@@ -4,7 +4,7 @@
  */
 
 // Vendored from FlashInfer's pinned preparation dependency
-// (flashinfer/experimental/b12x/comm/roce/_roce_proxy.c, proxy ABI 10).
+// (flashinfer/experimental/b12x/comm/roce/_roce_proxy.c, proxy ABI 14).
 // Keep the source below identical so preparation and serving share the transport ABI.
 
 // RDMA proxy for the b12x RoCE one-shot all-reduce.
@@ -31,6 +31,13 @@
 // waits for every stripe flag before consuming the receive slot.  Nothing on the receive path
 // involves the host.
 //
+// Each rail is n_lane reliable QPs between the same two HCAs (lanes).  A stripe and its seq
+// write always share one lane, so the flag-after-payload guarantee holds per stripe.  One-shot
+// stripes and ring relays use lane 0; two-shot and variable-length chunk c uses lane
+// c % n_lane, so consecutive chunks of one peer and rail proceed on separate QPs.  No buffer
+// lifetime argument depends on ordering between chunks or between operations on one QP:
+// every one rests on flags, the kernel's waits and pipe_done, which counts every lane.
+//
 // Messages too large for one-shot latency to matter take the pipelined two-shot
 // path instead (ctrl kind[slot] = 1).  The region then also holds
 //
@@ -53,6 +60,38 @@
 // thread sets ctrl pipe_done = seq, and the kernel publishes its epoch only after
 // seeing it; otherwise our next two-shot op could stage over the shard while it
 // was still to be sent, and peers would gather that input as our reduced values.
+//
+// The two halves of the two-shot path are also separate operations over the same
+// buffers and flags: a reduce-scatter (ctrl kind[slot] = 3) stages and posts the
+// phase-0 chunks only, and its kernel keeps the reduced shard; a shard gather
+// (ctrl kind[slot] = 4) stages this rank's shard of the message into pipe_send
+// and posts the phase-1 chunks only.  Each releases pipe_send through pipe_done
+// like a complete two-shot op.  The single-copy argument above covers two-shot ops following any
+// kind, a reduce-scatter following anything but a reduce-scatter, and a shard gather following a
+// one-shot, variable-length or reduce-scatter op: in each case some write of op N + 1 that a peer
+// needs before finishing N + 1 (or the predecessor's own completion) depends on that peer having
+// started N + 1.  Two transitions lack that dependency.  After a reduce-scatter, our next
+// reduce-scatter or two-shot posts phase-0 chunks as soon as our kernel staged them, while a peer's
+// kernel may still be reducing the previous op from the same rows; after a two-shot or shard
+// gather, our next shard gather posts phase-1 chunks while a peer may still be gathering.  Either
+// write could replace a flag before the peer saw it (a wait timeout) or the rows it is reading
+// (silent corruption).  For those transitions every rank writes a start-of-op credit, the op's
+// seq, into ctrl credit[rank] of every peer as it begins the op (our kernel N + 1 rang, so our
+// kernel N finished), and holds the hazardous phase until every peer's credit reached the op.  No
+// other op posts or waits for credits, so one-shot and back-to-back two-shot traffic is unchanged.
+// On the ring transports a credit to a rank that is not a neighbor travels as an empty mailbox
+// write, whose flag lands on every rail; only rail 0's credit word is read.
+//
+// A cabled fabric can relay the all-gather chunks (phase 1 of a two-shot op or a shard gather)
+// when its ranks form pairs joined by direct cables (roce_set_relay).  A rank then sends its
+// reduced shard to its partner and to one rank in every other pair, which forwards each chunk to
+// its own partner after the flags of every rail of that chunk arrived: from its pipe_recv row for
+// the source to the same row and flags at the partner, each stripe again followed by its flag on
+// the same queue pair.  The receiver waits on the same flags as for a direct write.  A forwarder
+// reads the row between the chunk's arrival and its own pipe_done, which counts the forwarded
+// writes, so the row's reuse rules are those of its kernel's reads.  The bytes are copied, not
+// combined, so results are unchanged bit for bit.  With two pairs, each rank's two-shot traffic is
+// half cable and half switch instead of one third cable.
 //
 // A variable-length all-gather (ctrl kind[slot] = 2) streams each rank's contribution, whose size
 // the kernel reads from device memory, through
@@ -87,11 +126,12 @@
 #define ROCE_MAX_PEERS 16
 #define ROCE_MAX_HCAS 4
 #define ROCE_MAX_RAILS 2
+#define ROCE_MAX_LANES 4
 #define ROCE_SLOTS 2
 #define ROCE_FLAG_STRIDE 128
 #define ROCE_PORT 1
 #define ROCE_SEND_DEPTH 512
-#define ROCE_ABI_VERSION 10
+#define ROCE_ABI_VERSION 14
 #define ROCE_MAX_CHUNKS 64
 #define ROCE_VARLEN_MAX_CHUNKS 512
 #define ROCE_CTRL_BYTES 4096
@@ -107,9 +147,25 @@
 #define CTRL_READY_RS 64
 #define CTRL_READY_AG 128
 #define CTRL_READY_VL 256
+// Start-of-op credits written by peers (one word per source rank), after the variable-length
+// all-gather's ready words.
+#define CTRL_CREDIT 768
+_Static_assert(CTRL_CREDIT >= CTRL_READY_VL + ROCE_VARLEN_MAX_CHUNKS &&
+                   (CTRL_CREDIT + ROCE_MAX_PEERS) * 4 + (ROCE_MAX_RAILS - 1) * ROCE_FLAG_STRIDE <=
+                       ROCE_CTRL_BYTES,
+               "credit words (one per rail for relayed credits) must fit the ctrl page after the "
+               "variable-length ready words");
+// Phases of a pipelined op that must wait for every peer's start-of-op credit.
+#define CREDIT_RS 1u
+#define CREDIT_AG 2u
 #define KIND_ONESHOT 0
 #define KIND_TWOSHOT 1
 #define KIND_VARLEN 2
+#define KIND_REDUCE_SCATTER 3
+#define KIND_GATHER_SHARDS 4
+// run_pipe_op phase mask: reduce-scatter chunks, all-gather chunks.
+#define PIPE_PHASE_RS 1u
+#define PIPE_PHASE_AG 2u
 // Model graphs leave sub-millisecond gaps between collectives.  Keep the
 // proxy hot across those gaps; sleeping there adds one scheduler wakeup to
 // every collective on the graph's critical path.
@@ -160,7 +216,8 @@ typedef struct {
   uint16_t lid[ROCE_MAX_HCAS];
   uint8_t gid[ROCE_MAX_HCAS][16];
   uint32_t mtu[ROCE_MAX_HCAS];
-  uint32_t qp_num[ROCE_MAX_HCAS][ROCE_MAX_PEERS];
+  uint32_t qp_num[ROCE_MAX_HCAS][ROCE_MAX_PEERS][ROCE_MAX_LANES];
+  uint32_t lanes;
 } roce_blob_t;
 
 typedef struct {
@@ -168,8 +225,8 @@ typedef struct {
   struct ibv_pd* pd;
   struct ibv_mr* mr;
   struct ibv_cq* cq;
-  struct ibv_qp* qp[ROCE_MAX_PEERS];
-  uint32_t outstanding[ROCE_MAX_PEERS];
+  struct ibv_qp* qp[ROCE_MAX_PEERS][ROCE_MAX_LANES];
+  uint32_t outstanding[ROCE_MAX_PEERS][ROCE_MAX_LANES];
   uint64_t writes_completed;
   uint64_t bytes_posted;
   union ibv_gid gid;
@@ -182,6 +239,7 @@ typedef struct {
   int rank;
   int n_hca;
   int n_rail;
+  int n_lane;
   int gid_index;
   int traffic_class;
   roce_hca_t hca[ROCE_MAX_HCAS];
@@ -210,6 +268,7 @@ typedef struct {
   atomic_int running;
   atomic_int failed;
   uint32_t last_seq;
+  uint32_t last_kind;  // kind of op last_seq (KIND_ONESHOT before the first op)
   uint64_t ops_posted;
   uint64_t writes_completed;
   uint8_t* ring;
@@ -227,6 +286,12 @@ typedef struct {
   uint8_t ring_previous[ROCE_MAX_PEERS][ROCE_MAX_RAILS][RING_WINDOW];
   uint64_t ring_inflight[ROCE_MAX_PEERS][ROCE_MAX_RAILS][RING_WINDOW];
   uint64_t ring_forwarded;
+  // All-gather relay (roce_set_relay): per peer, the rank that forwards our chunks to it (-1: we
+  // send them); per source, the rank we forward its chunks to (-1: none).
+  int relay;
+  int8_t relay_via[ROCE_MAX_PEERS];
+  int8_t relay_to[ROCE_MAX_PEERS];
+  uint64_t relay_forwarded;
   char err[512];
 } roce_ctx_t;
 
@@ -381,7 +446,7 @@ static int open_hca(roce_ctx_t* c, int h, const char* name) {
     set_err(c, "ibv_reg_mr(pinned region)", errno);
     return -1;
   }
-  hca->cq = ibv_create_cq(hca->ctx, ROCE_SEND_DEPTH * ROCE_MAX_PEERS, NULL, NULL, 0);
+  hca->cq = ibv_create_cq(hca->ctx, ROCE_SEND_DEPTH * ROCE_MAX_PEERS * c->n_lane, NULL, NULL, 0);
   if (hca->cq == NULL) {
     set_err(c, "ibv_create_cq", errno);
     return -1;
@@ -400,34 +465,37 @@ static int open_hca(roce_ctx_t* c, int h, const char* name) {
     attr.cap.max_send_sge = 1;
     attr.cap.max_recv_sge = 1;
     attr.cap.max_inline_data = 16;
-    hca->qp[p] = ibv_create_qp(hca->pd, &attr);
-    if (hca->qp[p] == NULL) {
-      set_err(c, "ibv_create_qp", errno);
-      return -1;
-    }
-    struct ibv_qp_attr init;
-    memset(&init, 0, sizeof(init));
-    init.qp_state = IBV_QPS_INIT;
-    init.pkey_index = 0;
-    init.port_num = ROCE_PORT;
-    init.qp_access_flags = IBV_ACCESS_REMOTE_WRITE;
-    int rc = ibv_modify_qp(hca->qp[p], &init,
-                           IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
-    if (rc != 0) {
-      set_err(c, "ibv_modify_qp(INIT)", rc);
-      return -1;
+    for (int l = 0; l < c->n_lane; l++) {
+      hca->qp[p][l] = ibv_create_qp(hca->pd, &attr);
+      if (hca->qp[p][l] == NULL) {
+        set_err(c, "ibv_create_qp", errno);
+        return -1;
+      }
+      struct ibv_qp_attr init;
+      memset(&init, 0, sizeof(init));
+      init.qp_state = IBV_QPS_INIT;
+      init.pkey_index = 0;
+      init.port_num = ROCE_PORT;
+      init.qp_access_flags = IBV_ACCESS_REMOTE_WRITE;
+      int rc = ibv_modify_qp(hca->qp[p][l], &init,
+                             IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
+      if (rc != 0) {
+        set_err(c, "ibv_modify_qp(INIT)", rc);
+        return -1;
+      }
     }
   }
   return 0;
 }
 
 roce_ctx_t* roce_create(int world, int rank, const char* const* hca_names, int n_hca, int gid_index,
-                        int traffic_class, void* region, uint64_t region_bytes, uint64_t slot_bytes,
-                        uint64_t pipe_bytes, uint64_t varlen_bytes, char* err, uint64_t err_len) {
+                        int traffic_class, int n_lane, void* region, uint64_t region_bytes,
+                        uint64_t slot_bytes, uint64_t pipe_bytes, uint64_t varlen_bytes, char* err,
+                        uint64_t err_len) {
   uint64_t layout[17];
   if (roce_layout(world, slot_bytes, pipe_bytes, varlen_bytes, layout) != 0 ||
       layout[4] > region_bytes || rank < 0 || rank >= world || n_hca < 1 || n_hca > ROCE_MAX_HCAS ||
-      traffic_class < 0 || traffic_class > 255) {
+      traffic_class < 0 || traffic_class > 255 || n_lane < 1 || n_lane > ROCE_MAX_LANES) {
     snprintf(err, err_len, "invalid roce runtime geometry");
     return NULL;
   }
@@ -441,6 +509,7 @@ roce_ctx_t* roce_create(int world, int rank, const char* const* hca_names, int n
   c->n_hca = n_hca;
   c->gid_index = gid_index;
   c->traffic_class = traffic_class;
+  c->n_lane = n_lane;
   c->region = region;
   c->region_bytes = region_bytes;
   c->slot_bytes = slot_bytes;
@@ -507,6 +576,7 @@ int roce_local_blob(roce_ctx_t* c, void* out, uint64_t out_len) {
   memset(&blob, 0, sizeof(blob));
   blob.region_addr = (uint64_t)(uintptr_t)c->region;
   blob.ring_addr = (uint64_t)(uintptr_t)c->ring;
+  blob.lanes = (uint32_t)c->n_lane;
   for (int h = 0; h < c->n_hca; h++) {
     blob.rkey[h] = c->hca[h].mr->rkey;
     blob.ring_rkey[h] = c->ring == NULL ? 0 : c->ring_mr[h]->rkey;
@@ -514,22 +584,25 @@ int roce_local_blob(roce_ctx_t* c, void* out, uint64_t out_len) {
     blob.mtu[h] = (uint32_t)c->hca[h].mtu;
     memcpy(blob.gid[h], c->hca[h].gid.raw, 16);
     for (int p = 0; p < c->world; p++) {
-      blob.qp_num[h][p] = (p == c->rank) ? 0 : c->hca[h].qp[p]->qp_num;
+      for (int l = 0; l < c->n_lane; l++) {
+        blob.qp_num[h][p][l] = (p == c->rank) ? 0 : c->hca[h].qp[p][l]->qp_num;
+      }
     }
   }
   memcpy(out, &blob, sizeof(blob));
   return 0;
 }
 
-// Move local HCA h's queue pair for rank p to RTS, connected to the peer's HCA r.
-static int connect_qp(roce_ctx_t* c, int h, int r, int p, const roce_blob_t* peer) {
+// Move local HCA h's queue pair `lane` for rank p to RTS, connected to the same lane of the
+// peer's HCA r.
+static int connect_qp(roce_ctx_t* c, int h, int r, int p, int lane, const roce_blob_t* peer) {
   roce_hca_t* hca = &c->hca[h];
   struct ibv_qp_attr rtr;
   memset(&rtr, 0, sizeof(rtr));
   rtr.qp_state = IBV_QPS_RTR;
   rtr.path_mtu =
       (enum ibv_mtu)(peer->mtu[r] < (uint32_t)hca->mtu ? peer->mtu[r] : (uint32_t)hca->mtu);
-  rtr.dest_qp_num = peer->qp_num[r][c->rank];
+  rtr.dest_qp_num = peer->qp_num[r][c->rank][lane];
   rtr.rq_psn = 0;
   rtr.max_dest_rd_atomic = 1;
   rtr.min_rnr_timer = 12;
@@ -543,7 +616,7 @@ static int connect_qp(roce_ctx_t* c, int h, int r, int p, const roce_blob_t* pee
   rtr.ah_attr.grh.hop_limit = 64;
   rtr.ah_attr.grh.traffic_class = (uint8_t)c->traffic_class;
   rtr.ah_attr.grh.flow_label = 0;
-  int rc = ibv_modify_qp(hca->qp[p], &rtr,
+  int rc = ibv_modify_qp(hca->qp[p][lane], &rtr,
                          IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
                              IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER);
   if (rc != 0) {
@@ -558,7 +631,7 @@ static int connect_qp(roce_ctx_t* c, int h, int r, int p, const roce_blob_t* pee
   rts.rnr_retry = 7;
   rts.sq_psn = 0;
   rts.max_rd_atomic = 1;
-  rc = ibv_modify_qp(hca->qp[p], &rts,
+  rc = ibv_modify_qp(hca->qp[p][lane], &rts,
                      IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY |
                          IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC);
   if (rc != 0) {
@@ -585,6 +658,11 @@ int roce_connect(roce_ctx_t* c, const void* blobs, uint64_t blobs_len, const int
   for (int p = 0; p < c->world; p++) {
     if ((all[p].ring_addr != 0) != (c->ring != NULL)) {
       snprintf(c->err, sizeof(c->err), "ranks disagree on experimental ring transport");
+      return -1;
+    }
+    if (all[p].lanes != (uint32_t)c->n_lane) {
+      snprintf(c->err, sizeof(c->err), "rank %d uses %u queue-pair lanes where this rank uses %d",
+               p, all[p].lanes, c->n_lane);
       return -1;
     }
     c->peer_addr[p] = all[p].region_addr;
@@ -621,11 +699,45 @@ int roce_connect(roce_ctx_t* c, const void* blobs, uint64_t blobs_len, const int
       int r = routes[(p * n_rail + k) * 2 + 1];
       c->peer_rkey[k][p] = all[p].rkey[r];
       c->ring_rkey[k][p] = all[p].ring_rkey[r];
-      if (connect_qp(c, h, r, p, &all[p]) != 0) {
-        return -1;
+      for (int l = 0; l < c->n_lane; l++) {
+        if (connect_qp(c, h, r, p, l, &all[p]) != 0) {
+          return -1;
+        }
       }
     }
   }
+  return 0;
+}
+
+// plan holds 2 * world ints: plan[p] is the rank that forwards our all-gather chunks to rank p
+// (-1: we send them ourselves) and plan[world + s] the rank we forward rank s's chunks to (-1:
+// none).  Call after roce_connect and before roce_start.  Every rank must pass the plan derived
+// from the same topology: a chunk nobody forwards stops its receiver's kernel at its wait timeout.
+int roce_set_relay(roce_ctx_t* c, const int32_t* plan, int n) {
+  if (c->started || c->n_rail == 0 || c->ring != NULL || n != 2 * c->world) {
+    snprintf(c->err, sizeof(c->err),
+             "all-gather relay needs a connected mesh transport that has not started and a plan "
+             "of %d entries, got %d",
+             2 * c->world, n);
+    return -1;
+  }
+  for (int p = 0; p < c->world; p++) {
+    int via = plan[p], to = plan[c->world + p];
+    int bad = (p == c->rank && (via != -1 || to != -1)) ||
+              (via != -1 &&
+               (via < 0 || via >= c->world || via == c->rank || via == p || plan[via] != -1)) ||
+              (to != -1 && (to < 0 || to >= c->world || to == c->rank || to == p));
+    if (bad) {
+      snprintf(c->err, sizeof(c->err), "invalid all-gather relay plan entry for rank %d: %d, %d", p,
+               via, to);
+      return -1;
+    }
+  }
+  for (int p = 0; p < c->world; p++) {
+    c->relay_via[p] = (int8_t)plan[p];
+    c->relay_to[p] = (int8_t)plan[c->world + p];
+  }
+  c->relay = 1;
   return 0;
 }
 
@@ -641,13 +753,14 @@ static int drain_cq(roce_ctx_t* c, int h) {
     int src = (int)((wc[i].wr_id >> 16) & 255);
     int slot = (int)((wc[i].wr_id >> 8) & 255);
     int rail = (int)(wc[i].wr_id & 255);
-    int peer = relayed ? (int)c->ring_target[src][rail][slot] : (int)wc[i].wr_id;
+    int peer = relayed ? (int)c->ring_target[src][rail][slot] : (int)(wc[i].wr_id & 255);
+    int lane = relayed ? 0 : (int)((wc[i].wr_id >> 8) & 255);
     if (wc[i].status != IBV_WC_SUCCESS) {
       snprintf(c->err, sizeof(c->err), "RDMA write to rank %u failed: %s (vendor_err 0x%x, seq %u)",
                (unsigned)peer, ibv_wc_status_str(wc[i].status), wc[i].vendor_err, c->last_seq);
       return -1;
     }
-    c->hca[h].outstanding[peer] -= 1;
+    c->hca[h].outstanding[peer][lane] -= 1;
     c->hca[h].writes_completed += 1;
     c->writes_completed += 1;
     if (relayed && ring_complete(c, src, rail, slot) != 0) return -1;
@@ -655,12 +768,12 @@ static int drain_cq(roce_ctx_t* c, int h) {
   return 0;
 }
 
-// Wait until HCA h can take one more stripe to peer p. Direct stripes need two
+// Wait until lane `lane` of HCA h can take one more stripe to peer p. Direct stripes need two
 // requests and relay packets need three. A quarter of the queue leaves room
 // for provider overhead and per-origin acks posted while draining completions.
-static int reserve(roce_ctx_t* c, int h, int p) {
+static int reserve(roce_ctx_t* c, int h, int p, int lane) {
   roce_hca_t* hca = &c->hca[h];
-  while (hca->outstanding[p] >= ROCE_SEND_DEPTH / 4) {
+  while (hca->outstanding[p][lane] >= ROCE_SEND_DEPTH / 4) {
     if (drain_all(c) != 0) {
       return -1;
     }
@@ -669,7 +782,7 @@ static int reserve(roce_ctx_t* c, int h, int p) {
     // roce_stop (and so teardown) behind it.
     if (!atomic_load_explicit(&c->running, memory_order_relaxed)) {
       snprintf(c->err, sizeof(c->err), "RoCE proxy stopped with %u writes outstanding to rank %d",
-               hca->outstanding[p], p);
+               hca->outstanding[p][lane], p);
       return -1;
     }
   }
@@ -698,12 +811,12 @@ static int ring_complete(roce_ctx_t* c, int origin, int rail, int slot) {
   wr.wr.rdma.remote_addr =
       c->ring_addr[previous] + ring_ack_offset(c->world, ring_slot(origin, rail, slot));
   wr.wr.rdma.rkey = c->ring_rkey[rail][previous];
-  int rc = ibv_post_send(c->hca[h].qp[previous], &wr, &bad);
+  int rc = ibv_post_send(c->hca[h].qp[previous][0], &wr, &bad);
   if (rc != 0) {
     set_err(c, "ring ack", rc);
     return -1;
   }
-  c->hca[h].outstanding[previous]++;
+  c->hca[h].outstanding[previous][0]++;
   c->ring_seen[origin][rail][slot] = serial;
   c->ring_pending[origin][rail][slot] = 0;
   c->ring_forwarded++;
@@ -747,12 +860,12 @@ static int ring_submit(roce_ctx_t* c, int origin, int rail, int slot, int next,
   z.send_flags = IBV_SEND_INLINE | IBV_SEND_SIGNALED;
   z.wr.rdma.remote_addr = mailbox;
   z.wr.rdma.rkey = c->ring_rkey[rail][next];
-  int rc = ibv_post_send(c->hca[h].qp[next], d->nbytes ? &a : &b, &bad);
+  int rc = ibv_post_send(c->hca[h].qp[next][0], d->nbytes ? &a : &b, &bad);
   if (rc != 0) {
     set_err(c, "ring submit", rc);
     return -1;
   }
-  c->hca[h].outstanding[next]++;
+  c->hca[h].outstanding[next][0]++;
   c->hca[h].bytes_posted += d->nbytes;
   return 0;
 }
@@ -795,7 +908,7 @@ static int ring_service_slot(roce_ctx_t* c, int origin, int rail, int slot) {
   c->ring_inflight[origin][rail][slot] = serial;
   int next = ring_next(c, target);
   int h = c->rail_hca[next][rail];
-  if (c->hca[h].outstanding[next] >= ROCE_SEND_DEPTH / 4) return 1;
+  if (c->hca[h].outstanding[next][0] >= ROCE_SEND_DEPTH / 4) return 1;
   if (next != target) {
     if (ring_submit(c, origin, rail, slot, next, box->data, c->ring_mr[h]->lkey, d) != 0) return -1;
     *pending = 2;
@@ -832,13 +945,13 @@ static int ring_service_slot(roce_ctx_t* c, int origin, int rail, int slot) {
     snprintf(c->err, sizeof(c->err), "empty ring write without a flag");
     return -1;
   }
-  int rc = ibv_post_send(c->hca[h].qp[target], first, &bad);
+  int rc = ibv_post_send(c->hca[h].qp[target][0], first, &bad);
   if (rc != 0) {
     set_err(c, "ring forward", rc);
     return -1;
   }
   *pending = 1;
-  c->hca[h].outstanding[target]++;
+  c->hca[h].outstanding[target][0]++;
   c->hca[h].bytes_posted += d->nbytes;
   return 0;
 }
@@ -915,7 +1028,7 @@ static int ring_post(roce_ctx_t* c, int target, const uint8_t* send, uint64_t of
           return -1;
         }
       }
-      if (reserve(c, h, next) != 0) return -1;
+      if (reserve(c, h, next, 0) != 0) return -1;
       ring_descriptor_t d = {
           .serial = serial,
           .target = (uint64_t)target,
@@ -938,7 +1051,7 @@ static int ring_post(roce_ctx_t* c, int target, const uint8_t* send, uint64_t of
 // 4-byte seq write to `flag_off + rail * ROCE_FLAG_STRIDE`.  An empty payload
 // still writes every flag, so receivers wait the same way for every chunk.
 static int post_striped(roce_ctx_t* c, int p, const uint8_t* send, uint64_t remote_off,
-                        uint32_t packs, uint64_t flag_off, uint32_t seq) {
+                        uint32_t packs, uint64_t flag_off, uint32_t seq, int lane) {
   if (ring_relayed(c, p)) return ring_post(c, p, send, remote_off, packs, flag_off, seq);
   uint32_t seq_copy = seq;
   uint32_t pack_offset = 0;
@@ -946,7 +1059,7 @@ static int post_striped(roce_ctx_t* c, int p, const uint8_t* send, uint64_t remo
   for (int k = 0; k < c->n_rail; k++) {
     int h = c->rail_hca[p][k];
     roce_hca_t* hca = &c->hca[h];
-    if (reserve(c, h, p) != 0) {
+    if (reserve(c, h, p, lane) != 0) {
       return -1;
     }
     uint32_t stripe_packs = packs / (uint32_t)c->n_rail;
@@ -962,7 +1075,7 @@ static int post_striped(roce_ctx_t* c, int p, const uint8_t* send, uint64_t remo
     };
     struct ibv_send_wr flag_wr;
     memset(&flag_wr, 0, sizeof(flag_wr));
-    flag_wr.wr_id = (uint64_t)p;
+    flag_wr.wr_id = (uint64_t)p | ((uint64_t)lane << 8);
     flag_wr.sg_list = &flag_sge;
     flag_wr.num_sge = 1;
     flag_wr.opcode = IBV_WR_RDMA_WRITE;
@@ -980,7 +1093,7 @@ static int post_striped(roce_ctx_t* c, int p, const uint8_t* send, uint64_t remo
           .lkey = hca->mr->lkey,
       };
       memset(&data_wr, 0, sizeof(data_wr));
-      data_wr.wr_id = (uint64_t)p;
+      data_wr.wr_id = (uint64_t)p | ((uint64_t)lane << 8);
       data_wr.next = &flag_wr;
       data_wr.sg_list = &data_sge;
       data_wr.num_sge = 1;
@@ -990,12 +1103,12 @@ static int post_striped(roce_ctx_t* c, int p, const uint8_t* send, uint64_t remo
       first_wr = &data_wr;
     }
     struct ibv_send_wr* bad = NULL;
-    int rc = ibv_post_send(hca->qp[p], first_wr, &bad);
+    int rc = ibv_post_send(hca->qp[p][lane], first_wr, &bad);
     if (rc != 0) {
       set_err(c, "ibv_post_send", rc);
       return -1;
     }
-    hca->outstanding[p] += 1;
+    hca->outstanding[p][lane] += 1;
     hca->bytes_posted += stripe_bytes;
     pack_offset += stripe_packs;
   }
@@ -1029,7 +1142,7 @@ static int post_op(roce_ctx_t* c, uint32_t seq, uint32_t nbytes) {
     uint64_t remote_off = c->recv_off + ((uint64_t)c->rank * ROCE_SLOTS + slot) * c->slot_bytes;
     uint64_t flag_off = c->flag_off + ((uint64_t)c->rank * ROCE_SLOTS + slot) *
                                           (uint64_t)c->n_rail * ROCE_FLAG_STRIDE;
-    if (post_striped(c, p, send, remote_off, nbytes / 16, flag_off, seq) != 0) {
+    if (post_striped(c, p, send, remote_off, nbytes / 16, flag_off, seq, 0) != 0) {
       return -1;
     }
   }
@@ -1048,7 +1161,7 @@ static int post_pipe_chunk(roce_ctx_t* c, uint32_t seq, int phase, uint32_t chun
                            uint32_t chunk_packs) {
   const uint8_t* send = c->region + c->pipe_send_off;
   for (int p = 0; p < c->world; p++) {
-    if (p == c->rank) {
+    if (p == c->rank || (phase == 1 && c->relay && c->relay_via[p] >= 0)) {
       continue;
     }
     int shard = phase == 0 ? p : c->rank;
@@ -1069,45 +1182,178 @@ static int post_pipe_chunk(roce_ctx_t* c, uint32_t seq, int phase, uint32_t chun
         c->pipe_flag_off +
         ((((uint64_t)phase * c->world + c->rank) * ROCE_MAX_CHUNKS + chunk) * (uint64_t)c->n_rail) *
             ROCE_FLAG_STRIDE;
-    if (post_striped(c, p, send + lo * 16, remote_off, (uint32_t)(hi - lo), flag_off, seq) != 0) {
+    if (post_striped(c, p, send + lo * 16, remote_off, (uint32_t)(hi - lo), flag_off, seq,
+                     (int)(chunk % (uint32_t)c->n_lane)) != 0) {
       return -1;
     }
   }
   return 0;
 }
 
-// Run two-shot op seq: post each reduce-scatter chunk once the kernel staged it
-// and each all-gather chunk once the kernel reduced it.
+// True once every rail's flag of all-gather chunk `chunk` from rank s holds seq.  Each flag follows
+// its stripe on one queue pair, so the chunk's bytes are in our pipe_recv row for s.
+static int pipe_chunk_arrived(const roce_ctx_t* c, uint32_t seq, int s, uint32_t chunk) {
+  uint64_t base = c->pipe_flag_off +
+                  ((((uint64_t)c->world + s) * ROCE_MAX_CHUNKS + chunk) * (uint64_t)c->n_rail) *
+                      ROCE_FLAG_STRIDE;
+  for (int k = 0; k < c->n_rail; k++) {
+    const uint32_t* flag = (const uint32_t*)(c->region + base + (uint64_t)k * ROCE_FLAG_STRIDE);
+    if (__atomic_load_n(flag, __ATOMIC_ACQUIRE) != seq) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+// Forward all-gather chunk `chunk` of rank s, which arrived in our pipe_recv row for s, to the same
+// row and flags at rank relay_to[s].
+static int forward_pipe_chunk(roce_ctx_t* c, uint32_t seq, int s, uint32_t chunk, uint32_t total,
+                              uint32_t chunk_packs) {
+  uint32_t first = shard_start(c, total, s);
+  uint32_t end = shard_start(c, total, s + 1);
+  uint64_t lo = (uint64_t)first + (uint64_t)chunk * chunk_packs;
+  uint64_t hi = lo + chunk_packs;
+  if (lo > end) {
+    lo = end;
+  }
+  if (hi > end) {
+    hi = end;
+  }
+  uint64_t row = c->pipe_recv_off + ((uint64_t)s * 2 + 1) * c->shard_cap + (lo - first) * 16;
+  uint64_t flag_off = c->pipe_flag_off +
+                      ((((uint64_t)c->world + s) * ROCE_MAX_CHUNKS + chunk) * (uint64_t)c->n_rail) *
+                          ROCE_FLAG_STRIDE;
+  if (post_striped(c, c->relay_to[s], c->region + row, row, (uint32_t)(hi - lo), flag_off, seq,
+                   (int)(chunk % (uint32_t)c->n_lane)) != 0) {
+    return -1;
+  }
+  c->relay_forwarded += 1;
+  return 0;
+}
+
+// The phases of an op of `kind` following an op of `prev` that must wait for peers' credits (see
+// the header): phase 0 after a reduce-scatter, phase 1 of a shard gather after an op that gathers.
+static uint32_t credit_phases(uint32_t prev, uint32_t kind) {
+  uint32_t need = 0;
+  if (prev == KIND_REDUCE_SCATTER && (kind == KIND_REDUCE_SCATTER || kind == KIND_TWOSHOT)) {
+    need |= CREDIT_RS;
+  }
+  if (kind == KIND_GATHER_SHARDS && (prev == KIND_TWOSHOT || prev == KIND_GATHER_SHARDS)) {
+    need |= CREDIT_AG;
+  }
+  return need;
+}
+
+// Tell every peer that we began op seq, so our kernel finished the previous op: one inline 4-byte
+// write of seq into the peer's ctrl credit[our rank], on rail 0 and lane 0, or an empty mailbox
+// write through the ring for a rank that is not a neighbor.
+static int post_credits(roce_ctx_t* c, uint32_t seq) {
+  uint32_t value = seq;
+  uint64_t credit_off = c->ctrl_off + 4ull * (CTRL_CREDIT + c->rank);
+  for (int p = 0; p < c->world; p++) {
+    if (p == c->rank) {
+      continue;
+    }
+    if (ring_relayed(c, p)) {
+      if (ring_post(c, p, c->region, 0, 0, credit_off, seq) != 0) {
+        return -1;
+      }
+      continue;
+    }
+    int h = c->rail_hca[p][0];
+    if (reserve(c, h, p, 0) != 0) {
+      return -1;
+    }
+    struct ibv_sge sge = {.addr = (uint64_t)(uintptr_t)&value, .length = 4, .lkey = 0};
+    struct ibv_send_wr wr, *bad = NULL;
+    memset(&wr, 0, sizeof(wr));
+    wr.wr_id = (uint64_t)p;
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+    wr.opcode = IBV_WR_RDMA_WRITE;
+    wr.send_flags = IBV_SEND_SIGNALED | IBV_SEND_INLINE;
+    wr.wr.rdma.remote_addr = c->peer_addr[p] + credit_off;
+    wr.wr.rdma.rkey = c->peer_rkey[0][p];
+    int rc = ibv_post_send(c->hca[h].qp[p][0], &wr, &bad);
+    if (rc != 0) {
+      set_err(c, "ibv_post_send(credit)", rc);
+      return -1;
+    }
+    c->hca[h].outstanding[p][0] += 1;
+  }
+  return 0;
+}
+
+// True once every peer's credit reached seq.
+static int credits_arrived(const roce_ctx_t* c, uint32_t seq) {
+  const uint32_t* credit = (const uint32_t*)(c->region + c->ctrl_off) + CTRL_CREDIT;
+  for (int p = 0; p < c->world; p++) {
+    if (p != c->rank && (int32_t)(__atomic_load_n(&credit[p], __ATOMIC_ACQUIRE) - seq) < 0) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+// Run pipelined op seq over the phases in `phases`: post each reduce-scatter
+// chunk once the kernel staged it and each all-gather chunk once the kernel
+// reduced (or, for a shard gather, staged) it.  With the relay, also forward each relayed source's
+// all-gather chunk as it arrives.
 static int run_pipe_op(roce_ctx_t* c, uint32_t seq, uint32_t nbytes, uint32_t chunk_packs,
-                       uint32_t chunks) {
+                       uint32_t chunks, uint32_t phases, uint32_t credit) {
   volatile uint32_t* ctrl = (volatile uint32_t*)(c->region + c->ctrl_off);
   uint32_t total = nbytes / 16;
   uint32_t widest = (total + (uint32_t)c->world - 1) / (uint32_t)c->world;
   if (nbytes == 0 || nbytes % 16 != 0 || nbytes > c->pipe_bytes || chunks == 0 ||
       chunks > ROCE_MAX_CHUNKS || chunk_packs == 0 || (uint64_t)chunks * chunk_packs < widest) {
     snprintf(c->err, sizeof(c->err),
-             "invalid two-shot op %u: %u bytes in %u chunks of %u packs (capacity %zu)", seq,
+             "invalid pipelined op %u: %u bytes in %u chunks of %u packs (capacity %zu)", seq,
              nbytes, chunks, chunk_packs, c->pipe_bytes);
     return -1;
   }
-  uint32_t rs = 0;
-  uint32_t ag = 0;
+  uint32_t rs = (phases & PIPE_PHASE_RS) ? 0 : chunks;
+  uint32_t ag = (phases & PIPE_PHASE_AG) ? 0 : chunks;
+  uint32_t forwarded[ROCE_MAX_PEERS];
+  int forwarding = 0;  // relayed sources with chunks still to forward
+  for (int s = 0; s < c->world; s++) {
+    forwarded[s] = chunks;
+    if (c->relay && (phases & PIPE_PHASE_AG) && c->relay_to[s] >= 0) {
+      forwarded[s] = 0;
+      forwarding++;
+    }
+  }
   uint64_t idle = 0;
-  while (rs < chunks || ag < chunks) {
+  while (rs < chunks || ag < chunks || forwarding > 0) {
     int posted = 0;
-    if (rs < chunks && __atomic_load_n(&ctrl[CTRL_READY_RS + rs], __ATOMIC_ACQUIRE) == seq) {
+    if (credit != 0 && credits_arrived(c, seq)) {
+      credit = 0;  // every peer began this op: no phase can overrun a peer's previous op
+    }
+    if (rs < chunks && !(credit & CREDIT_RS) &&
+        __atomic_load_n(&ctrl[CTRL_READY_RS + rs], __ATOMIC_ACQUIRE) == seq) {
       if (post_pipe_chunk(c, seq, 0, rs, total, chunk_packs) != 0) {
         return -1;
       }
       rs++;
       posted = 1;
     }
-    if (ag < chunks && __atomic_load_n(&ctrl[CTRL_READY_AG + ag], __ATOMIC_ACQUIRE) == seq) {
+    if (ag < chunks && !(credit & CREDIT_AG) &&
+        __atomic_load_n(&ctrl[CTRL_READY_AG + ag], __ATOMIC_ACQUIRE) == seq) {
       if (post_pipe_chunk(c, seq, 1, ag, total, chunk_packs) != 0) {
         return -1;
       }
       ag++;
       posted = 1;
+    }
+    for (int s = 0; forwarding > 0 && !(credit & CREDIT_AG) && s < c->world; s++) {
+      if (forwarded[s] < chunks && pipe_chunk_arrived(c, seq, s, forwarded[s])) {
+        if (forward_pipe_chunk(c, seq, s, forwarded[s], total, chunk_packs) != 0) {
+          return -1;
+        }
+        if (++forwarded[s] == chunks) {
+          forwarding--;
+        }
+        posted = 1;
+      }
     }
     if (posted) {
       idle = 0;
@@ -1139,7 +1385,9 @@ static int run_pipe_op(roce_ctx_t* c, uint32_t seq, uint32_t nbytes, uint32_t ch
     uint32_t pending = 0;
     for (int h = 0; h < c->n_hca; h++) {
       for (int p = 0; p < c->world; p++) {
-        pending += c->hca[h].outstanding[p];
+        for (int l = 0; l < c->n_lane; l++) {
+          pending += c->hca[h].outstanding[p][l];
+        }
       }
     }
     if (pending == 0) {
@@ -1203,7 +1451,8 @@ static int run_varlen_op(roce_ctx_t* c, uint32_t seq, uint32_t nbytes, uint32_t 
              (uint64_t)c->n_rail) *
                 ROCE_FLAG_STRIDE;
         if (post_striped(c, p, c->region + row_off + lo * 16, row_off + lo * 16,
-                         (uint32_t)(hi - lo), flag_off, seq) != 0) {
+                         (uint32_t)(hi - lo), flag_off, seq,
+                         (int)(posted % (uint32_t)c->n_lane)) != 0) {
           return -1;
         }
       }
@@ -1286,9 +1535,18 @@ static void* proxy_main(void* arg) {
       int rc;
       if (kind == KIND_ONESHOT) {
         rc = post_op(c, s, nbytes);
-      } else if (kind == KIND_TWOSHOT) {
-        rc = run_pipe_op(c, s, nbytes, ctrl[CTRL_SLOT_CHUNK_PACKS + slot],
-                         ctrl[CTRL_SLOT_CHUNKS + slot]);
+      } else if (kind == KIND_TWOSHOT || kind == KIND_REDUCE_SCATTER ||
+                 kind == KIND_GATHER_SHARDS) {
+        uint32_t phases = kind == KIND_TWOSHOT          ? (PIPE_PHASE_RS | PIPE_PHASE_AG)
+                          : kind == KIND_REDUCE_SCATTER ? PIPE_PHASE_RS
+                                                        : PIPE_PHASE_AG;
+        // Every rank runs the same op sequence, so all of them post and await the same credits.
+        uint32_t credit = credit_phases(c->last_kind, kind);
+        rc = credit != 0 ? post_credits(c, s) : 0;
+        if (rc == 0) {
+          rc = run_pipe_op(c, s, nbytes, ctrl[CTRL_SLOT_CHUNK_PACKS + slot],
+                           ctrl[CTRL_SLOT_CHUNKS + slot], phases, credit);
+        }
       } else if (kind == KIND_VARLEN) {
         rc = run_varlen_op(c, s, nbytes, ctrl[CTRL_SLOT_CHUNK_PACKS + slot],
                            ctrl[CTRL_SLOT_CHUNKS + slot]);
@@ -1301,6 +1559,7 @@ static void* proxy_main(void* arg) {
         return NULL;
       }
       c->last_seq = s;
+      c->last_kind = kind;
     }
   }
   return NULL;
@@ -1352,6 +1611,10 @@ uint64_t roce_stat(roce_ctx_t* c, int which) {
       if (c->ring == NULL) return c->world - 1;
       if (c->world == 2 || (c->ring_open && (c->rank == 0 || c->rank == c->world - 1))) return 1;
       return 2;
+    case 5:
+      return c->relay_forwarded;
+    case 6:
+      return (uint64_t)c->relay;
     default:
       return 0;
   }
@@ -1379,8 +1642,10 @@ void roce_destroy(roce_ctx_t* c) {
   for (int h = 0; h < ROCE_MAX_HCAS; h++) {
     roce_hca_t* hca = &c->hca[h];
     for (int p = 0; p < ROCE_MAX_PEERS; p++) {
-      if (hca->qp[p] != NULL) {
-        ibv_destroy_qp(hca->qp[p]);
+      for (int l = 0; l < ROCE_MAX_LANES; l++) {
+        if (hca->qp[p][l] != NULL) {
+          ibv_destroy_qp(hca->qp[p][l]);
+        }
       }
     }
     if (hca->cq != NULL) {

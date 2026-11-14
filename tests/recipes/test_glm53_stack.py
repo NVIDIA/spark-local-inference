@@ -14,6 +14,8 @@ from ignition.components.parallel import TensorParallelShard
 from ignition.recipes.glm53.model import create_model_tree
 from ignition.recipes.glm53.stack import DecoderScratch
 from ignition.recipes.glm53.state import DecoderMetadata, DecoderState
+from ignition.recipes.glm53.mla import MLAState, PreparedGlmMLA
+from ignition.recipes.glm53.indexer import PreparedGlmIndexer
 
 
 def scratch_tensors(scratch, prefix=""):
@@ -24,6 +26,31 @@ def scratch_tensors(scratch, prefix=""):
             yield name, value
         elif value is not None:
             yield from scratch_tensors(value, f"{name}.")
+
+
+def test_sparse_attention_rebind_uses_replacement_cache_at_execution():
+    from types import SimpleNamespace
+
+    state = MLAState.allocate(1, 2, "cpu")
+    previous = torch.empty_like(state.cache)
+    indexer = object.__new__(PreparedGlmIndexer)
+    indexer.state, indexer.cache = state.index, previous
+    indexer.selectors, indexer.logical, indexer.expand_options = (), False, {}
+
+    class Attention:
+        def rebind_cache(self, cache):
+            self.cache = cache
+
+    prepared = object.__new__(PreparedGlmMLA)
+    prepared.state, prepared.cache = state, previous
+    prepared.writer, prepared.indexer = SimpleNamespace(cache=previous), indexer
+    prepared.attention, prepared.context = Attention(), None
+    prepared.rebind_pages()
+    assert prepared.cache is state.cache
+    assert prepared.writer.cache is state.cache
+    assert prepared.attention.cache is state.cache
+    assert prepared.indexer.cache is state.index.cache
+    assert prepared.indexer.expand_options["num_cache_blocks"] == state.index.cache.shape[0]
 
 
 @pytest.mark.parametrize("world,rank", [(2, 0), (4, 3)])
@@ -57,6 +84,22 @@ def test_scratch_views_reject_unavailable_token_sample_and_request_capacity():
                                (1, "prefill", 2), (4, "decode", 4), (4, "invalid", 1)):
         with pytest.raises(ValueError):
             base.rows(tokens, mode, sample_rows=rows)
+
+
+def test_cp_prefill_query_value_alias_survives_declaration_views():
+    base = DecoderScratch.allocate(65, 2, "prefill", "cpu", shard=TensorParallelShard(0, 2),
+        sample_rows=1, context_ranks=2)
+    for rows in (65, 16, 65):
+        view = base.rows(rows, "prefill", sample_rows=1).mla
+        view.query.fill_(float("nan"))
+        view.expanded.fill_(rows)
+        assert torch.all(view.query == rows)
+    for mode, ranks in (("prefill", 1), ("decode", 2)):
+        separate = DecoderScratch.allocate(2, 2, mode, "cpu", shard=TensorParallelShard(0, 2),
+            sample_rows=1, context_ranks=ranks).mla
+        separate.query.fill_(7)
+        separate.expanded.zero_()
+        assert torch.all(separate.query == 7)
 
 
 @pytest.mark.parametrize("world,rank", [(2, 0), (4, 3)])

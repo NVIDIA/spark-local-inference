@@ -21,6 +21,94 @@ pub struct StartupProgress {
     terminal: bool,
     output: Arc<Mutex<Output>>,
     animation: Option<(mpsc::Sender<AnimationStop>, JoinHandle<()>)>,
+    observation: Option<StartupObservation>,
+}
+
+/// Stable identifiers for core loading stages; labels are presentation text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StartupStage {
+    Other, VerifyStoredData, PrepareModel, InitializeGpu, PlanCache, AllocateCache,
+    AllocateModelMemory, LoadWeights, PrepareKernels, PrepareExecution,
+    PrepareEmbeddingTables, PrepareHostPrefixCache, LoadTokenizer, StartServer, ShutdownServer,
+}
+
+impl StartupStage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Other => "other",
+            Self::VerifyStoredData => "verify_stored_data",
+            Self::PrepareModel => "prepare_model",
+            Self::InitializeGpu => "initialize_gpu",
+            Self::PlanCache => "plan_cache",
+            Self::AllocateCache => "allocate_cache",
+            Self::AllocateModelMemory => "allocate_model_memory",
+            Self::LoadWeights => "load_weights",
+            Self::PrepareKernels => "prepare_kernels",
+            Self::PrepareExecution => "prepare_execution",
+            Self::PrepareEmbeddingTables => "prepare_embedding_tables",
+            Self::PrepareHostPrefixCache => "prepare_host_prefix_cache",
+            Self::LoadTokenizer => "load_tokenizer",
+            Self::StartServer => "start_server",
+            Self::ShutdownServer => "shutdown_server",
+        }
+    }
+
+    fn from_label(label: &str) -> Self {
+        match label {
+            "Verify stored data" => Self::VerifyStoredData,
+            "Prepare model" => Self::PrepareModel,
+            "Initialize GPU" | "Initialize GPUs" => Self::InitializeGpu,
+            "Plan cache" => Self::PlanCache,
+            "Allocate cache" => Self::AllocateCache,
+            "Allocate model memory" => Self::AllocateModelMemory,
+            "Load weights" => Self::LoadWeights,
+            "Prepare kernels" => Self::PrepareKernels,
+            "Prepare execution" => Self::PrepareExecution,
+            "Prepare embedding tables" => Self::PrepareEmbeddingTables,
+            "Prepare host prefix cache" => Self::PrepareHostPrefixCache,
+            "Load tokenizer" => Self::LoadTokenizer,
+            "Start server" => Self::StartServer,
+            "Shut down server" => Self::ShutdownServer,
+            _ => Self::Other,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StartupStatus { Running, Complete, Failed }
+
+/// Latest startup update, retaining at most 512 characters in each text field.
+#[derive(Clone, Debug)]
+pub struct StartupSnapshot {
+    pub sequence: u64,
+    pub stage: StartupStage,
+    pub status: StartupStatus,
+    pub label: String,
+    pub detail: String,
+    pub completed: u64,
+    pub total: Option<u64>,
+    pub elapsed: Duration,
+}
+
+/// A bounded observation independent of terminal rendering or event consumers.
+#[derive(Clone, Default)]
+pub struct StartupObservation(Arc<Mutex<Option<StartupSnapshot>>>);
+
+impl StartupObservation {
+    pub fn snapshot(&self) -> Option<StartupSnapshot> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    fn publish(&self, state: &State, status: StartupStatus) {
+        let mut latest = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let sequence = latest.as_ref().map_or(1, |last| last.sequence.saturating_add(1));
+        *latest = Some(StartupSnapshot {
+            sequence, stage: state.stage, status,
+            label: state.label.chars().take(512).collect(),
+            detail: state.detail.chars().take(512).collect(),
+            completed: state.completed, total: state.total, elapsed: state.started.elapsed(),
+        });
+    }
 }
 
 enum AnimationStop {
@@ -42,6 +130,7 @@ impl StartupProgress {
             terminal: std::io::stderr().is_terminal(),
             output: Arc::new(Mutex::new(Output::default())),
             animation: None,
+            observation: None,
         }
     }
 
@@ -51,7 +140,16 @@ impl StartupProgress {
             terminal: false,
             output: Arc::new(Mutex::new(Output::default())),
             animation: None,
+            observation: None,
         }
+    }
+
+    /// Observes loading without writing stderr or starting terminal workers.
+    pub fn observed() -> (Self, StartupObservation) {
+        let observation = StartupObservation::default();
+        let mut progress = Self::silent();
+        progress.observation = Some(observation.clone());
+        (progress, observation)
     }
 
     /// Whether phases write anything at all.
@@ -137,7 +235,12 @@ impl StartupProgress {
     }
 
     pub fn phase(&self, label: &str, total: Option<u64>) -> Phase {
+        self.phase_named(StartupStage::from_label(label), label, total)
+    }
+
+    pub fn phase_named(&self, stage: StartupStage, label: &str, total: Option<u64>) -> Phase {
         let state = Arc::new(Mutex::new(State {
+            stage,
             label: label.to_owned(),
             detail: String::new(),
             started: Instant::now(),
@@ -152,7 +255,9 @@ impl StartupProgress {
             output: self.output.clone(),
             finished: false,
             animation: None,
+            observation: self.observation.clone(),
         };
+        phase.publish(StartupStatus::Running);
         if self.enabled {
             self.output.lock().unwrap().write(
                 &state.lock().unwrap(),
@@ -203,12 +308,21 @@ pub struct Phase {
     output: Arc<Mutex<Output>>,
     finished: bool,
     animation: Option<(mpsc::Sender<()>, JoinHandle<()>)>,
+    observation: Option<StartupObservation>,
 }
 
 impl Phase {
+    fn publish(&self, status: StartupStatus) {
+        if let Some(observation) = &self.observation {
+            observation.publish(&self.state.lock().unwrap(), status);
+        }
+    }
+
     pub fn advance(&self, count: u64) {
         let mut state = self.state.lock().unwrap();
         state.completed = state.completed.saturating_add(count);
+        drop(state);
+        self.publish(StartupStatus::Running);
     }
 
     pub fn advance_bytes(&self, count: u64) {
@@ -219,10 +333,13 @@ impl Phase {
             Some(total) => format!("{completed:.1} / {:.1} GiB", total as f64 / (1u64 << 30) as f64),
             None => format!("{completed:.1} GiB"),
         };
+        drop(state);
+        self.publish(StartupStatus::Running);
     }
 
     pub fn detail(&self, detail: impl Into<String>) {
         self.state.lock().unwrap().detail = detail.into();
+        self.publish(StartupStatus::Running);
     }
 
     pub fn finish(mut self, detail: impl Into<String>) {
@@ -233,6 +350,7 @@ impl Phase {
 
 impl Drop for Phase {
     fn drop(&mut self) {
+        self.publish(if self.finished { StartupStatus::Complete } else { StartupStatus::Failed });
         if let Some((stop, worker)) = self.animation.take() {
             let _ = stop.send(());
             let _ = worker.join();
@@ -253,6 +371,7 @@ impl Drop for Phase {
 
 #[derive(Clone)]
 struct State {
+    stage: StartupStage,
     label: String,
     detail: String,
     started: Instant,
@@ -445,6 +564,46 @@ fn terminal_size() -> (usize, usize) {
     crate::os::terminal_size()
 }
 
+#[cfg(test)]
+mod observation_tests {
+    use super::*;
+
+    #[test]
+    fn observed_stages_publish_counts_and_terminal_status_without_terminal_workers() {
+        let (progress, observation) = StartupProgress::observed();
+        assert!(!progress.is_enabled());
+        assert!(!progress.is_terminal());
+        let phase = progress.phase("Load weights", Some(10));
+        assert!(phase.animation.is_none());
+        let first = observation.snapshot().unwrap();
+        assert_eq!(first.stage, StartupStage::LoadWeights);
+        assert_eq!(first.status, StartupStatus::Running);
+        phase.advance_bytes(4);
+        assert_eq!(observation.snapshot().unwrap().completed, 4);
+        phase.finish("loaded");
+        let last = observation.snapshot().unwrap();
+        assert_eq!(last.total, Some(10));
+        assert_eq!(last.status, StartupStatus::Complete);
+        assert!(last.sequence > first.sequence);
+        assert_eq!(last.detail, "loaded");
+        drop(progress.phase_named(StartupStage::StartServer, "Listen", None));
+        assert_eq!(observation.snapshot().unwrap().status, StartupStatus::Failed);
+    }
+
+    #[test]
+    fn observer_retains_one_bounded_update_and_survives_producer_drop() {
+        let (progress, observation) = StartupProgress::observed();
+        let phase = progress.phase_named(StartupStage::Other, &"λ".repeat(2000), None);
+        for _ in 0..100 { phase.advance(1); }
+        phase.finish("δ".repeat(2000));
+        drop(progress);
+        let snapshot = observation.snapshot().unwrap();
+        assert_eq!(snapshot.label.chars().count(), 512);
+        assert_eq!(snapshot.detail.chars().count(), 512);
+        assert_eq!(snapshot.completed, 100);
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -456,7 +615,7 @@ mod tests {
         progress.terminal = true;
         progress.animate_banner();
         let started = progress.output.lock().unwrap().started.unwrap();
-        progress.phase("Verify package", None).finish("signatures");
+        progress.phase("Verify core", None).finish("signatures");
         let output = progress.output.clone();
         let result = progress.with_animation_paused(|| {
             let output = output.lock().unwrap();

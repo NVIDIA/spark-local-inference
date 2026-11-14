@@ -4,6 +4,7 @@
 
 """Bootstrap coordination of b12x collectives over an established Gloo group."""
 
+from contextlib import contextmanager
 import json
 from datetime import timedelta
 from pathlib import Path
@@ -17,7 +18,7 @@ def host_identity():
     return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
 
 
-def create_roce_runtime(group, device, *, max_tokens, pipe_tokens, hidden_size, gather_bytes, package_storage=None,
+def create_roce_runtime(group, device, *, max_tokens, pipe_tokens, hidden_size, gather_bytes, core_storage=None,
                         varlen_bytes=0, ring=False, ring_open=False):
     """Allocate RoCEnante for ranks on separate DGX Sparks: BF16 hidden reductions and logit gathers.
 
@@ -27,7 +28,7 @@ def create_roce_runtime(group, device, *, max_tokens, pipe_tokens, hidden_size, 
     reductions, up to `pipe_tokens` rows, run as a pipelined two-shot reduce-scatter and
     all-gather, which moves a ring's bytes for prefill chunks.
 
-    With `package_storage`, the pinned region is package host storage at a recorded address and
+    With `core_storage`, the pinned region is core host storage at a recorded address and
     the runtime is registered for export, so a native rank can rebuild the transport over it.
     `varlen_bytes` sizes each rank's contribution to variable-length gathers; zero prepares none.
     """
@@ -42,17 +43,46 @@ def create_roce_runtime(group, device, *, max_tokens, pipe_tokens, hidden_size, 
         raise ValueError("RoCE capacities must occupy complete 16-byte packs")
     import torch
 
-    region = None if package_storage is None else (
-        lambda size: package_storage.host_allocate("roce", (size,), torch.uint8).host_view)
+    region = None if core_storage is None else (
+        lambda size: core_storage.host_allocate("roce", (size,), torch.uint8).host_view)
     if type(varlen_bytes) is not int or varlen_bytes < 0 or varlen_bytes % 16:
         raise ValueError("variable-length gather capacity must be a nonnegative multiple of 16 bytes")
     runtime = roce.AllReduce(exchange_group=group, device=device, max_size=nbytes, max_gather_bytes=gather_bytes,
                              pipe_bytes=pipe_bytes, region_allocator=region,
                              ring=ring, **({"ring_open": True} if ring_open else {}),
                              **({"max_varlen_bytes": varlen_bytes} if varlen_bytes else {}))
-    if package_storage is not None:
-        package_storage.transports.append(runtime)
+    if core_storage is not None:
+        core_storage.transports.append(runtime)
     return runtime
+
+# RoCEnante kernels poll a peer's flag about once per microsecond and give up after this many
+# polls, so a dead peer surfaces as an error instead of a hung kernel. b12x's default of 20
+# million polls, about 20 s, suits serving. Compiled warmup's first pass builds and benchmarks each
+# forward's Triton kernels between collective launches, and the rank that compiled a forward meets
+# its kernels warm while its peer builds them, so one rank can trail the other by minutes within
+# one forward. Warmup waits about ten minutes instead; captured graphs keep the serving wait.
+WARMUP_SPIN_LIMIT = 600_000_000
+
+
+@contextmanager
+def warmup_wait(runtime, coordinator):
+    """Widen `runtime`'s collective wait while compiled forwards warm on ranks spanning hosts.
+
+    The wait is a RoCEnante launch argument, so the widened value applies to warmup launches
+    and the value restored on exit is what capture bakes into serving graphs. Runtimes without
+    a poll limit, such as PCIe reductions, are left unchanged.
+    """
+    limit = None if runtime is None or coordinator is None or not coordinator.spans_hosts else getattr(
+        runtime, "spin_limit", None)
+    if limit is None:
+        yield
+        return
+    runtime.spin_limit = max(limit, WARMUP_SPIN_LIMIT)
+    try:
+        yield
+    finally:
+        runtime.spin_limit = limit
+
 
 def create_all_reduce_runtime(group, device, *, max_tokens, hidden_size, ipc=None, element_bytes=2,
                               collective_tuning="static"):
@@ -156,6 +186,42 @@ def _tuning_results(contributions):
     return tuple(results)
 
 
+def _selected_plan_catalog(requests):
+    from b12x.preparation.session import _declaration_key
+    from b12x.preparation.types import _CompositePlan
+
+    def declaration(plan):
+        if isinstance(plan, _CompositePlan):
+            return (plan.component_id, plan.composite_semantic_version, plan.capacity_metadata,
+                    tuple((count, declaration(child)) for count, child in plan.variants.items()))
+        return _declaration_key(plan)[:-1]
+
+    by_name = {request.name: request for request in requests}
+    identities = {}
+
+    def identity(name):
+        if name not in identities:
+            request = by_name[name]
+            identities[name] = (declaration(request.plan),
+                                tuple(identity(dependency) for dependency in request.dependencies))
+        return identities[name]
+
+    entries = []
+
+    def selected(plan, key):
+        if isinstance(plan, _CompositePlan):
+            for count, child in plan.variants.items():
+                selected(child, (key, count))
+        else:
+            config = plan.selection.config
+            entries.append((plan, key, plan.contract.config_payload(config), config))
+
+    for request in requests:
+        if request.collective is None:
+            selected(request.plan, identity(request.name))
+    return entries
+
+
 class CollectivePreparation:
     """Authorize matching collective declarations and synchronize kernel entry.
 
@@ -173,12 +239,61 @@ class CollectivePreparation:
             raise ValueError("collective preparation requires a Gloo control group")
         self.group = group
         self.ranks = tuple(dist.get_process_group_ranks(group))
+        self.control_groups = {self.ranks: group}
+        self.operation_ranks = {}
         self.timeout = timeout
         hosts = [None] * len(self.ranks)
         dist.all_gather_object(hosts, host_identity(), group=group)
         # Each rank's host, in group order; ranks on one host share its CPUs and CUDA IPC.
         self.hosts = tuple(hosts)
         self.local_ranks = self.hosts.count(host_identity())
+
+    def register_group(self, ranks, group):
+        """Retain a control subgroup used by hybrid TP/DCP collective barriers."""
+        ranks = tuple(ranks)
+        if not ranks or any(rank not in self.ranks for rank in ranks) or ranks in self.control_groups:
+            raise ValueError("collective subgroup must be a new nonempty subset of the control ranks")
+        self.control_groups[ranks] = group
+
+    def _global_rank(self):
+        try:
+            return dist.get_rank()
+        except (RuntimeError, ValueError):
+            return self.ranks[0]
+
+    def _local_index(self):
+        return self.ranks.index(self._global_rank())
+
+    def _remember_operation_ranks(self, states):
+        """Record each operation's control group for final per-group selection checks."""
+        local_rank = self._global_rank()
+
+        def remember(key, ranks):
+            ranks = tuple(ranks)
+            if local_rank in ranks:
+                self.operation_ranks[key] = ranks
+
+        for state in states:
+            if type(state[0]) is bool:
+                for key, ranks in state[1]:
+                    remember(key, ranks)
+                if state[5] is not None and getattr(state[5], "key", None) is not None:
+                    remember(state[5].key, state[5].ranks)
+                for contribution in state[4]:
+                    if getattr(contribution, "key", None) is not None and getattr(contribution, "ranks", None) is not None:
+                        remember(contribution.key, contribution.ranks)
+            else:
+                for key, ranks in state[0]:
+                    remember(key, ranks)
+                if state[1] is not None and getattr(state[1], "key", None) is not None:
+                    remember(state[1].key, state[1].ranks)
+
+    def _members(self, states, ranks):
+        """Select only the local operation's control group from a TP-wide progress exchange."""
+        ranks = tuple(ranks)
+        if not ranks or self._global_rank() not in ranks or any(rank not in self.ranks for rank in ranks):
+            raise ValueError("collective operation requires a subgroup containing the local rank")
+        return [state for state, rank in zip(states, self.ranks, strict=True) if rank in ranks]
 
     @property
     def spans_hosts(self):
@@ -212,12 +327,52 @@ class CollectivePreparation:
                  for item in selections}
         gathered = [None] * len(self.ranks)
         dist.all_gather_object(gathered, local, group=self.group)
-        root = gathered[0]
-        differing = sorted(name for other in gathered[1:] for name, value in other.items()
-                           if name in root and root[name] != value)
+        operation_ranks = getattr(self, "operation_ranks", {})
+        differing = set()
+        for name in local:
+            ranks = operation_ranks.get(name, self.ranks)
+            positions = [index for index, rank in enumerate(self.ranks) if rank in ranks]
+            if not positions:
+                continue
+            root = gathered[positions[0]]
+            for index in positions[1:]:
+                other = gathered[index]
+                if name in root and name in other and root[name] != other[name]:
+                    differing.add(name)
+        differing = sorted(differing)
         if differing:
             raise RuntimeError(f"{len(differing)} kernel selections differ from rank zero's, such as "
                                f"{differing[:3]}; preparing again adopts rank zero's tuning decisions")
+
+    def reconcile_selections(self, requests):
+        """Choose one actual configuration for matching declarations across ranks.
+
+        Unequal catalogs cannot shard candidate races. Their shared declarations
+        still need matching scratch layouts before compiled forwards are shared.
+        """
+        entries = _selected_plan_catalog(requests)
+        local = {}
+        for _, key, payload, config in entries:
+            local.setdefault(key, {}).setdefault(payload, config)
+        gathered = [None] * len(self.ranks)
+        dist.all_gather_object(gathered, local, group=self.group)
+        chosen, participants = {}, {}
+        for catalog in gathered:
+            for key, values in catalog.items():
+                chosen.setdefault(key, next(iter(values.items())))
+                participants[key] = participants.get(key, 0) + 1
+        common = {key for key, count in participants.items() if count > 1}
+        changed = any(payload != chosen[key][0]
+                      for catalog in gathered for key, values in catalog.items() if key in common
+                      for payload in values)
+        configs = {}
+        for plan, key, payload, _ in entries:
+            if key in common and payload != chosen[key][0]:
+                config = chosen[key][1]
+                if plan in configs and plan.contract.config_payload(configs[plan]) != chosen[key][0]:
+                    raise ValueError("one plan has conflicting rank-shared configurations")
+                configs[plan] = config
+        return configs, changed
 
     def __call__(self, progress):
         if progress.ready_cache is not None or progress.ready_tuning:
@@ -226,22 +381,26 @@ class CollectivePreparation:
         local = (pending, progress.ready_collective_tuning)
         states = [None] * len(self.ranks)
         dist.all_gather_object(states, local, group=self.group)
+        self._remember_operation_ranks(states)
         if not all(item[0] or item[1] is not None for item in states):
             return None
         if all(item[1] is not None for item in states):
-            values = tuple(item[1] for item in states)
-            if any(item.ranks != self.ranks for item in values):
-                raise ValueError("collective tuning requires the complete control group")
+            local = states[self._local_index()][1]
+            members = self._members(states, local.ranks)
+            values = tuple(item[1] for item in members)
+            if any(getattr(item, "key", None) != getattr(local, "key", None) or item.ranks != local.ranks
+                   for item in values):
+                return None
             return values
-        states = [item[0] for item in states]
-        if any(state != states[0] for state in states[1:]):
+        local = states[self._local_index()][0]
+        ranks = local[0][1]
+        states = [item[0] for item in self._members(states, ranks)]
+        if any(state != local for state in states):
             raise RuntimeError(f"collective preparation declarations differ across ranks: {states}")
-        key, ranks = states[0][0]
-        if tuple(ranks) != self.ranks:
-            raise ValueError("collective preparation requires the complete control group")
+        key, _ = local[0]
         return key
 
-    def prepare(self, session, requests, *, progress=None, autotune=None):
+    def prepare(self, session, requests, *, progress=None, autotune=None, selected_configs=None):
         """Drive a mixed local/collective job until every rank has finished.
 
         A finished rank must still exchange readiness while its peers compile
@@ -256,7 +415,8 @@ class CollectivePreparation:
             while True:
                 try:
                     if job is None:
-                        job = session.begin(requests, autotune=autotune)
+                        options = {} if selected_configs is None else {"selected_configs": selected_configs}
+                        job = session.begin(requests, autotune=autotune, **options)
                     if state is None or not state.done:
                         state = job.advance(**authorization)
                         if progress is not None:
@@ -270,58 +430,74 @@ class CollectivePreparation:
                          None if state is None else state.ready_collective_tuning)
                 states = [None] * len(self.ranks)
                 dist.all_gather_object(states, local, group=self.group)
+                self._remember_operation_ranks(states)
                 failures = [(rank, item[2]) for rank, item in zip(self.ranks, states, strict=True) if item[2] is not None]
                 if failures:
                     raise RuntimeError(f"rank preparation failed: {failures}") from error
                 if all(item[0] for item in states):
                     return job.result()
-                if any(item[0] for item in states) and any(item[1] or item[3] is not None or item[4] or item[5] is not None
-                                                        for item in states):
-                    raise RuntimeError("a rank finished before its peer's collective declaration")
                 authorization = {"collective_key": None}
-                if all(item[5] is not None for item in states):
-                    if any(item[5].ranks != self.ranks for item in states):
-                        raise ValueError("collective tuning requires the complete control group")
-                    authorization = {"collective_tuning": tuple(item[5] for item in states)}
+                local = states[self._local_index()]
+                operation, local_ranks = None, None
+                for index in (5, 3, 4, 1):
+                    value = local[index]
+                    if value:
+                        operation = index
+                        local_ranks = (getattr(value, "ranks", self.ranks) if index in (5, 3) else
+                                       getattr(value[0], "ranks", self.ranks) if index == 4 else value[0][1])
+                        break
+                if operation is None:
+                    if local[0]:
+                        for item in states:
+                            for index in (5, 3, 4, 1):
+                                value = item[index]
+                                if value:
+                                    ranks = (getattr(value, "ranks", self.ranks) if index in (5, 3) else
+                                             getattr(value[0], "ranks", self.ranks) if index == 4 else value[0][1])
+                                    if self._global_rank() in ranks:
+                                        raise RuntimeError("a rank finished before its peer's collective declaration")
                     continue
-                if all(item[3] is not None for item in states):
-                    # Each rank reconciles every rank's cached selections, rank zero's first.
-                    authorization = {"cache": tuple(item[3] for item in states)}
+                members = self._members(states, local_ranks)
+                def busy(item):
+                    return item[1] or item[3] is not None or item[4] or item[5] is not None
+                if any(item[0] for item in members) and any(busy(item) for item in members):
+                    raise RuntimeError("a rank finished before its peer's collective declaration")
+                if not all(item[operation] for item in members):
                     continue
-                if all(item[4] for item in states):
-                    races = [sorted(contribution.key for contribution in item[4]) for item in states]
+                if operation == 5:
+                    if any(item[5] is None or getattr(item[5], "key", None) != getattr(local[5], "key", None)
+                           or item[5].ranks != local_ranks for item in members):
+                        continue
+                    authorization = {"collective_tuning": tuple(item[5] for item in members)}
+                elif operation == 3:
+                    if any(item[3] is None or getattr(item[3], "ranks", self.ranks) != local_ranks for item in members):
+                        continue
+                    # Each operation reconciles its own group's cached selections, first rank first.
+                    authorization = {"cache": tuple(item[3] for item in members)}
+                elif operation == 4:
+                    contributions = [item[4] for item in members]
+                    if any({getattr(contribution, "ranks", self.ranks) for contribution in group} != {local_ranks}
+                           for group in contributions):
+                        continue
+                    races = [sorted(contribution.key for contribution in group) for group in contributions]
                     if any(keys != races[0] for keys in races[1:]):
                         reference = set(races[0])
-                        counts = dict(zip(self.ranks, map(len, races), strict=True))
+                        counts = dict(zip(local_ranks, map(len, races), strict=True))
                         differences = {}
-                        for rank, keys in zip(self.ranks[1:], races[1:], strict=True):
+                        for rank, keys in zip(local_ranks[1:], races[1:], strict=True):
                             missing, extra = reference - set(keys), set(keys) - reference
                             if missing or extra:
                                 differences[rank] = {"missing": len(missing), "extra": len(extra),
                                                      "examples": sorted(missing | extra)[:2]}
                         raise RuntimeError(f"tuning races differ across ranks: counts={counts}, differences={differences}")
-                    results = _tuning_results(contribution for item in states for contribution in item[4])
+                    results = _tuning_results(contribution for group in contributions for contribution in group)
                     authorization = {"tuning": results[0] if len(results) == 1 else results}
-                    continue
-                ready = [item[1] for item in states]
-                if all(ready):
-                    if any(item != ready[0] for item in ready[1:]):
-                        raise RuntimeError(f"collective preparation declarations differ across ranks: {ready}")
-                    key, ranks = ready[0][0]
-                    if tuple(ranks) != self.ranks:
-                        raise ValueError("collective preparation requires the complete control group")
-                    authorization = {"collective_key": key}
-                elif all(item[1] or item[3] is not None or item[4] or item[5] is not None for item in states):
-                    pending = {
-                        rank: {
-                            "collectives": item[1],
-                            "cache": None if item[3] is None else tuple(item[3].records),
-                            "tuning": tuple(contribution.key for contribution in item[4]),
-                            "collective_tuning": None if item[5] is None else (item[5].key, item[5].step),
-                        }
-                        for rank, item in zip(self.ranks, states, strict=True)
-                    }
-                    raise RuntimeError(f"ranks reached incompatible preparation exchanges: {pending}")
+                else:
+                    if any(tuple(ranks) != local_ranks for _, ranks in local[1]):
+                        raise ValueError("collective declaration mixes incompatible control groups")
+                    if any(item[1] != local[1] for item in members):
+                        continue
+                    authorization = {"collective_key": local[1][0][0]}
         except BaseException as failure:
             try:
                 if job is not None:
@@ -334,6 +510,7 @@ class CollectivePreparation:
             raise
 
     def barrier(self, key, ranks):
-        if tuple(ranks) != self.ranks:
+        ranks = tuple(ranks)
+        if ranks not in self.control_groups:
             raise ValueError(f"collective {key!r} does not span its control group")
-        dist.monitored_barrier(group=self.group, timeout=self.timeout, wait_all_ranks=True)
+        dist.monitored_barrier(group=self.control_groups[ranks], timeout=self.timeout, wait_all_ranks=True)

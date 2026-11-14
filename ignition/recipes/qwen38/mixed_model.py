@@ -5,6 +5,7 @@
 """Mixed prompt and decode execution through one packed Qwen target forward."""
 
 from copy import copy
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 import torch
@@ -18,6 +19,12 @@ from .speculative_model import PreparedPrefillAbsorption, PreparedSpeculativeRou
 from .vision_state import PreparedEmbeddingInjection
 
 
+@dataclass(frozen=True)
+class MixedAuxiliary:
+    residual: torch.Tensor
+    mixed: tuple
+
+
 class MixedEmbeddingInjection:
     def __init__(self, packing, features, state, embedding, scratch):
         self.packing, self.embedding, self.scratch = packing, embedding, scratch
@@ -26,14 +33,19 @@ class MixedEmbeddingInjection:
             i.row_slot_ids, i.row_generations, i.query_lengths, i.live_rows, scratch)
         self.prompt.prepare()
 
-    def validate(self):
-        self.prompt.validate()
+    def functional(self):
+        self.prompt.functional(dynamic_inputs=True)
+        self.packing = self.embedding = self.scratch = None
+        return self
 
-    def inject(self):
-        self.scratch.copy_(self.embedding[self.packing.prompt_indices])
-        self.prompt.inject()
-        self.embedding.copy_(torch.where(self.packing.is_prompt[:, None],
-            self.scratch[self.packing.prompt_source], self.embedding))
+    def validate_runtime(self, packing):
+        return self.prompt.validate(packing.prompt)
+
+    def inject(self, embedding, errors):
+        errors, packing = errors
+        scratch = embedding[packing.prompt_indices]
+        self.prompt.inject(scratch, errors, packing.prompt)
+        embedding.copy_(torch.where(packing.is_prompt[:, None], scratch[packing.prompt_source], embedding))
 
 
 class PreparedMixedRound:
@@ -46,9 +58,9 @@ class PreparedMixedRound:
         self.packing = MixedPacking(owner.inputs, self.prompt_inputs, self.decode_inputs, batch, width, prefill)
         self.prompt_state = PreparedDecoderState(self.prompt_inputs, owner.requests, owner.pool,
             tokens=prefill, rows=1, mode="prefill", maintain_draft_state=enabled)
-        private = owner.completion.private_storage.cursor()
-        self.prompt_completion = owner.completion.private(private)
-        self.decode_completion = owner.completion.private(private)
+        if not hasattr(owner, "mixed_completions"):
+            owner.mixed_completions = (owner.completion.private(), owner.completion.private())
+        self.prompt_completion, self.decode_completion = owner.mixed_completions
         self.prompt_decoder = SimpleNamespace(state=self.prompt_state)
         self.absorb = None
         if enabled:
@@ -108,21 +120,70 @@ class PreparedMixedRound:
             self.decode_sampler.prepare_broadcast(runtime=owner.collectives["vocabulary_runtime"],
                 session=owner.session, coordinator=owner.collectives["coordinator"], name=name + ".decode.sampling")
 
-    def __call__(self):
-        o = self.owner
-        self.packing.upload_roles()
-        if self.absorb is not None:
-            self.absorb.begin()
+    def functional(self, *, session):
+        self.packing.functional()
         if self.enabled:
-            self.round()
+            self.round.functional(session=session, dynamic_inputs=True)
         else:
-            self.decoder()
-            self.decode_sampler()
-            self.prompt_sampler()
+            self.decoder.functional(session=session)
+            self.prompt_sampler.functional(session=session, dynamic_inputs=True)
+            self.decode_sampler.functional(session=session, dynamic_inputs=True)
         if self.absorb is not None:
-            self.absorb.finish()
+            self.absorb.mtp.functional(session=session)
+            self.absorb.metadata.functional()
+            self.absorb.mtp.release_outputs()
+            self.absorb.before = self.absorb.previous = self.absorb.previous_rope = None
+            self.absorb.indices = self.absorb.target_residual = None
+            self.absorb.owner.inputs = None
+            self.absorb.owner.release_examples()
+        if self.enabled:
+            self.round.owner.inputs = None
+            self.round.owner.release_examples()
+        self.prompt_decoder.residual_output = None
+        self.decoder.release_outputs()
+        self.prompt_inputs = self.decode_inputs = None
+        return self
+
+    def __call__(self):
+        from ignition.components.state import gather_rows
+
+        o = self.owner
+        packing = self.packing.runtime()
+        saved = None
+        if self.absorb is not None:
+            slots = packing.prompt.row_slot_ids[:1]
+            safe = slots.long().clamp(0, o.requests.capacity - 1)
+            before = o.requests.consumed_tokens[safe]
+            previous = torch.empty((1, 10240), dtype=torch.bfloat16, device=slots.device)
+            rope = torch.empty((1, 3), dtype=torch.int64, device=slots.device)
+            state_rows = packing.prompt.request_state_rows[safe, 0]
+            gather_rows(o.pool.region("target_residual"), state_rows, previous)
+            gather_rows(o.pool.region("target_residual_position"), state_rows, rope)
+            saved = before, previous, rope
+        if self.enabled:
+            result = self.round.run(packing.decode, packing)
+        else:
+            errors = self.decoder.embedding_injection.validate_runtime(packing)
+            prompt = self.prompt_state.begin_runtime(packing.prompt)
+            decode = self.decoder.state.decode.begin_runtime(packing.decode)
+            runtime = self.decoder.state.combine_runtime(packing, prompt, decode)
+            runtime.injection_errors = (errors, packing)
+            _, logits, auxiliary, _ = self.decoder(runtime)
+            b = packing.batch
+            self.decode_sampler.run(logits[:b], slots=packing.decode.row_slot_ids[:b],
+                generations=packing.decode.row_generations[:b], live_rows=packing.decode.live_rows,
+                sample_enabled=packing.decode.sample_enabled[:b])
+            self.prompt_sampler.run(logits[b:], slots=packing.prompt.row_slot_ids[:1],
+                generations=packing.prompt.row_generations[:1], live_rows=packing.prompt.live_rows,
+                sample_enabled=packing.prompt.sample_enabled[:1])
+            result = runtime, auxiliary
+        if self.absorb is not None:
+            runtime, auxiliary = result
+            prompt_residual = runtime.gdn_partitions.parts[0].gather(auxiliary.residual)
+            self.absorb.finish_runtime(packing.prompt, runtime.prompt, prompt_residual, *saved)
         o.completion.merge(self.prompt_completion, self.decode_completion,
-            self.prompt_inputs.row_slot_ids[0], o.frame)
+            packing.prompt.row_slot_ids[0], o.frame)
+
 
 
 class DecodeTarget:
@@ -131,6 +192,21 @@ class DecodeTarget:
     def __init__(self, scratch, forward, prompt_sampler):
         self.scratch, self.forward, self.prompt_sampler = scratch, forward, prompt_sampler
 
-    def __call__(self):
-        self.forward()
-        self.prompt_sampler()
+    def functional(self, *, session):
+        self.forward.functional(session=session)
+        self.prompt_sampler.functional(session=session, dynamic_inputs=True)
+        return self
+
+    def __call__(self, decode, packing):
+        state = self.forward.state
+        errors = self.forward.embedding_injection.validate_runtime(packing)
+        prompt = state.prompt.begin_runtime(packing.prompt)
+        runtime = state.combine_runtime(packing, prompt, decode)
+        runtime.injection_errors = (errors, packing)
+        hidden, logits, auxiliary, records = self.forward(runtime)
+        b = packing.batch * packing.width
+        self.prompt_sampler.run(logits[b:], slots=packing.prompt.row_slot_ids[:1],
+            generations=packing.prompt.row_generations[:1], live_rows=packing.prompt.live_rows,
+            sample_enabled=packing.prompt.sample_enabled[:1])
+        decode_residual = runtime.gdn_partitions.parts[1].gather(auxiliary.residual)
+        return hidden[:b], logits[:b], MixedAuxiliary(decode_residual, (runtime, auxiliary)), records

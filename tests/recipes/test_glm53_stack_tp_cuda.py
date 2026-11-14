@@ -116,6 +116,8 @@ def _rank(rank, world, rendezvous, snapshot, capacity, generate=False, sockets=(
         requests = DeviceRequestState.allocate(device, vocab_size=154880,
             consumed_tokens=pool.consumed_tokens[1:5, 0]) if generate else None
         inputs = BatchInputs.allocate(capacity, 64, device) if generate else None
+        if generate:
+            inputs.request_state_rows[:, 0].copy_(torch.arange(1, 5, device=device))
         records = torch.zeros((2, 4, 32), dtype=torch.int64, device=device) if generate else None
         frame = torch.zeros(1, dtype=torch.int32, device=device) if generate else None
         sequence = torch.zeros(1, dtype=torch.int64, device=device) if generate else None
@@ -132,21 +134,38 @@ def _rank(rank, world, rendezvous, snapshot, capacity, generate=False, sockets=(
                     runtime=runtime, vocabulary_runtime=vocabulary_runtime, coordinator=coordinator,
                     session=session, name=mode, workspace=arena,
                     progress=progress)
-                forwards[mode] = decoders[mode]
                 if generate:
-                    batch = PreparedBatch(inputs, requests, metadata[mode], mode=mode, shard=shard, pages=64)
-                    forwards[mode] = PreparedGeneration(decoders[mode], batch, completion_outputs(records), frame, sequence,
+                    batch = PreparedBatch(inputs, requests, metadata[mode], mode=mode, shard=shard, pages=pool.memory_capacity[1:])
+                    generation = PreparedGeneration(decoders[mode], batch, completion_outputs(records), frame, sequence,
                         pool=pool, runtime=runtime, coordinator=coordinator, session=session, name=f"{mode}.generation")
+                    def forward(generation=generation, readback=scratch[mode]):
+                        result = generation.forward()
+                        readback.hidden.copy_(result.hidden)
+                        readback.logits.copy_(result.logits)
+                else:
+                    decoders[mode].functional(session=session)
+                    def forward(decoder=decoders[mode], m=metadata[mode], readback=scratch[mode]):
+                        hidden, logits, _, _ = decoder(m)
+                        readback.hidden.copy_(hidden)
+                        readback.logits.copy_(logits)
+                forwards[mode] = forward
             if checkpoint:
-                forwards["resume"] = PreparedResume(weights, requests, pool, inputs, completion_outputs(records), frame, sequence,
+                resume = PreparedResume(weights, requests, pool, inputs, completion_outputs(records), frame, sequence,
                     rows=1, runtime=runtime, vocabulary_runtime=vocabulary_runtime,
                     coordinator=coordinator, session=session, name="resume")
+                resume_readback = (torch.empty_like(scratch["decode"].hidden), torch.empty_like(scratch["decode"].logits))
+                def resume_forward():
+                    hidden, logits = resume.forward()
+                    resume_readback[0].copy_(hidden)
+                    resume_readback[1].copy_(logits)
+                forwards["resume"] = resume_forward
                 for mode in ("init", "restore", "snapshot"):
                     forwards[mode] = PreparedMaintenance(mode, requests, pool, commands, inputs, completion_outputs(records), frame, sequence,
                         runtime=runtime, coordinator=coordinator, session=session, name=mode, admission_buffers=admission)
                 graphs.update({mode: torch.cuda.CUDAGraph() for mode in ("resume", "init", "restore", "snapshot")})
             progress("autotuning complete text forwards")
             session.tune()
+            arena.release_preparation()
             compiled = {}
             stream = torch.cuda.Stream(device=device)
             for mode, decoder in forwards.items():
@@ -164,14 +183,15 @@ def _rank(rank, world, rendezvous, snapshot, capacity, generate=False, sockets=(
             resources = (weights, compiled, decoders, forwards, pool, metadata, scratch, session, arena, runtime, stream)
             if generate:
                 buffers = dict(inputs.buffers(), completion_records=records, frame_index=frame, submission_sequence=sequence)
-                signatures = {mode: GraphSignature(mode, 1, capacity if mode == "prefill" else 1, tuple(inputs.buffers()))
+                signatures = {mode: GraphSignature(mode, 1, capacity if mode == "prefill" else 1,
+                    tuple(name for name in inputs.buffers() if mode != "decode" or name not in ("token_ids", "query_lengths")))
                               for mode in graphs}
                 if checkpoint:
                     state_buffers = commands.buffers()
                     admission_buffers = {name: getattr(admission, name) for name in admission.__dataclass_fields__}
                     buffers.update(state_buffers)
                     buffers.update(admission_buffers)
-                    rows = ("row_slot_ids", "row_generations", "live_rows")
+                    rows = ("request_state_rows", "row_slot_ids", "row_generations", "live_rows")
                     signatures["resume"] = GraphSignature("resume", 1, 1, rows)
                     signatures["snapshot"] = GraphSignature("snapshot", 4, 1, (*rows, "page_tables", *state_buffers))
                     for mode in ("init", "restore"):
@@ -199,6 +219,7 @@ def _rank(rank, world, rendezvous, snapshot, capacity, generate=False, sockets=(
                 if not checkpoint:
                     requests.admit(0, RequestAdmission(1, 13, max_new_tokens=32, eos_token_ids=tuple(eos)), tokens)
                 host = BatchInputs.allocate(capacity, 64, "cpu")
+                host.request_state_rows[:, 0].copy_(torch.arange(1, 5))
                 host.row_slot_ids[0], host.row_generations[0] = 0, 1
                 host.live_rows.fill_(1)
                 host.sample_enabled[0] = 1
@@ -215,7 +236,7 @@ def _rank(rank, world, rendezvous, snapshot, capacity, generate=False, sockets=(
                 from tests.recipes.glm53_cached_generation import run_cached_generation
 
                 branches = run_cached_generation(worker, bundle, pool, requests, scratch, forwards["resume"],
-                    tokens, eos, capacity, progress)
+                    tokens, eos, capacity, progress, resume_readback=resume_readback)
                 finished = True
             for index in range((0 if rank or checkpoint else 32) if generate else 4):
                 mode = "prefill" if index == 0 else "decode"
@@ -225,7 +246,7 @@ def _rank(rank, world, rendezvous, snapshot, capacity, generate=False, sockets=(
                     host.token_ids.zero_()
                     host.token_ids[:len(ids)].copy_(torch.tensor(ids))
                     host.query_lengths[0] = len(ids)
-                    uploads = [(name, 0, value.numpy().tobytes()) for name, value in host.buffers().items()]
+                    uploads = [(name, 0, getattr(host, name).numpy().tobytes()) for name in bundle.signatures[mode].inputs]
                 else:
                     _inputs(metadata[mode], tokens[:capacity] if index == 0 else tokens[start:start + 1], start)
                 torch.cuda.synchronize(device)
@@ -299,20 +320,25 @@ def _rank(rank, world, rendezvous, snapshot, capacity, generate=False, sockets=(
                 dist.broadcast_object_list(counts, src=0, group=group)
                 for slot, count in counts[0].items():
                     assert requests.consumed_tokens[slot] == len(tokens) + count - 1
-                    assert requests.generated_tokens[slot] == (count if rank == 0 else 0)
+                    assert requests.generated_tokens[slot] == count
                 last_slot = 3 if checkpoint else 1
                 torch.testing.assert_close(pool.last_hidden[last_slot], scratch["decode"].hidden[0], rtol=0, atol=0)
                 assert not pool.backing[[0, 4] if checkpoint else [0, 2, 3, 4, 5]].count_nonzero()
                 if checkpoint:
                     assert pool.consumed_tokens[1] == len(tokens) and pool.consumed_tokens[5] == len(tokens)
                     torch.testing.assert_close(pool.last_hidden[5], scratch["prefill"].hidden[0], rtol=0, atol=0)
-                    torch.testing.assert_close(forwards["resume"].state.hidden[0], pool.last_hidden[5], rtol=0, atol=0)
+                    torch.testing.assert_close(resume_readback[0][0], pool.last_hidden[5], rtol=0, atol=0)
             progress(f"weight bytes {weights.allocated_bytes}; operator scratch bytes {arena.nbytes}")
             if worker is not None:
                 worker.close()
                 worker = None
             for graph in graphs.values():
                 graph.reset()
+    except BaseException:
+        import traceback
+
+        traceback.print_exc()
+        raise
     finally:
         if worker is not None:
             worker.close()

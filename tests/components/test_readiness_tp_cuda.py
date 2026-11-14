@@ -34,7 +34,7 @@ def _rank(rank, world, rendezvous):
     from ignition.components.collectives import _all_reduce
     from ignition.components.readiness import PreparedReadinessWait, ReadinessTimings, record_timestamp, wait_for_readiness
     from ignition.preparation.collectives import CollectivePreparation, create_all_reduce_runtime
-    from ignition.preparation.package_storage import PackageStorage
+    from ignition.preparation.core_storage import CoreStorage
     from ignition.preparation.tuning import RecordedPreparationSession
 
     torch.cuda.set_device(rank)
@@ -47,7 +47,7 @@ def _rank(rank, world, rendezvous):
     progress.host_view.zero_()
     generation = 0
     try:
-        with PackageStorage(rank=rank, world=world, device=rank) as storage:
+        with CoreStorage(rank=rank, world=world, device=rank) as storage:
             coordinator = CollectivePreparation(dist.group.WORLD)
             runtime = create_all_reduce_runtime(dist.group.WORLD, device, max_tokens=1,
                                                hidden_size=8, ipc=storage.peer_storage)

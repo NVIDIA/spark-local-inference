@@ -785,6 +785,7 @@ dependencies = [
 name = "flare-heliopause"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "flare-helios",
  "io-uring",
  "libc",

@@ -65,6 +65,15 @@ impl RankExecutor {
         }
     }
 
+    /// Wait briefly for this rank's running frame; false when the caller should keep polling.
+    pub(crate) fn park(&self) -> bool {
+        match self {
+            Self::Local(executor) => executor.park(),
+            Self::Parallel(executor) => executor.park(),
+            Self::Threaded(_) => false,
+        }
+    }
+
     pub(crate) fn outstanding(&self) -> usize {
         match self {
             Self::Local(executor) => executor.outstanding(),

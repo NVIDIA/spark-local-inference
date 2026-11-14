@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Package export and development serving with injected preparation resources."""
+"""Core export and development serving with injected preparation resources."""
 
 import json
 import os
@@ -54,7 +54,7 @@ class Prepared:
 
 @pytest.fixture
 def host(monkeypatch, tmp_path):
-    from ignition.preparation import module_images, package_storage, model_package
+    from ignition.preparation import module_images, core_storage, model_core
 
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("COLUMNS", "200")
@@ -92,12 +92,12 @@ def host(monkeypatch, tmp_path):
     monkeypatch.setitem(sys.modules, "torch", types.SimpleNamespace(
         cuda=types.SimpleNamespace(set_device=lambda _: None), OutOfMemoryError=OutOfMemoryError))
     monkeypatch.setattr(module_images, "ModuleImages", Scope)
-    monkeypatch.setattr(package_storage, "PackageStorage", Scope)
+    monkeypatch.setattr(core_storage, "CoreStorage", Scope)
 
-    def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_graphs=False, package_storage):
-        assert isinstance(package_storage, Scope)
+    def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_graphs=False, core_storage):
+        assert isinstance(core_storage, Scope)
         calls.update(snapshot=snapshot, plan=plan, compile_forwards=compile_forwards,
-                     kernel_cache=kernel_cache, storage=package_storage, retain_graphs=retain_graphs)
+                     kernel_cache=kernel_cache, storage=core_storage, retain_graphs=retain_graphs)
         behavior = dict(calls["behavior"])
         if "raises" in behavior:
             raise behavior["raises"]
@@ -122,12 +122,12 @@ def host(monkeypatch, tmp_path):
         calls["publisher"] = publisher
         calls["options"] = options
         calls["exports"] += 1
-        from ignition.preparation.package_snapshot import _OPTIONS
+        from ignition.preparation.core_snapshot import _OPTIONS
         assert path is None
         calls["cache"] = _OPTIONS.get().cache
         calls["entry_path"] = calls["cache"] / "models" / "qwen38" / f"gb202-tp1-test-{calls['exports']}"
         return types.SimpleNamespace(entry_path=calls["entry_path"])
-    monkeypatch.setattr(model_package, "export_package", export_model)
+    monkeypatch.setattr(model_core, "export_core", export_model)
 
     return calls
 
@@ -159,7 +159,7 @@ def test_export_records_rebuild_settings_and_closes_preparation(host):
     assert 'history_drafts' not in host['options']
     assert 'history_drafts' not in rebuild.speculation
     from google.protobuf.json_format import ParseDict
-    from ignition.preparation.runtime_package_pb2 import RebuildManifest
+    from ignition.preparation.runtime_core_pb2 import RebuildManifest
     encoded = ParseDict(host['options']['rebuild_manifest'], RebuildManifest()).SerializeToString()
     decoded = RebuildManifest.FromString(encoded)
     assert 'history_drafts' not in {field.name for field, _ in decoded.speculation.ListFields()}
@@ -171,9 +171,9 @@ def test_export_records_rebuild_settings_and_closes_preparation(host):
 
 
 @pytest.mark.parametrize("budget", [None, 1536])
-def test_export_server_options_match_package_contract(tmp_path, budget):
+def test_export_server_options_match_core_contract(tmp_path, budget):
     from google.protobuf.json_format import ParseDict
-    from ignition.preparation.runtime_package_pb2 import ServingContract
+    from ignition.preparation.runtime_core_pb2 import ServingContract
 
     model = resolve("qwen3.8-flash")
     plan = types.SimpleNamespace(recipe=model.recipe, checkpoint=model.checkpoint, reserve_bytes=0,
@@ -192,6 +192,7 @@ def test_export_server_options_match_package_contract(tmp_path, budget):
     ("deepseek-v4.1-flash", "DeepSeek-V4.1-Flash"),
     ("deepseek-v4-flash", "DeepSeek-V4-Flash-Vision-Exp"),
     ("mimo-v2.6-pro-mopd", "MiMo-V2.6-Pro-MOPD"),
+    ("mimo-v2.6-flash-rl", "MiMo-V2.6-Flash-RL"),
     ("kimi-k3-mxfp4-csf", "Kimi-K3"),
     ("kimi-k3", "Kimi-K3"),
     ("kimi-k3-dspark", "Kimi-K3"),
@@ -397,21 +398,24 @@ def test_export_does_not_launch_a_server_and_preserves_the_serving_plan(host, tm
     assert host["options"]["reserve_bytes"] == reserve
     assert "headroom_bytes" not in host["options"]
     assert host["prepared"].closed
-    assert host["cache"] == Configuration.load(config).directory("package_cache")
+    assert host["cache"] == Configuration.load(config).directory("core_cache")
 
 
+@pytest.mark.parametrize("fraction", [None, 0.0, 0.25])
 @pytest.mark.parametrize("budget", [None, 1536])
-def test_development_listener_and_authentication_use_configuration(host, tmp_path, monkeypatch, budget):
+def test_development_listener_and_authentication_use_configuration(host, tmp_path, monkeypatch, budget, fraction):
     port = free_port()
     config = tmp_path / "config.toml"
     config.write_text(f'[server]\nport = {port}\napi_key = "secret"\n'
-                      + ("" if budget is None else f"thinking_token_budget = {budget}\n"))
+                      + ("" if budget is None else f"thinking_token_budget = {budget}\n")
+                      + ("" if fraction is None else f"scheduler_checkpoint_extra_work_fraction = {fraction}\n"))
     calls = []
     monkeypatch.setattr(serve, "_serve_prepared", lambda prepared, bind, options: calls.append((bind, options)))
     assert main(["debug-serve", "qwen3.8-flash", "--gpus", "0", "--config", str(config)]) == 0
     assert calls[0][0] == f"127.0.0.1:{port}"
     assert calls[0][1]["api_key"] == "secret"
     assert calls[0][1]["thinking_token_budget"] == budget
+    assert calls[0][1]["scheduler_checkpoint_extra_work_fraction"] == (0.05 if fraction is None else fraction)
     assert host["exports"] == 0
 
 
@@ -581,11 +585,11 @@ def test_tensor_parallel_export_preserves_rank_selection(host):
 
 
 def test_multihost_export_dispatches_with_configured_cache(host, tmp_path, monkeypatch, capsys):
-    from ignition.preparation.package_snapshot import _OPTIONS
+    from ignition.preparation.core_snapshot import _OPTIONS
 
     config = tmp_path / 'export.toml'
     cache = tmp_path / 'prepared-models'
-    config.write_text(f'[paths]\npackage_cache = "{cache.as_posix()}"\n')
+    config.write_text(f'[paths]\ncore_cache = "{cache.as_posix()}"\n')
     entry = cache / 'models' / 'qwen38' / 'gb202-tp2-test'
     calls = []
 
@@ -619,7 +623,7 @@ def test_export_rejects_size_sharding(host):
 def test_export_reports_cache_entry_and_repository(host, tmp_path, capsys):
     config = tmp_path / 'export.toml'
     cache = tmp_path / 'prepared-models'
-    config.write_text(f'[paths]\npackage_cache = "{cache.as_posix()}"\n')
+    config.write_text(f'[paths]\ncore_cache = "{cache.as_posix()}"\n')
     assert main(['export', 'qwen3.8-flash', '--config', str(config)]) == 0
     assert host['cache'] == cache
     output = capsys.readouterr().out
@@ -645,7 +649,7 @@ def test_reuse_weights_requires_cached_version_before_preparation(host, capsys):
 
 def test_reuse_weights_passes_cached_metadata_through_export(host, monkeypatch, tmp_path):
     import flare_heliopause
-    from ignition.preparation.package_snapshot import _OPTIONS
+    from ignition.preparation.core_snapshot import _OPTIONS
 
     source = {'envelope': [1, 2, 3], 'publishers': []}
     requests = []

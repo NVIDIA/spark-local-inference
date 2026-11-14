@@ -6,17 +6,17 @@
 import ctypes as C
 import math
 
-from .package_storage import DeviceRegion, _Location, _Properties
-from .runtime_package import _Cuda
+from .core_storage import DeviceRegion, _Location, _Properties
+from .runtime_core import _Cuda
 
 
 class VirtualStorage:
     """Reserve each runtime-sized tensor's full extent and back only a measured prefix.
 
-    Compiled forwards bind tensor shapes. A package therefore compiles against the
+    Compiled forwards bind tensor shapes. A core therefore compiles against the
     full virtual extent and backs the measured working set afterwards; this gives an
     in-process preparation the same shapes, so its compiled forwards do not depend on
-    the memory one launch happens to find free. It offers PackageStorage's
+    the memory one launch happens to find free. It offers CoreStorage's
     `device_allocate` and `grow`; `close` unmaps everything after native replay drains.
     """
 

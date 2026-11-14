@@ -4,7 +4,7 @@
 """Text graph bindings, complete continuation rows, and paged attention histories."""
 
 from ignition.preparation import contract as c
-from ignition.preparation import runtime_package_pb2 as p
+from ignition.preparation import runtime_core_pb2 as p
 
 from .frontend import FRONTEND
 from .pool import PAGE_TOKENS

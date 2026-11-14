@@ -10,9 +10,13 @@ import json
 from pathlib import Path
 import shutil
 import subprocess
+from xml.etree import ElementTree
 
 ROOT = Path(__file__).resolve().parents[1]
 TARGETS = ("x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "x86_64-pc-windows-msvc")
+CLI_MANIFESTS = ("flare-cli/Cargo.toml",)
+WINUI_TARGETS = ("x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc")
+WINUI_MANIFESTS = ("flare-winui/bridge/Cargo.toml", "flare-winui/launcher/Cargo.toml")
 
 
 def dependency_roles(metadata):
@@ -48,20 +52,25 @@ def license_files(root):
     )
 
 
-def collect(destination, targets=TARGETS):
+def collect(destination, targets=TARGETS, manifests=CLI_MANIFESTS):
     # Refuse to merge with old output: obsolete package notices must not survive regeneration.
     if destination.exists():
         raise ValueError(f"destination already exists: {destination}; generate into a fresh directory")
     packages = {}
-    roles = defaultdict(dict)
-    for target in targets:
-        metadata = json.loads(subprocess.check_output([
-            "cargo", "metadata", "--locked", "--format-version", "1",
-            "--manifest-path", str(ROOT / "flare/Cargo.toml"), "--filter-platform", target,
-        ], cwd=ROOT))
-        packages.update((p["id"], p) for p in metadata["packages"])
-        for package_id, kinds in dependency_roles(metadata).items():
-            roles[package_id][target] = sorted(kinds)
+    kinds_by_target = defaultdict(lambda: defaultdict(set))
+    for manifest in manifests:
+        for target in targets:
+            metadata = json.loads(subprocess.check_output([
+                "cargo", "metadata", "--locked", "--format-version", "1",
+                "--manifest-path", str(ROOT / manifest), "--filter-platform", target,
+            ], cwd=ROOT))
+            packages.update((p["id"], p) for p in metadata["packages"])
+            for package_id, kinds in dependency_roles(metadata).items():
+                kinds_by_target[package_id][target] |= kinds
+    roles = {
+        package_id: {target: sorted(by_target[target]) for target in targets if target in by_target}
+        for package_id, by_target in kinds_by_target.items()
+    }
 
     destination.mkdir(parents=True)
     entries = []
@@ -102,9 +111,13 @@ def collect(destination, targets=TARGETS):
     groups = defaultdict(list)
     for entry in entries:
         groups[entry["license"] or "See license files"].append(entry)
-    lines = ["# Native Rust dependency licenses", "",
-             "Generated from the locked `flare/Cargo.toml` dependency graph. Python and",
-             "Heliopause are preparation/build-only and are not part of this binary release.", "",
+    if tuple(manifests) == CLI_MANIFESTS:
+        origin = ["Generated from the locked `flare-cli/Cargo.toml` dependency graph. Python and",
+                  "Heliopause are preparation/build-only and are not part of this binary release."]
+    else:
+        origin = ["Generated from the locked dependency graphs of:", ""]
+        origin += [f"- `{manifest}`" for manifest in manifests]
+    lines = ["# Native Rust dependency licenses", "", *origin, "",
              "This inventory includes runtime dependencies and build/proc-macro tools,",
              "with target-specific roles in `packages.json`. Build-tool notices are included",
              "conservatively; their presence does not mean those tools are shipped.", "",
@@ -139,6 +152,31 @@ def toolchain_notices(destination):
     (destination / "version.txt").write_text(
         subprocess.check_output(["rustc", "--version", "--verbose"], text=True), encoding="utf-8",
     )
+
+
+def nuget_notices(destination, restored):
+    """Copy license texts from the restored NuGet packages pinned for the WinUI desktop."""
+    pinned = ElementTree.parse(ROOT / "flare-winui/packages.config").getroot().findall("package")
+    destination.mkdir(parents=True)
+    lines = ["# Windows desktop NuGet package licenses", "",
+             "License and notice files from the packages pinned in `flare-winui/packages.config`.",
+             "Every pinned package is listed, including packages used only to build the desktop.", "",
+             "| Package | License texts |", "| --- | --- |"]
+    for package in sorted(pinned, key=lambda p: p.get("id").lower()):
+        name = f'{package.get("id")}.{package.get("version")}'
+        root = restored / name
+        files = license_files(root) if root.is_dir() else []
+        if not files:
+            raise ValueError(f"missing license text for NuGet package {name} under {restored}")
+        copied = []
+        for source in files:
+            output = destination / name / source.relative_to(root)
+            output.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, output)
+            copied.append(output.relative_to(destination).as_posix())
+        links = ", ".join(f"[{Path(p).name}]({p})" for p in copied)
+        lines.append(f'| {package.get("id")} {package.get("version")} | {links} |')
+    (destination / "README.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def main():

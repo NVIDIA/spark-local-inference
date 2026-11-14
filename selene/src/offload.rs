@@ -357,29 +357,29 @@ impl std::fmt::Debug for Binding {
     }
 }
 
-/// Resolve the settings against the package and host, map and register the
+/// Resolve the settings against the core and host, map and register the
 /// pools with rank zero's context current, and scan the record directory.
 /// Without a disk tier the CPU never reads a record, so the memory pool is
 /// split by rank and each device maps only its part.
 ///
-/// `package` is the package file, beside which the default record directory
+/// `core` is the core file, beside which the default record directory
 /// would be created once derived defaults are enabled.
 pub fn prepare(
     options: &PrefixCacheOffload,
-    package: &std::path::Path,
+    core: &std::path::Path,
     identity: [u8; 32],
     geometry: Vec<CacheGeometry>,
     contexts: Vec<(usize, i32)>,
     registrar: &dyn crate::HostRegistrar,
 ) -> Result<Preparation> {
     prepare_with_inputs(
-        options, package, identity, geometry, contexts, 1, 0, None, registrar,
+        options, core, identity, geometry, contexts, 1, 0, None, registrar,
     )
 }
 
 pub fn prepare_with_inputs(
     options: &PrefixCacheOffload,
-    package: &std::path::Path,
+    core: &std::path::Path,
     identity: [u8; 32],
     geometry: Vec<CacheGeometry>,
     contexts: Vec<(usize, i32)>,
@@ -391,18 +391,18 @@ pub fn prepare_with_inputs(
     if !options.enabled() {
         return Ok(Preparation::None("disabled".to_owned()));
     }
-    let _ = package;
+    let _ = core;
     let layout = Layout::new(&geometry)?;
     let fingerprint = match (shard, geometry.as_slice()) {
         (None, _) => geometry::fingerprint(&geometry),
         (Some((rank, world)), [local]) => geometry::shard_fingerprint(local, rank, world),
         (Some(_), _) => {
-            return Err("a rank process of a multi-host package holds exactly one rank".into());
+            return Err("a rank process of a multi-host core holds exactly one rank".into());
         }
     };
     let memory_bytes = options.memory_bytes.unwrap_or(0);
     if shard.is_some() && memory_bytes != 0 {
-        return Err("a multi-host package keeps host prefix records on disk only; set --prefix-cache-memory 0".into());
+        return Err("a multi-host core keeps host prefix records on disk only; set --prefix-cache-memory 0".into());
     }
     let mut notes = Vec::new();
     let directory = match options

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Package-owned TP4 reductions across retained graph variants and native replay."""
+"""Core-owned TP4 reductions across retained graph variants and native replay."""
 
 from datetime import timedelta
 import os
@@ -139,8 +139,8 @@ def _rank(rank, rendezvous, directory, widths):
     from ignition.preparation.collectives import CollectivePreparation, create_all_reduce_runtime
     from ignition.preparation.execution import GraphSignature, PreparedExecution
     from ignition.preparation.module_images import ModuleImages
-    from ignition.preparation.package_storage import PackageStorage
-    from ignition.preparation.runtime_package import export_model
+    from ignition.preparation.core_storage import CoreStorage
+    from ignition.preparation.runtime_core import export_model
     from ignition.preparation.tuning import RecordedPreparationSession
 
     torch.cuda.set_device(rank)
@@ -151,7 +151,7 @@ def _rank(rank, rendezvous, directory, widths):
     runtime = worker = None
     graphs = {}
     try:
-        with ModuleImages() as images, PackageStorage(rank=rank, world=4, device=rank) as storage:
+        with ModuleImages() as images, CoreStorage(rank=rank, world=4, device=rank) as storage:
             coordinator = CollectivePreparation(dist.group.WORLD)
             runtime = create_all_reduce_runtime(dist.group.WORLD, device, max_tokens=max_rows,
                 hidden_size=max(widths), ipc=storage.peer_storage)
@@ -190,7 +190,7 @@ def _rank(rank, rendezvous, directory, widths):
                 session.freeze()
 
                 # Both transports must use the same explicit VMM ownership path
-                # that the runtime-package exporter uses for peer resources.
+                # that the runtime-core exporter uses for peer resources.
                 peer = storage.peer_storage
                 assert len(peer.owned) >= 2 and len(peer.imported) >= 6
                 for address, size in peer.owned.items():
@@ -215,17 +215,17 @@ def _rank(rank, rendezvous, directory, widths):
                     signatures={name: GraphSignature("decode", 1, 1) for name in graphs}, max_active=1,
                     resources=(runtime, session, stream, storage, operations, sources, outputs))
                 bundle.server_config = {}
-                bundle.package_data = None
+                bundle.core_data = None
                 torch.cuda.synchronize(device)
                 dist.barrier()
                 peer.reset()
                 torch.cuda.synchronize(device)
                 dist.barrier()
                 # Stage a tiny unsigned rank bundle, not a model checkpoint.
-                package = export_model(bundle, images, storage,
+                core = export_model(bundle, images, storage,
                     directory / f"rank-{rank}.json", options={}, bundle_only=True, sources=True)
-                assert package.export_counts["modules"] > 0
-                exported = {(allocation.address, allocation.nbytes) for allocation in package.allocations
+                assert core.export_counts["modules"] > 0
+                exported = {(allocation.address, allocation.nbytes) for allocation in core.allocations
                             if allocation.memory == "peer"}
                 assert exported == set(peer.imported.items())
                 worker = bundle.start_executor()
@@ -280,7 +280,7 @@ def _rank(rank, rendezvous, directory, widths):
 
 @pytest.mark.parametrize("widths", [(4096, 5120), (2560,)], ids=["4096-5120", "qwen-2560"])
 @_gpu_only
-def test_package_owned_tp4_collective_graph_variants(tmp_path, widths):
+def test_core_owned_tp4_collective_graph_variants(tmp_path, widths):
     assert os.environ.get("CUDA_VISIBLE_DEVICES"), "assign four CUDA devices explicitly"
     assert torch.cuda.device_count() == 4
     mp.spawn(_rank, args=((tmp_path / "gloo").as_uri(), tmp_path, widths), nprocs=4, join=True)
@@ -292,16 +292,16 @@ def test_exported_tp4_collectives_replay_after_preparation_exit(tmp_path):
     root = Path(__file__).resolve().parents[2]
     target = Path(os.environ.get("CARGO_TARGET_DIR", root / "helios" / "target"))
     subprocess.run(["cargo", "build", "-j", "4", "--manifest-path", str(root / "helios/Cargo.toml"),
-        "--no-default-features", "--features", "runtime-package,test-tools", "--bin", "test_fixed_runtime_package"],
+        "--no-default-features", "--features", "runtime-core,test-tools", "--bin", "test_fixed_runtime_core"],
         cwd=root, check=True, timeout=600)
-    result = subprocess.run([sys.executable, str(root / "helios/tests/collective_package_fixture.py"),
+    result = subprocess.run([sys.executable, str(root / "helios/tests/collective_core_fixture.py"),
         str(tmp_path)], cwd=root, text=True, capture_output=True, timeout=300)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "all four preparation ranks exited" in result.stdout
     print(result.stdout, end="")
     # subprocess.run waits for the Python exporter; the Rust reader independently
     # rejects any still-live recorded preparation PID before initializing CUDA.
-    result = subprocess.run([str(target / "debug/test_fixed_runtime_package"), str(tmp_path), "--tp4-collective"],
+    result = subprocess.run([str(target / "debug/test_fixed_runtime_core"), str(tmp_path), "--tp4-collective"],
         cwd=root, text=True, capture_output=True, timeout=180)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "native TP4 collective package replay passed after Python exit" in result.stdout
+    assert "native TP4 collective core replay passed after Python exit" in result.stdout

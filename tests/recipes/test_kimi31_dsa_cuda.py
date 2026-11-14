@@ -107,7 +107,7 @@ def test_fp8_top2048_scores_and_inactive_rows():
 
         def forward():
             indexer.write_keys(keys, slots)
-            indexer()
+            indexer(query, weights)
 
         compiled = compile_forward(forward)
         compiled()
@@ -224,7 +224,7 @@ def test_candidate_fold_and_selected_peer_records_match_dense_reference():
             fold()
             selection_slots(selected, positions, tables, owners, slots, counts, shards, 1, local=False)
             gather()
-            attention()
+            attention(query, output)
 
         compiled = compile_forward(forward)
         compiled()
@@ -263,7 +263,7 @@ def test_index_projections_layernorm_and_prefill_slice_boundary(compile_projecti
 
     device = torch.device("cuda", 0)
     torch.manual_seed(3181)
-    rows = 129
+    rows = 257
     source = (torch.randn((rows, 7168), device=device) * .0005).bfloat16()
     query_latent = (torch.randn((rows, 1536), device=device) * .1).bfloat16()
     weights = {field: (torch.randn(shape, device=device) * .02).bfloat16() for field, shape in (
@@ -271,11 +271,11 @@ def test_index_projections_layernorm_and_prefill_slice_boundary(compile_projecti
         ("indexer.weights_proj", (32, 7168)), ("indexer.k_norm.weight", (128,)),
         ("indexer.k_norm.bias", (128,)))}
     weights["indexer.k_norm.weight"].add_(1)
-    metadata = Metadata.allocate(rows, 1, 2, device)
+    metadata = Metadata.allocate(rows, 1, 3, device)
     metadata.positions.copy_(torch.arange(rows, dtype=torch.int64, device=device))
     metadata.positions[-1] = -1
-    metadata.page_table.copy_(torch.tensor([[1, 0]], dtype=torch.int32, device=device))
-    cache = torch.zeros((4, 64, 132), dtype=torch.uint8, device=device)
+    metadata.page_table.copy_(torch.tensor([[2, 0, 1]], dtype=torch.int32, device=device))
+    cache = torch.zeros((6, 64, 132), dtype=torch.uint8, device=device)
     shards = ContextShards.on(0, 1, device)
     with RecordedPreparationSession(device=device, checkpoint="kimi31-index-projections",
             workload_schema="kimi31-index", numerical_policy="query-pow2-key-fp32", autotune_effort="off") as session:
@@ -283,49 +283,81 @@ def test_index_projections_layernorm_and_prefill_slice_boundary(compile_projecti
         session.register_scratch(arena)
         indexer = PreparedDSAIndexer(weights, source, query_latent, metadata, cache, shards,
             context=None, eps=eps, mode="prefill", session=session, name="index", workspace=arena, buffers={},
-            latent_cache=torch.zeros((2, 128, 576), dtype=torch.float8_e4m3fn, device=device))
-        assert indexer.bounds == ((0, 128), (128, 129))
+            latent_cache=torch.zeros((3, 128, 576), dtype=torch.float8_e4m3fn, device=device))
+        assert indexer.bounds == ((0, 128), (128, 256), (256, 257))
+        assert tuple(indexer.selections) == (128, 1)
+        selected = torch.empty((rows, 2048), dtype=torch.int32, device=device)
+        quantized = torch.empty((rows, 32, 128), dtype=torch.float8_e4m3fn, device=device)
+        scales = torch.empty((rows, 32), dtype=torch.float32, device=device)
+        scaled_weights = torch.empty_like(scales)
         session.tune(show_progress=False)
         cache.zero_()
 
+        observed_query = torch.empty((rows, 4096), dtype=source.dtype, device=device)
+        observed_key = torch.empty((rows, 128), dtype=source.dtype, device=device)
+        observed_normalized_key = torch.empty_like(observed_key)
+        observed_weights = torch.empty((rows, 32), dtype=source.dtype, device=device)
+
         def forward():
-            indexer.project(source)
-            for part in indexer.parts:
-                part()
+            query, key, normalized_key, head_weights = indexer.project_result(source, query_latent, metadata)
+            observed_query.copy_(query)
+            observed_key.copy_(key)
+            observed_normalized_key.copy_(normalized_key)
+            observed_weights.copy_(head_weights)
+            for start, end in indexer.bounds:
+                part = indexer.selections[end - start]
+                packed, _, _, quantized_part, scales_part, scaled_part = part.prepare_local_result(
+                    query[start:end], head_weights[start:end], metadata.positions[start:end],
+                    metadata.token_page_table[start:end])
+                selected[start:end].copy_(part.exchange(packed, metadata.positions[start:end]))
+                quantized[start:end].copy_(quantized_part)
+                scales[start:end].copy_(scales_part)
+                scaled_weights[start:end].copy_(scaled_part)
 
         compiled = compile_forward(forward) if compile_projection else forward
         compiled()
         graph = torch.cuda.CUDAGraph()
         with session.capture(), torch.cuda.graph(graph):
             compiled()
-        graph.replay()
-        torch.cuda.synchronize()
+        for iteration in range(3):
+            source.mul_(-1)
+            query_latent.mul_(-1)
+            arena.tensor.fill_(255 if iteration % 2 else 0)
+            torch.cuda.synchronize()
+            before = torch.cuda.memory_stats(device)
+            graph.replay()
+            torch.cuda.synchronize()
+            after = torch.cuda.memory_stats(device)
+            for field in ("allocation.all.allocated", "allocation.all.freed",
+                          "segment.all.allocated", "segment.all.freed"):
+                assert before[field] == after[field]
         expected_key = (source.float() @ weights["indexer.wk"].float().T).bfloat16()
-        torch.testing.assert_close(indexer.key.float(), expected_key.float(), rtol=.02, atol=.002)
+        torch.testing.assert_close(observed_key.float(), expected_key.float(), rtol=.02, atol=.002)
         expected_weights = torch.mm(source, weights["indexer.weights_proj"].T) * 32 ** -.5
-        assert indexer.head_weights.dtype == torch.bfloat16
-        torch.testing.assert_close(indexer.head_weights.float(), expected_weights.float(), rtol=.008, atol=1e-5)
-        expected_norm = torch.nn.functional.layer_norm(indexer.key.float(), (128,),
+        assert observed_weights.dtype == torch.bfloat16
+        torch.testing.assert_close(observed_weights.float(), expected_weights.float(), rtol=.008, atol=1e-5)
+        expected_norm = torch.nn.functional.layer_norm(observed_key.float(), (128,),
             weights["indexer.k_norm.weight"].float(), weights["indexer.k_norm.bias"].float(), eps).bfloat16()
-        torch.testing.assert_close(indexer.normalized_key.float(), expected_norm.float(), rtol=0, atol=0)
-        wrong_norm = torch.nn.functional.layer_norm(indexer.key.float(), (128,),
+        torch.testing.assert_close(observed_normalized_key.float(), expected_norm.float(), rtol=0, atol=0)
+        wrong_norm = torch.nn.functional.layer_norm(observed_key.float(), (128,),
             weights["indexer.k_norm.weight"].float(), weights["indexer.k_norm.bias"].float(),
             1e-5 if eps == 1e-6 else 1e-6).bfloat16()
         assert not torch.allclose(expected_norm.float(), wrong_norm.float(), rtol=.1, atol=.001)
-        expected_k, expected_key_scale = _identity_fp8_reference(indexer.normalized_key[:128], power_of_two=False)
+        expected_k, expected_key_scale = _identity_fp8_reference(observed_normalized_key[:256], power_of_two=False)
         physical_keys = cache.view(-1, 64 * 132)
-        actual_k = physical_keys[2:, :8192].view(torch.float8_e4m3fn).reshape(128, 128)
-        actual_key_scale = physical_keys[2:, 8192:].view(torch.float32).flatten()
+        actual_k = physical_keys[[4, 5, 0, 1], :8192].view(torch.float8_e4m3fn).reshape(256, 128)
+        actual_key_scale = physical_keys[[4, 5, 0, 1], 8192:].view(torch.float32).flatten()
         torch.testing.assert_close(actual_k.view(torch.uint8), expected_k.view(torch.uint8), rtol=0, atol=0)
         torch.testing.assert_close(actual_key_scale, expected_key_scale, rtol=0, atol=0)
-        tail = indexer.parts[-1].indexer
-        expected_q, expected_query_scale = _identity_fp8_reference(indexer.query[-1:].view(1, 32, 128), power_of_two=True)
-        torch.testing.assert_close(tail.quantized.view(torch.uint8), expected_q.view(torch.uint8), rtol=0, atol=0)
-        torch.testing.assert_close(tail.scales, expected_query_scale, rtol=0, atol=0)
-        expected_scaled = (indexer.head_weights[-1:].float() * tail.scales) * 128 ** -.5
-        torch.testing.assert_close(tail.scaled_weights, expected_scaled, rtol=0, atol=0)
-        assert indexer.parts[-1].selected[0].eq(-1).all()
-        assert not cache[:2].count_nonzero()
+        expected_q, expected_query_scale = _identity_fp8_reference(observed_query.view(rows, 32, 128), power_of_two=True)
+        torch.testing.assert_close(quantized.view(torch.uint8), expected_q.view(torch.uint8), rtol=0, atol=0)
+        torch.testing.assert_close(scales, expected_query_scale, rtol=0, atol=0)
+        expected_scaled = (observed_weights.float() * scales) * 128 ** -.5
+        torch.testing.assert_close(scaled_weights, expected_scaled, rtol=0, atol=0)
+        for row, chosen in enumerate(selected[:-1].cpu().tolist()):
+            assert set(token for token in chosen if token >= 0) == set(range(row + 1))
+        assert selected[-1].eq(-1).all()
+        assert not cache[2:4].count_nonzero()
         graph.reset()
 
 
@@ -338,7 +370,7 @@ def _cache_barrier_peer_read_rank(rank, rendezvous, world, rows):
     from ignition.components.peer_record_gather import PreparedPeerRecordGather
     from ignition.preparation.collectives import CollectivePreparation, create_head_exchange
     from ignition.preparation.compilation import compile_forward
-    from ignition.preparation.package_storage import PackageStorage
+    from ignition.preparation.core_storage import CoreStorage
     from ignition.preparation.tuning import RecordedPreparationSession
     from ignition.recipes.kimi31.dcp import RECORD_BYTES, TOPK, write_records
 
@@ -349,7 +381,7 @@ def _cache_barrier_peer_read_rank(rank, rendezvous, world, rows):
                             timeout=timedelta(minutes=5))
     graph = runtime = None
     try:
-        with PackageStorage(rank=rank, world=world, device=rank) as storage:
+        with CoreStorage(rank=rank, world=world, device=rank) as storage:
             cache = storage.device_allocate("latent", (1, local_records, RECORD_BYTES), torch.float8_e4m3fn,
                 group="KV_PAGES", maximum=1)
             region = next(region for region in storage.dynamic_regions if region.address == cache.data_ptr())
@@ -432,11 +464,11 @@ def test_compiled_cache_write_precedes_candidate_barrier_and_peer_read(tmp_path,
 def test_selected_attention_constants_survive_disposable_scratch_reset():
     from b12x.attention import dense_mla
     from ignition.components.dense_mla import PreparedDenseMLA
+    from ignition.components.peer_record_gather import PreparedPeerRecordGather
     from ignition.preparation.compilation import compile_forward
     from ignition.preparation.disposable import storage_ranges
     from ignition.preparation.scratch import ScratchArena
     from ignition.preparation.tuning import RecordedPreparationSession
-    from ignition.recipes.kimi3.decoder import DecoderStorage
     from ignition.recipes.kimi31.dcp import AttentionConstants, PREFILL_ROWS, RECORD_BYTES, TOPK
     from ignition.recipes.kimi31.indexer import SharedBuffers
 
@@ -445,23 +477,34 @@ def test_selected_attention_constants_survive_disposable_scratch_reset():
     constants = AttentionConstants.allocate(device)
     scratch = {}
     buffers = SharedBuffers(scratch, device)
-    query = buffers.buffer("query", (PREFILL_ROWS + 1, 8, RECORD_BYTES), torch.bfloat16)
+    query = buffers.buffer("query", (2 * PREFILL_ROWS + 1, 8, RECORD_BYTES), torch.bfloat16)
     cache = buffers.buffer("records", (PREFILL_ROWS, TOPK, RECORD_BYTES), torch.float8_e4m3fn)
-    output = buffers.buffer("output", (PREFILL_ROWS + 1, 8, 512), torch.bfloat16)
+    output = buffers.buffer("output", (2 * PREFILL_ROWS + 1, 8, 512), torch.bfloat16)
     counts = buffers.buffer("counts", (PREFILL_ROWS,), torch.int32)
     query_seed = (torch.randn(query.shape, device=device) * .1).bfloat16()
     record_seed = (torch.randn((PREFILL_ROWS, 17, RECORD_BYTES), device=device) * .1).to(cache.dtype)
     count_seed = torch.arange(PREFILL_ROWS, dtype=torch.int32, device=device) % 18
     count_seed[0] = 17
-    storage = DecoderStorage(scratch, hidden_columns=None, latent_begin=None)
+    peers = torch.full((16,), record_seed.data_ptr(), dtype=torch.int64, device=device)
+    owners = buffers.buffer("owners", (PREFILL_ROWS, TOPK), torch.int32)
+    slots = buffers.buffer("slots", (PREFILL_ROWS, TOPK), torch.int32)
+    slot_seed = torch.zeros_like(slots)
+    slot_seed[:, :17] = torch.arange(PREFILL_ROWS * 17, device=device).view(PREFILL_ROWS, 17)
     with RecordedPreparationSession(device=device, checkpoint="kimi31-attention-constants",
             workload_schema="selected-page-attention", numerical_policy="default") as session:
         arena = ScratchArena(device)
         session.register_scratch(arena)
         operations = []
         for layer in range(2):
-            for begin, end in ((0, PREFILL_ROWS), (PREFILL_ROWS, PREFILL_ROWS + 1)):
+            parts = {}
+            for begin, end in ((0, PREFILL_ROWS), (PREFILL_ROWS, 2 * PREFILL_ROWS),
+                               (2 * PREFILL_ROWS, 2 * PREFILL_ROWS + 1)):
                 rows = end - begin
+                if rows in parts:
+                    operations.append((begin, end, parts[rows]))
+                    continue
+                gather = PreparedPeerRecordGather(peers, owners[:rows], slots[:rows], counts[:rows], cache[:rows],
+                    peer_records=PREFILL_ROWS * 17, session=session, name=f"layer{layer}.records{rows}")
                 caps = dense_mla.Caps(device=device, mode="decode", q_dtype=query.dtype, kv_dtype=cache.dtype,
                     num_q_heads=8, page_size=1, max_total_q=rows, max_batch=rows, max_cache_tokens=TOPK,
                     max_page_table_width=TOPK, num_cache_pages=rows * TOPK, use_cuda_graph=True)
@@ -472,46 +515,65 @@ def test_selected_attention_constants_survive_disposable_scratch_reset():
                 for name, original in (("page_table", constants.pages), ("cu_seqlens_q", constants.starts),
                                        ("kv_scale", constants.scale), ("q_scale", constants.scale)):
                     assert attention.arguments[name].untyped_storage().data_ptr() == original.untyped_storage().data_ptr()
-                operations.append((begin, end, attention))
+                parts[rows] = (gather, attention)
+                operations.append((begin, end, parts[rows]))
+        assert operations[0][2] is operations[1][2]
+        assert operations[3][2] is operations[4][2]
+        assert operations[0][2] is not operations[3][2]
         session.tune(show_progress=False)
         scratch["workspace"] = arena.tensor
-        disposable = storage_ranges(storage.scratch_tensors())
+        disposable = storage_ranges(scratch)
         for constant in (constants.pages, constants.starts, constants.scale):
             address = constant.untyped_storage().data_ptr()
             extent = constant.untyped_storage().nbytes()
             assert all(address + extent <= begin or begin + size <= address for begin, size in disposable)
         query.copy_(query_seed)
-        cache[:, :17].copy_(record_seed)
+        slots.copy_(slot_seed)
         counts.copy_(count_seed)
         graphs = []
-        for begin, end, attention in operations:
-            compiled = compile_forward(attention)
+        def make_forward(layer_operations):
+            def forward():
+                for begin, end, (gather, attention) in layer_operations:
+                    gather()
+                    attention(query[begin:end], output[begin:end])
+            return forward
+
+        for layer in range(2):
+            layer_operations = tuple(operations[layer * 3:(layer + 1) * 3])
+            compiled = compile_forward(make_forward(layer_operations))
             compiled()
             graph = torch.cuda.CUDAGraph()
             with session.capture(), torch.cuda.graph(graph):
                 compiled()
-            graphs.append((begin, end, compiled, graph))
+            graphs.append((layer_operations, compiled, graph))
         session.freeze()
-        for begin, end, compiled, graph in graphs:
+        for layer_operations, compiled, graph in graphs:
             for tensor in scratch.values():
-                tensor.zero_()
+                if isinstance(tensor, torch.Tensor):
+                    tensor.zero_()
             query.copy_(query_seed)
-            cache[:, :17].copy_(record_seed)
+            output.fill_(torch.nan)
+            slots.copy_(slot_seed)
             counts.copy_(count_seed)
-            torch.cuda.synchronize(device)
-            before = torch.cuda.memory_stats(device)["allocation.all.allocated"]
-            graph.replay()
-            torch.cuda.synchronize(device)
-            assert before == torch.cuda.memory_stats(device)["allocation.all.allocated"]
-            rows = end - begin
-            quantized = query_seed[begin:end].float().to(cache.dtype).float()
-            records = record_seed[:rows].float()
-            logits = torch.einsum("rhd,rkd->rhk", quantized, records) * 192 ** -.5
-            visible = torch.arange(17, device=device)[None] < count_seed[:rows, None]
-            probabilities = logits.masked_fill(~visible[:, None], -torch.inf).softmax(-1)
-            probabilities = torch.where(count_seed[:rows, None, None] > 0, probabilities, 0)
-            expected = torch.einsum("rhk,rkd->rhd", probabilities, records[:, :, :512])
-            torch.testing.assert_close(output[begin:end].float(), expected, rtol=.03, atol=.002)
+            for _ in range(3):
+                torch.cuda.synchronize(device)
+                before = torch.cuda.memory_stats(device)
+                graph.replay()
+                torch.cuda.synchronize(device)
+                after = torch.cuda.memory_stats(device)
+                for field in ("allocation.all.allocated", "allocation.all.freed",
+                              "segment.all.allocated", "segment.all.freed"):
+                    assert before[field] == after[field]
+            for begin, end, _ in layer_operations:
+                rows = end - begin
+                quantized = query_seed[begin:end].float().to(cache.dtype).float()
+                records = record_seed[:rows].float()
+                logits = torch.einsum("rhd,rkd->rhk", quantized, records) * 192 ** -.5
+                visible = torch.arange(17, device=device)[None] < count_seed[:rows, None]
+                probabilities = logits.masked_fill(~visible[:, None], -torch.inf).softmax(-1)
+                probabilities = torch.where(count_seed[:rows, None, None] > 0, probabilities, 0)
+                expected = torch.einsum("rhk,rkd->rhd", probabilities, records[:, :, :512])
+                torch.testing.assert_close(output[begin:end].float(), expected, rtol=.03, atol=.002)
             assert constants.pages[-1, -1].item() == PREFILL_ROWS * TOPK - 1
             assert constants.starts[-1].item() == PREFILL_ROWS
             assert constants.scale.item() == 1
@@ -572,7 +634,7 @@ def test_inactive_local_dsa_stage_replay_with_overwritten_workspace(stage):
 
             def forward():
                 indexer.write_keys(keys, key_slots)
-                indexer()
+                indexer(query, weights)
         elif stage == "fold":
             forward = PreparedRowTopK(candidate_scores, lengths, candidate_ids, selected_scores, selected,
                 session=session, name="fold")
@@ -588,10 +650,13 @@ def test_inactive_local_dsa_stage_replay_with_overwritten_workspace(stage):
             caps = dense_mla.Caps(device=device, mode="decode", q_dtype=absorbed.dtype, kv_dtype=records.dtype,
                 num_q_heads=6, page_size=1, max_total_q=rows, max_batch=rows, max_cache_tokens=TOPK,
                 max_page_table_width=TOPK, num_cache_pages=rows * TOPK, use_cuda_graph=True)
-            forward = PreparedDenseMLA(absorbed, records.view(-1, 1, RECORD_BYTES), attended,
+            attention = PreparedDenseMLA(absorbed, records.view(-1, 1, RECORD_BYTES), attended,
                 constants.pages, counts, constants.starts, caps=caps, scale=192 ** -.5,
                 session=session, name="attention", workspace=arena,
                 kv_scale=constants.scale, q_scale=constants.scale)
+
+            def forward():
+                attention(absorbed, attended)
         session.tune(show_progress=False)
         arena.tensor.fill_(255)
         forward()
@@ -676,7 +741,7 @@ def test_bf16_head_gate_rounding_and_normalized_fp8_weights_under_replay():
         def forward():
             projection(source)
             gates.mul_(32 ** -.5)
-            indexer()
+            indexer(query, gates)
 
         forward()
         torch.cuda.synchronize(device)
@@ -751,22 +816,23 @@ def test_mla_query_and_latent_norm_use_configured_epsilon(eps):
         session.register_scratch(arena)
         projection = PreparedMLAProjection(weights, source, None, None, eps=eps, mode="prefill",
             session=session, name="projection", workspace=arena, buffers={})
+        projection.functional(session=session)
         session.tune(show_progress=False)
-        projection.project(source)
+        result = projection.project(source)
         torch.cuda.synchronize(device)
-        torch.testing.assert_close(projection.query_norm, expected_query, rtol=0, atol=0)
-        torch.testing.assert_close(projection.latent[:, :512], expected_latent, rtol=0, atol=0)
+        torch.testing.assert_close(result.query_norm, expected_query, rtol=0, atol=0)
+        torch.testing.assert_close(result.latent[:, :512], expected_latent, rtol=0, atol=0)
         graph = torch.cuda.CUDAGraph()
         with session.capture(), torch.cuda.graph(graph):
-            projection.project(source)
+            result = projection.project(source)
         session.freeze()
-        projection.query_norm.fill_(19)
-        projection.latent.fill_(19)
+        result.query_norm.fill_(19)
+        result.latent.fill_(19)
         before = torch.cuda.memory_stats(device)["allocation.all.allocated"]
         graph.replay()
         torch.cuda.synchronize(device)
         assert before == torch.cuda.memory_stats(device)["allocation.all.allocated"]
-        torch.testing.assert_close(projection.query_norm, expected_query, rtol=0, atol=0)
-        torch.testing.assert_close(projection.latent[:, :512], expected_latent, rtol=0, atol=0)
-        torch.testing.assert_close(projection.latent[:, 512:], projected[:, query_width + 512:latent_width], rtol=0, atol=0)
+        torch.testing.assert_close(result.query_norm, expected_query, rtol=0, atol=0)
+        torch.testing.assert_close(result.latent[:, :512], expected_latent, rtol=0, atol=0)
+        torch.testing.assert_close(result.latent[:, 512:], projected[:, query_width + 512:latent_width], rtol=0, atol=0)
         graph.reset()

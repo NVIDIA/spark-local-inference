@@ -126,14 +126,15 @@ class CompressorCase:
     def __call__(self):
         op = self.operator
         if self.grouped:
-            op(op.values)
+            gather_rows_three(self.sources, self.metadata.state_rows, self.destinations)
+            mla_compress.run(op.binding)
         else:
             for source, destination in zip(self.sources, self.destinations, strict=True):
                 gather_rows(source, self.metadata.state_rows, destination)
             mla_compress.run(op.binding)
         for source, destination in zip(self.destinations, self.saved, strict=True):
             destination.copy_(source)
-        op.commit(self.counts)
+        op.commit(self.counts, (op.values, op.gates), self.metadata)
         # Acceptance no longer reads private snapshots or projected source rows.
         for value in (*self.destinations, op.values, op.gates):
             value.fill_(37)

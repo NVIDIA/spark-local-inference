@@ -39,7 +39,7 @@ import torch
 from ignition.cli.config import Configuration
 from ignition.components.split_draft import causal_prefix, lagged_budget
 from ignition.direct.scheduler import Lane, Layout, Request, SamplingParameters, Scheduler, Step
-from ignition.preparation.package_storage import PackageStorage
+from ignition.preparation.core_storage import CoreStorage
 from ignition.preparation.rank_group import prepare_group
 from ignition.recipes.deepseek41.bootstrap import PreparationConfig, prepare_rank
 from ignition.recipes.deepseek41.recipe import RECIPE
@@ -347,7 +347,7 @@ def main(args):
         split_speculation=args.split_speculation, speculation_reference_graphs=True,
         kernel_cache=configuration.directory('kernel_cache'),
         snapshot_budget_bytes=8 * RECIPE.ranks[4].state_row_bytes, headroom_bytes=1 << 30,
-        retain_graphs=True, compile_decoder=True, prefill_chunk_size=4096)
+        compile_decoder=True, prefill_chunk_size=4096)
     print(json.dumps(dict(preparation=asdict(config), sampling=dict(temperature=1., top_p=.95, top_k=0),
                           embedding_table_storage='ram'), default=str), flush=True)
     from tokenizers import Tokenizer
@@ -369,9 +369,9 @@ def main(args):
                              **request.get('chat_template_kwargs', {}))
         prompts[workload] = tokenizer.encode(text, add_special_tokens=False).ids
     torch.cuda.set_device(0)
-    storage = PackageStorage(world=4)
+    storage = CoreStorage(world=4)
     with storage:
-        group = prepare_group(snapshot, config, prepare_rank, package_storage=storage,
+        group = prepare_group(snapshot, config, prepare_rank, core_storage=storage,
                               progress=lambda message: print(message, flush=True))
     result = dict(preparation=asdict(config), gpus=args.gpus, requests=requests, qualification=[], cases=[],
         scope='research-only diagnostic native GraphExecutor; not HTTP serving')

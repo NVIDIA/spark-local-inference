@@ -22,15 +22,15 @@ def test_standalone_destinations_belong_to_convert(flags, capsys):
     assert error.value.code == 2
     assert 'unrecognized arguments' in capsys.readouterr().err
     args = _parser().parse_args(['convert', 'cached-entry', *flags])
-    assert args.package == Path('cached-entry')
+    assert args.core == Path('cached-entry')
 
 
 @pytest.mark.parametrize('command', [
     ['export', 'qwen3.8-flash'],
-    ['convert', 'package'],
-    ['sign', 'package', '--output', 'signed-package'],
+    ['convert', 'core'],
+    ['sign', 'core', '--output', 'signed-core'],
 ])
-def test_package_commands_reject_shard_size(command, capsys):
+def test_core_commands_reject_shard_size(command, capsys):
     with pytest.raises(SystemExit) as error:
         _parser().parse_args([*command, '--shard-size', '32G'])
     assert error.value.code == 2

@@ -4,6 +4,7 @@
 """Concurrent query scratch has identical rank shapes and disjoint live storage."""
 
 from types import SimpleNamespace
+from functools import partial
 
 import torch
 import torch.distributed as dist
@@ -26,7 +27,7 @@ def test_query_workspace_normalizes_zero_and_nonzero_rank_requirements(monkeypat
         chain.arena = arena
         chain.parallel_plans = (plan(layouts[rank][0][0][0]),)
         chain.projection = SimpleNamespace(plan=plan(layouts[rank][1][0][0]))
-        arena.register_finalizer(chain.refresh)
+        arena.register_finalizer(partial(chain.refresh, chain.parallel_plans, arena))
 
         def gather(ranks, value, group):
             ranks[:] = [(256, [layouts[0]]), (567808, [layouts[1]])]

@@ -63,8 +63,23 @@ class PreparedVarlenAttention:
     def rebind(self):
         self.scratch = planned_scratch(self.plan.scratch_specs(), self.workspace)
 
-    def __call__(self):
-        varlen.run_out(self.q, self.k, self.v, self.cu, out=self.out,
-            scratch=self.scratch, plan=self.plan, attention_sink_bias=self.sink,
+    def functional(self, *, session):
+        self.output_layout = (tuple(self.out.shape), tuple(self.out.stride()), self.out.dtype)
+        register_finalizer(session, self._finalize_functional)
+        return self
+
+    def _finalize_functional(self):
+        self.scratch_layout = tuple((tuple(spec.shape), spec.dtype) for spec in self.plan.scratch_specs())
+        self.q = self.k = self.v = self.cu = self.out = self.workspace = self.scratch = None
+
+    def __call__(self, q=None, k=None, v=None, cu=None):
+        if self.out is None:
+            shape, stride, dtype = self.output_layout
+            output = torch.empty_strided(shape, stride, dtype=dtype, device=q.device).zero_()
+            scratch, = (torch.empty(shape, dtype=dtype, device=q.device) for shape, dtype in self.scratch_layout)
+        else:
+            q, k, v, cu, output, scratch = self.q, self.k, self.v, self.cu, self.out, self.scratch
+        varlen.run_out(q, k, v, cu, out=output,
+            scratch=scratch, plan=self.plan, attention_sink_bias=self.sink,
             max_seqlen_q=self.max_seqlen, max_seqlen_k=self.max_seqlen)
-        return self.out
+        return output

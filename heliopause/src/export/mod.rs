@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Preparation-time graph export and package publication.
+//! Preparation-time graph export and core publication.
 
 pub(crate) mod archive;
 pub(crate) mod binding;
@@ -12,7 +12,7 @@ pub(crate) mod capture;
 pub(crate) mod conversion;
 pub(crate) mod cubin;
 pub(crate) mod io;
-pub(crate) mod package;
+pub(crate) mod core;
 pub(crate) mod protection;
 pub(crate) mod reachability;
 pub(crate) mod recorder;
@@ -25,7 +25,7 @@ pub(crate) mod transfer;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-pub(crate) use helios_core::runtime_package::wire;
+pub(crate) use helios_core::runtime_core::wire;
 use serde::{Deserialize, Serialize};
 
 pub(crate) type ExportResult<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -106,8 +106,14 @@ pub(crate) struct Kernel {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct GraphHandle {
     pub name: String,
+    #[serde(default)]
     pub graph: usize,
+    #[serde(default)]
     pub executable: usize,
+    #[serde(default)]
+    pub instantiate_flags: Option<u64>,
+    #[serde(default)]
+    pub recorded: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -185,7 +191,7 @@ pub(crate) struct CaptureRequest {
     /// Thin semantic weight declaration; resolved against retained allocations.
     #[serde(default)]
     pub weight_payload: Option<serde_json::Value>,
-    pub package_data: Option<serde_json::Value>,
+    pub core_data: Option<serde_json::Value>,
     #[serde(default)]
     pub options: ExportOptions,
     #[serde(default)]
@@ -284,16 +290,16 @@ pub(crate) struct WeightPayloadSources {
     pub views: Vec<WeightPayloadView>,
     /// Payloads that the receiving coordinator already holds; no sender file is required.
     #[serde(default)]
-    pub cached: Vec<helios_core::package::schema::wire::PayloadDescriptor>,
+    pub cached: Vec<helios_core::core::schema::wire::PayloadDescriptor>,
     /// File-backed embedding table metadata rebound to this preparation's buffers.
     #[serde(default)]
-    pub engram: Option<helios_core::package::schema::wire::Engram>,
+    pub engram: Option<helios_core::core::schema::wire::Engram>,
 }
 
 /// Leases for captured cache objects, held from capture through publication and
 /// rank transfer so collection cannot unlink a payload between phases.
 #[derive(Clone, Default)]
-pub(crate) struct PayloadLeases(pub Vec<crate::package::cache::PayloadObject>);
+pub(crate) struct PayloadLeases(pub Vec<crate::core::cache::PayloadObject>);
 
 impl std::fmt::Debug for PayloadLeases {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

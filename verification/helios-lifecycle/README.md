@@ -13,9 +13,10 @@ aliases, and multi-rank offload reply aggregation.
 
 Install Java 11 or later and download the
 [TLA+ tools 1.7.4 jar](https://github.com/tlaplus/tlaplus/releases/tag/v1.7.4).
-The check uses Python 3, Cargo, `protoc`, and Helios's `server` test dependencies.
-It requires no CUDA device or model checkpoint. Java 21.0.13 and Rust 1.94.1
-are tested tool versions.
+The check uses Python 3, Cargo, `protoc`, and the build dependencies of Helios's
+`server` feature, including CMake and a C compiler for the bundled libjpeg-turbo.
+It requires no CUDA device or model checkpoint. The `Helios lifecycle` workflow
+in `.github/workflows/helios-lifecycle.yml` pins Java 21.0.13.
 
 From the repository root, run:
 
@@ -39,7 +40,7 @@ It also checks that premature cancellation release in a temporary copy of the
 model violates `QueuedReferencesRetainOwnership`.
 Additional model faults check early rank commitment, early queue removal, and
 ownership release after partial dispatch failure, lost inherited fences, and
-speculative pending bounds.
+speculative pending bounds, and publication before checkpoint-copy completion.
 
 ## Scheduler ownership
 
@@ -185,7 +186,7 @@ inherited read fences, retirement retention, and completion-gated reclamation.
 `cache::lifecycle_tests::bounded_cache_ownership_matches_tla` calls the production
 `PrefixCheckpointCache` methods through depth ten. Successor branches copy every
 cache field before calling an operation. The visited key includes the projection
-and relative LRU order. The 29-integer projection contains completed fence,
+and relative retention order. The 29-integer projection contains completed fence,
 publication count, three original-page read fences, and eight fields per node
 (status, parent, original parent, page mask, readiness fence, last-use fence,
 direct pins, retirement fence). All observed edges are checked against
@@ -196,13 +197,43 @@ transactional rejection, duplicate-publication caller ownership, and unique
 returned resources. A separate test compares `reclaimable_if_pinned` with actual
 pinning and eviction in 36 chain, branch, readiness, and pin configurations.
 Victim selection is abstracted to any eligible victim; the model does not prove
-LRU ranking or identity/resource reuse.
+demand/role retention ranking or identity/resource reuse.
 
 The scheduler alias test independently covers all 225 pairs of contiguous ranges
 within four pages, reservation budgets zero through five, both release orders,
 and reacquisition. It checks actual snapshot reservation/release against
 per-page owner counts, free sets, backing-page statistics, and retained page
 budgets. It does not exercise physical CUDA memory aliasing.
+
+## Checkpoint destination reservations
+
+`CheckpointReservation.tla` checks two requests, three snapshot rows, and submission
+fences zero through two. Each row is free, an unused anchor guard, an armed capture
+destination, an in-flight copy, a published checkpoint, a retired destination, or
+mandatory execution storage. A request may hold one guard while an earlier extra
+capture owns another row. Mandatory allocation can revoke a guard; it cannot
+reclaim an armed or copying destination before completion. Cancellation immediately
+releases unused guards and retains outstanding destinations through their final
+fence. Publication requires copy completion. Submitted and completed fences do
+not wrap, and rows can be reused within those bounds.
+
+`scheduler::checkpoint_lifecycle_tests` calls the production scheduler's planning,
+commit, completion, and cancellation methods. It cancels an anchor capture during
+its producing submission, while waiting to copy, during its copy submission, and
+after publication. The tests check release after the relevant fence and published
+checkpoint survival after cancellation. A separate guard test checks oldest-first
+revocation and overlapping backing aliases through the production allocator and
+revocation helper. Guard setup in that test assigns allocated rows directly to
+live requests; it does not exercise optional-cut selection.
+
+A 15-integer projection contains submitted/completed fences, the live-request
+mask, and each row's phase, request owner, retention fence, and observed GPU-use
+fence. TLC checks the observed edges with the same transition relations used by
+`Next`. Scheduler commit and completion are atomic compositions of reservation,
+arming, submission, publication, and reclamation actions. These traces cover
+selected cancellation boundaries, not exhaustive Rust-state exploration. Optional
+work arithmetic, victim ranking, physical CUDA aliases, and executor fence truth
+remain outside this model.
 
 ## Speculative accounting
 
@@ -265,7 +296,8 @@ implementation.
 The rank-helper checks cover the extracted bookkeeping predicates. They do not
 execute `poll_ranks`, `rank_loop`, poison handling, or `close` against CUDA, and
 do not establish all-rank drain or collective progress. The socket coordinator
-in `execution/parallel.rs` retains its separate implementation.
+in `execution/parallel.rs` is a separate implementation that these checks do not
+cover.
 
 The model permits any nonempty live cohort with a compatible feedback barrier.
 It does not prove scheduling-policy choices or fairness. It checks safety only;
@@ -290,7 +322,7 @@ failure distinct from an inaccurate abstraction or unsupported tooling.
 
 Use pstack's `statechart` skill to interpret TLA+ results and
 `maintain-formal-verification-skill` when covered code changes without updating
-the checks. A deliberate source mutation must fail the corresponding Rust test
+the checks. Neither skill is stored in this repository. A deliberate source mutation must fail the corresponding Rust test
 or observed-edge check before the verification is used to guard that property.
 
 ## Sequential Rust proofs
@@ -337,7 +369,7 @@ token IDs and consumed position, vector lengths zero through sixteen, optional
 vectors/cursors, and speculative or decode operation kind. Cursor arithmetic
 uses an `i128` oracle. Separate soundness and completeness harnesses check
 acceptance and rejection against the same requirements. Unrelated metadata is
-fixed; package validation is outside these harnesses. Counts, token lower bounds,
+fixed; core validation is outside these harnesses. Counts, token lower bounds,
 and status validity belong to the transport and scheduler validators. Cursor lags larger
 than `u32::MAX` are outside this proof's domain.
 
@@ -365,7 +397,7 @@ That test checks lookup before geometry validation, exact error classifications
 and messages, malformed geometry, and equality boundaries. The numerical Kani
 proof excludes manifest lookup and diagnostic construction. Shape and stride
 vectors represent empty and single-element inputs; the predicate reads only
-their lengths and first elements. Package validity, allocation failure,
+their lengths and first elements. Core validity, allocation failure,
 resource-owner destruction, GPU state, and rank interleavings require their
 separate checks.
 
@@ -389,9 +421,11 @@ relative. `TMPDIR="$PWD"` places the temporary copied crate beside `selene/`,
 `selene-manager/`, and `eos/`, preserving those paths. The original source remains
 unchanged, and the tool removes its temporary build tree afterward.
 
-The selected helpers generate eight mutations. Seven are caught by protocol
-assertions; constructing `Some(Default::default())` is unviable because `Pending`
-has no `Default` implementation. Unviable mutations do not count as caught.
+The selection is expected to leave no surviving mutation; inspect any survivor
+as the [verification guidance](../../docs/verification.md#use-mutation-testing-to-check-sensitivity)
+describes. A mutation that does not compile is unviable and does not count as
+caught: constructing `Some(Default::default())` is unviable because `Pending`
+has no `Default` implementation.
 The tool does not generate every targeted fault, including changing `.all` to
 `.any` or ignoring a failed commit send. The optional `--mutations` runner checks
 those explicit faults separately.
@@ -407,7 +441,7 @@ TMPDIR="$PWD" cargo mutants --manifest-path helios/Cargo.toml --no-config \
   -- model::contract::tests::state_view_validation_resolves_buffers_and_preserves_storage_errors
 ```
 
-This selection generates eleven mutations, all caught by the test. It covers
-unconditional acceptance/rejection, weakened conjunctions, omitted shape checks,
-and incorrect comparisons. A targeted strict-boundary fault (`<=` to `<`) also
-fails the storage-fit Kani equivalence assertion.
+This selection mutates the predicate into unconditional acceptance and
+rejection, weakened conjunctions, omitted shape checks, and incorrect
+comparisons, and is expected to leave no surviving mutation. The storage-fit
+Kani equivalence assertion detects a strict-boundary fault (`<=` changed to `<`).

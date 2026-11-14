@@ -206,7 +206,37 @@ def test_rank_preparation_rejects_invalid_k31_inputs_before_cuda(raw_config, tmp
 
     (tmp_path / "config.json").write_text(json.dumps(raw_config))
     with pytest.raises(ValueError, match=reason):
-        prepare_rank(tmp_path, PreparationConfig(**options), rank=0, group=None, package_storage=None)
+        prepare_rank(tmp_path, PreparationConfig(**options), rank=0, group=None, core_storage=None)
+
+
+@pytest.mark.parametrize("rows,expected_blocks", [(2, 1), (4, 1), (6, 1), (7, 1), (8, 2)])
+def test_paired_route_gather_uses_two_row_blocks_only_for_p8(monkeypatch, rows, expected_blocks):
+    from types import SimpleNamespace
+    import torch
+    from b12x.comm import pcie
+    from ignition.recipes.kimi3 import routing
+
+    class Plan:
+        def __init__(self, query):
+            self.query = query
+
+        def request(self, *args, **kwargs):
+            return object()
+
+    monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda group: tuple(range(16)))
+    monkeypatch.setattr(pcie, "query_from_runtime",
+                        lambda runtime, *, surface, call: dict(surface=surface, call=call))
+    monkeypatch.setattr(pcie, "plan", lambda query, *, runtime: Plan(query))
+    monkeypatch.setattr(routing, "declare", lambda *args, **kwargs: None)
+    runtime = SimpleNamespace(world_size=16, exchange_group=object())
+    local_down = torch.zeros((rows, 224), dtype=torch.bfloat16)
+    local_router = torch.zeros((rows, 56), dtype=torch.float32)
+    operation = routing.PreparedRouteGather(
+        local_down, local_router, torch.zeros(896), torch.zeros((rows, 3584), dtype=torch.bfloat16),
+        torch.zeros((rows, 16)), torch.zeros((rows, 16), dtype=torch.int32),
+        runtime=runtime, session=None, coordinator=None, name="route")
+    assert operation.plan.query["call"]["row_blocks"] == expected_blocks
+    assert operation.pair is None
 
 
 def test_native_quantization_covers_all_routed_experts(config):

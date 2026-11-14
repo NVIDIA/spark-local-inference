@@ -35,7 +35,7 @@ type StreamCreatePriority = unsafe extern "C" fn(*mut Handle, c_uint, c_int) -> 
 type PriorityRange = unsafe extern "C" fn(*mut c_int, *mut c_int) -> c_int;
 type HostRegister = unsafe extern "C" fn(Handle, usize, c_uint) -> c_int;
 type HostUnregister = unsafe extern "C" fn(Handle) -> c_int;
-#[cfg(feature = "runtime-package")]
+#[cfg(feature = "runtime-core")]
 type DeviceUuid = unsafe extern "C" fn(*mut [u8; 16], c_int) -> c_int;
 type DeviceAttribute = unsafe extern "C" fn(*mut c_int, c_int, c_int) -> c_int;
 type AddressReserve = unsafe extern "C" fn(*mut u64, usize, usize, u64, u64) -> c_int;
@@ -165,6 +165,7 @@ struct Driver {
     event_destroy: StreamOperation,
     stream_wait: StreamWait,
     wait_value: WaitValue,
+    write_value: WaitValue,
     host_pointer: HostPointer,
     pointer_attribute: PointerAttribute,
     stream_create_priority: StreamCreatePriority,
@@ -172,7 +173,7 @@ struct Driver {
     host_register: HostRegister,
     host_unregister: HostUnregister,
     device_attribute: DeviceAttribute,
-    #[cfg(feature = "runtime-package")]
+    #[cfg(feature = "runtime-core")]
     device_uuid: DeviceUuid,
     event_synchronize: StreamOperation,
     memcpy_batch: MemcpyBatch,
@@ -229,6 +230,7 @@ impl Driver {
                 event_destroy: symbol!("cuEventDestroy_v2"),
                 stream_wait: symbol!("cuStreamWaitEvent"),
                 wait_value: symbol!("cuStreamWaitValue32_v2"),
+                write_value: symbol!("cuStreamWriteValue32_v2"),
                 host_pointer: symbol!("cuMemHostGetDevicePointer_v2"),
                 pointer_attribute: symbol!("cuPointerGetAttribute"),
                 stream_create_priority: symbol!("cuStreamCreateWithPriority"),
@@ -236,7 +238,7 @@ impl Driver {
                 host_register: symbol!("cuMemHostRegister_v2"),
                 host_unregister: symbol!("cuMemHostUnregister"),
                 device_attribute: symbol!("cuDeviceGetAttribute"),
-                #[cfg(feature = "runtime-package")]
+                #[cfg(feature = "runtime-core")]
                 device_uuid: symbol!("cuDeviceGetUuid"),
                 event_synchronize: symbol!("cuEventSynchronize"),
                 memcpy_batch: symbol!("cuMemcpyBatchAsync_v2"),
@@ -302,7 +304,7 @@ pub fn current_context() -> Result<(usize, i32)> {
 }
 
 /// The UUID of the device with this ordinal, which names the GPU across restarts.
-#[cfg(feature = "runtime-package")]
+#[cfg(feature = "runtime-core")]
 pub(crate) fn device_uuid(device: i32) -> Result<[u8; 16]> {
     let driver = Driver::load()?;
     let mut uuid = [0u8; 16];
@@ -318,16 +320,16 @@ pub(crate) struct HostRegistration {
     driver: Arc<Driver>,
     address: usize,
     device_address: u64,
-    #[cfg(all(test, feature = "runtime-package"))]
+    #[cfg(all(test, feature = "runtime-core"))]
     nbytes: usize,
 }
 
 impl HostRegistration {
-    #[cfg(all(test, feature = "runtime-package"))]
+    #[cfg(all(test, feature = "runtime-core"))]
     pub(crate) fn address(&self) -> usize {
         self.address
     }
-    #[cfg(all(test, feature = "runtime-package"))]
+    #[cfg(all(test, feature = "runtime-core"))]
     pub(crate) fn nbytes(&self) -> usize {
         self.nbytes
     }
@@ -380,7 +382,7 @@ pub(crate) unsafe fn register_host(
         driver,
         address,
         device_address: 0,
-        #[cfg(all(test, feature = "runtime-package"))]
+        #[cfg(all(test, feature = "runtime-core"))]
         nbytes,
     };
     // SAFETY: The context is still current, the range is registered and live,
@@ -775,6 +777,15 @@ impl Stream {
         })
     }
 
+    /// Write `value` to a mapped host word once all prior work on this stream completed.
+    /// The default flags order the stream's earlier memory operations before the write.
+    /// The mapped word remains allocated until this stream drains.
+    pub(crate) unsafe fn write_value(&self, word: usize, value: u32) -> Result<()> {
+        self.driver.check("cuStreamWriteValue32_v2", unsafe {
+            (self.driver.write_value)(self.handle as Handle, word as u64, value, 0)
+        })
+    }
+
     pub(crate) fn mapped_address(&self, host: &PinnedHost) -> Result<usize> {
         let mut address = 0;
         self.driver.check("cuMemHostGetDevicePointer", unsafe {
@@ -1036,7 +1047,7 @@ mod tests {
 
     /// Scattered entries: device offsets ascend with odd gaps while host
     /// offsets descend, so neither side is contiguous or aligned.
-    #[cfg(feature = "runtime-package")]
+    #[cfg(feature = "runtime-core")]
     fn scattered_entries(capacity: usize) -> Vec<(usize, usize, usize)> {
         let sizes: Vec<usize> = (0..220)
             .map(|i| match i % 50 {
@@ -1068,13 +1079,13 @@ mod tests {
             .collect()
     }
 
-    #[cfg(feature = "runtime-package")]
+    #[cfg(feature = "runtime-core")]
     fn pattern(offset: usize) -> u8 {
         ((offset * 7) ^ (offset >> 9)) as u8
     }
 
     #[cfg(unix)]
-    #[cfg(feature = "runtime-package")]
+    #[cfg(feature = "runtime-core")]
     fn thread_cpu_time() -> std::time::Duration {
         let mut time = libc::timespec {
             tv_sec: 0,
@@ -1091,7 +1102,7 @@ mod tests {
     /// Read a patterned file with `O_DIRECT` into the registered mapping and
     /// compare. Returns `false` when the directory refuses direct I/O.
     #[cfg(unix)]
-    #[cfg(feature = "runtime-package")]
+    #[cfg(feature = "runtime-core")]
     fn direct_read_matches(host: *mut u8, capacity: usize) -> bool {
         use std::os::unix::ffi::OsStrExt;
         const FILE_BYTES: usize = 4 << 20;
@@ -1141,11 +1152,11 @@ mod tests {
         true
     }
 
-    #[cfg(feature = "runtime-package")]
+    #[cfg(feature = "runtime-core")]
     #[test]
     #[ignore = "requires a CUDA device; FLARE_OFFLOAD_TEST_DIR names a directory supporting direct I/O"]
     fn batched_copies_round_trip_through_registered_memory() {
-        use crate::runtime_package::driver::Driver as Loader;
+        use crate::runtime_core::driver::Driver as Loader;
         const BYTES: usize = 8 << 20;
         let loader = Loader::load().unwrap();
         let mut context = std::ptr::null_mut();

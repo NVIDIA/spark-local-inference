@@ -3,11 +3,11 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-//! Host-tier tests that need a CUDA device and an exported package.
+//! Host-tier tests that need a CUDA device and an exported core.
 //!
 //! Selene's own tests cover the stores against copiers that never touch a
 //! device; these run the stores over the real transfer threads. They are ignored
-//! unless `FLARE_OFFLOAD_TEST_PACKAGE` names a package a free GPU 0 can load.
+//! unless `FLARE_OFFLOAD_TEST_CORE` names a core a free GPU 0 can load.
 
 use flare_selene::{
     HostStore, StoreEvent,
@@ -18,12 +18,12 @@ fn seed(plane: usize, unit: u32) -> u64 {
     (plane as u64 + 1) * 1_000_003 + u64::from(unit)
 }
 
-fn load_test_model(package: &std::ffi::OsStr) -> crate::runtime_package::NativeModel {
+fn load_test_model(core: &std::ffi::OsStr) -> crate::runtime_core::NativeModel {
     unsafe {
-        crate::runtime_package::NativeModel::load(
-            crate::runtime_package::test_support::authorize(std::path::Path::new(package)),
+        crate::runtime_core::NativeModel::load(
+            crate::runtime_core::test_support::authorize(std::path::Path::new(core)),
             &[0],
-            &crate::runtime_package::LoadOptions::default(),
+            &crate::runtime_core::LoadOptions::default(),
             &crate::startup::StartupProgress::silent(),
         )
     }
@@ -62,16 +62,16 @@ mod memory {
     const IDENTITY: [u8; 32] = [7; 32];
 
     #[test]
-    #[ignore = "requires FLARE_OFFLOAD_TEST_PACKAGE naming an exported package and a free GPU 0"]
+    #[ignore = "requires FLARE_OFFLOAD_TEST_CORE naming an exported core and a free GPU 0"]
     fn memory_store_round_trips_a_multi_window_checkpoint() {
         use crate::cuda::Stream;
         use flare_selene::CacheGeometry;
 
-        let Some(package) = std::env::var_os("FLARE_OFFLOAD_TEST_PACKAGE") else {
-            eprintln!("skipping: FLARE_OFFLOAD_TEST_PACKAGE is unset");
+        let Some(core) = std::env::var_os("FLARE_OFFLOAD_TEST_CORE") else {
+            eprintln!("skipping: FLARE_OFFLOAD_TEST_CORE is unset");
             return;
         };
-        let model = super::load_test_model(&package);
+        let model = super::load_test_model(&core);
         let manifest = model.manifests().unwrap().remove(0);
         let geometry = vec![manifest.cache.clone().unwrap()];
         let rank: &CacheGeometry = &geometry[0];
@@ -206,16 +206,16 @@ mod memory {
     }
 
     #[test]
-    #[ignore = "requires FLARE_OFFLOAD_TEST_PACKAGE naming an exported package and a free GPU 0"]
-    fn memory_store_round_trips_a_checkpoint_through_a_loaded_package() {
+    #[ignore = "requires FLARE_OFFLOAD_TEST_CORE naming an exported core and a free GPU 0"]
+    fn memory_store_round_trips_a_checkpoint_through_a_loaded_core() {
         use crate::cuda::Stream;
         use flare_selene::CacheGeometry;
 
-        let Some(package) = std::env::var_os("FLARE_OFFLOAD_TEST_PACKAGE") else {
-            eprintln!("skipping: FLARE_OFFLOAD_TEST_PACKAGE is unset");
+        let Some(core) = std::env::var_os("FLARE_OFFLOAD_TEST_CORE") else {
+            eprintln!("skipping: FLARE_OFFLOAD_TEST_CORE is unset");
             return;
         };
-        let model = super::load_test_model(&package);
+        let model = super::load_test_model(&core);
         let manifest = model.manifests().unwrap().remove(0);
         let geometry = vec![manifest.cache.clone().unwrap()];
         let rank: &CacheGeometry = &geometry[0];
@@ -591,18 +591,18 @@ mod composite {
     }
 
     #[test]
-    #[ignore = "requires FLARE_OFFLOAD_TEST_PACKAGE naming an exported package and a free GPU 0"]
+    #[ignore = "requires FLARE_OFFLOAD_TEST_CORE naming an exported core and a free GPU 0"]
     fn composite_writes_a_child_published_while_its_parent_is_in_flight() {
         use crate::cuda::Stream;
         use flare_selene::geometry::fingerprint;
-        let Some(package) = std::env::var_os("FLARE_OFFLOAD_TEST_PACKAGE") else {
-            eprintln!("skipping: FLARE_OFFLOAD_TEST_PACKAGE is unset");
+        let Some(core) = std::env::var_os("FLARE_OFFLOAD_TEST_CORE") else {
+            eprintln!("skipping: FLARE_OFFLOAD_TEST_CORE is unset");
             return;
         };
         let Some(directory) = test_directory("composite", "gpu-child") else {
             return;
         };
-        let model = super::load_test_model(&package);
+        let model = super::load_test_model(&core);
         let manifest = model.manifests().unwrap().remove(0);
         let geometry = vec![manifest.cache.clone().unwrap()];
         let rank = geometry[0].clone();
@@ -913,18 +913,18 @@ mod composite {
     }
 
     #[test]
-    #[ignore = "requires FLARE_OFFLOAD_TEST_PACKAGE naming an exported package and a free GPU 0"]
-    fn composite_round_trips_through_memory_and_disk_on_a_loaded_package() {
+    #[ignore = "requires FLARE_OFFLOAD_TEST_CORE naming an exported core and a free GPU 0"]
+    fn composite_round_trips_through_memory_and_disk_on_a_loaded_core() {
         use crate::cuda::Stream;
         use flare_selene::geometry::fingerprint;
-        let Some(package) = std::env::var_os("FLARE_OFFLOAD_TEST_PACKAGE") else {
-            eprintln!("skipping: FLARE_OFFLOAD_TEST_PACKAGE is unset");
+        let Some(core) = std::env::var_os("FLARE_OFFLOAD_TEST_CORE") else {
+            eprintln!("skipping: FLARE_OFFLOAD_TEST_CORE is unset");
             return;
         };
         let Some(directory) = test_directory("composite", "gpu") else {
             return;
         };
-        let model = super::load_test_model(&package);
+        let model = super::load_test_model(&core);
         let manifest = model.manifests().unwrap().remove(0);
         let geometry = vec![manifest.cache.clone().unwrap()];
         let rank = geometry[0].clone();
@@ -1435,18 +1435,18 @@ mod disk_store {
     }
 
     #[test]
-    #[ignore = "requires FLARE_OFFLOAD_TEST_PACKAGE naming an exported package and a free GPU 0"]
+    #[ignore = "requires FLARE_OFFLOAD_TEST_CORE naming an exported core and a free GPU 0"]
     fn staged_store_round_trips_records_through_files_and_a_restart() {
         use crate::cuda::Stream;
         use flare_selene::geometry::fingerprint;
-        let Some(package) = std::env::var_os("FLARE_OFFLOAD_TEST_PACKAGE") else {
-            eprintln!("skipping: FLARE_OFFLOAD_TEST_PACKAGE is unset");
+        let Some(core) = std::env::var_os("FLARE_OFFLOAD_TEST_CORE") else {
+            eprintln!("skipping: FLARE_OFFLOAD_TEST_CORE is unset");
             return;
         };
         let Some(directory) = test_directory("disk-store", "round-trip") else {
             return;
         };
-        let model = super::load_test_model(&package);
+        let model = super::load_test_model(&core);
         let manifest = model.manifests().unwrap().remove(0);
         let geometry = vec![manifest.cache.clone().unwrap()];
         let rank = geometry[0].clone();
@@ -1857,12 +1857,12 @@ mod disk_store {
 
 mod geometry {
     #[test]
-    #[ignore = "requires FLARE_OFFLOAD_TEST_PACKAGE naming an exported package and a free GPU 0"]
-    fn package_geometry_lists_every_plane() {
-        let Some(package) = std::env::var_os("FLARE_OFFLOAD_TEST_PACKAGE") else {
+    #[ignore = "requires FLARE_OFFLOAD_TEST_CORE naming an exported core and a free GPU 0"]
+    fn core_geometry_lists_every_plane() {
+        let Some(core) = std::env::var_os("FLARE_OFFLOAD_TEST_CORE") else {
             return;
         };
-        let model = super::load_test_model(&package);
+        let model = super::load_test_model(&core);
         let manifest = model.manifests().unwrap().remove(0);
         let geometry = manifest.cache.unwrap();
         eprintln!(

@@ -245,7 +245,7 @@ def _worker(rank, rendezvous, checkpoint, destination, policy, compiled, maximum
     from ignition.components.shared_pages import SharedPages
     from ignition.preparation.collectives import CollectivePreparation, create_all_reduce_runtime, create_head_exchange
     from ignition.preparation.compilation import compile_forward
-    from ignition.preparation.package_storage import PackageStorage
+    from ignition.preparation.core_storage import CoreStorage
     from ignition.preparation.scratch import ScratchArena
     from ignition.preparation.tuning import RecordedPreparationSession
     from ignition.recipes.kimi3.dcp import ContextShards
@@ -261,7 +261,7 @@ def _worker(rank, rendezvous, checkpoint, destination, policy, compiled, maximum
     graphs, runtimes, stage = [], [], None
     reports = []
     try:
-        with PackageStorage(rank=rank, world=WORLD, device=rank) as storage:
+        with CoreStorage(rank=rank, world=WORLD, device=rank) as storage:
             coordinator = CollectivePreparation(dist.group.WORLD)
             control_runtime = create_head_exchange(dist.group.WORLD, device,
                 max_rows=128, heads=WORLD, head_dim=8192, ipc=storage.peer_storage)

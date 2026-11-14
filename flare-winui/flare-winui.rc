@@ -1,0 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
+#include "resource.h"
+IDI_FLARE_APP ICON "Assets\\flare-app.ico"
+IDB_FLARE_TITLE RCDATA "Assets\\flare-app-128.png"

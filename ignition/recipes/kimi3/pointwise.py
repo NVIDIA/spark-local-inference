@@ -91,3 +91,65 @@ def sigmoid_gate(value, gate):
     torch.library.wrap_triton(_sigmoid_gate)[(rows, triton.cdiv(width, block))](
         value, gate, value.stride(0), gate.stride(0), width, block, num_warps=4)
     return value
+
+
+@triton.jit
+def _unpack_norm_q(Gathered, Weight, Out, g_row_stride, g_rank_stride, out_stride, eps,
+                   LOCAL_Q: tl.constexpr, NORM_WIDTH: tl.constexpr, BLOCK: tl.constexpr):
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.arange(0, BLOCK)
+    valid = cols < NORM_WIDTH
+    rank = cols // LOCAL_Q
+    offset = cols % LOCAL_Q
+    value = tl.load(Gathered + row * g_row_stride + rank * g_rank_stride + offset,
+                    mask=valid, other=0.0).to(tl.float32)
+    normalized = (value * tl.rsqrt(tl.sum(value * value) / NORM_WIDTH + eps)).to(Out.dtype.element_ty)
+    weight = tl.load(Weight + cols, mask=valid, other=0.0).to(tl.float32)
+    tl.store(Out + row * out_stride + cols, (weight * normalized.to(tl.float32)).to(Out.dtype.element_ty), mask=valid)
+
+
+@triton.jit
+def _unpack_norm_kv_and_tail(Gathered, Weight, LatentOut, g_row_stride, g_rank_stride, lat_stride, eps,
+                             LOCAL_Q: tl.constexpr, LOCAL_KV: tl.constexpr,
+                             KV_NORM_WIDTH: tl.constexpr, TAIL_WIDTH: tl.constexpr, BLOCK: tl.constexpr):
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.arange(0, BLOCK)
+    valid = cols < KV_NORM_WIDTH
+    rank = cols // LOCAL_KV
+    offset = LOCAL_Q + (cols % LOCAL_KV)
+    value = tl.load(Gathered + row * g_row_stride + rank * g_rank_stride + offset,
+                    mask=valid, other=0.0).to(tl.float32)
+    normalized = (value * tl.rsqrt(tl.sum(value * value) / KV_NORM_WIDTH + eps)).to(LatentOut.dtype.element_ty)
+    weight = tl.load(Weight + cols, mask=valid, other=0.0).to(tl.float32)
+    tl.store(LatentOut + row * lat_stride + cols,
+             (weight * normalized.to(tl.float32)).to(LatentOut.dtype.element_ty), mask=valid)
+    if TAIL_WIDTH > 0:
+        tail_cols = tl.arange(0, 64)
+        tail_valid = tail_cols < TAIL_WIDTH
+        tail_index = KV_NORM_WIDTH + tail_cols
+        tail_rank = tail_index // LOCAL_KV
+        tail_offset = LOCAL_Q + (tail_index % LOCAL_KV)
+        tail_value = tl.load(Gathered + row * g_row_stride + tail_rank * g_rank_stride + tail_offset,
+                             mask=tail_valid, other=0.0)
+        tl.store(LatentOut + row * lat_stride + tail_index, tail_value, mask=tail_valid)
+
+
+def unpack_and_rms_norm_qkv(gathered, local_q: int, local_kv: int, q_weight, kv_weight, q_norm_out, latent_out, eps: float):
+    """Unpack rank-interleaved latents and apply canonical Q/KV RMSNorm and tail copy."""
+    rows, world, width = gathered.shape
+    q_width = q_norm_out.shape[1]
+    kv_norm_width = kv_weight.shape[0]
+    tail_width = latent_out.shape[1] - kv_norm_width
+    if (local_q + local_kv > width or q_width > world * local_q or latent_out.shape[1] > world * local_kv
+            or not 0 <= tail_width <= 64 or q_weight.shape != (q_width,)
+            or q_norm_out.shape[0] != rows or latent_out.shape[0] != rows
+            or gathered.stride(2) != 1 or q_norm_out.stride(1) != 1 or latent_out.stride(1) != 1):
+        raise ValueError("fused latent unpacking requires complete rank shards, contiguous rows and at most 64 tail columns")
+    q_block = triton.next_power_of_2(q_width)
+    kv_block = triton.next_power_of_2(kv_norm_width)
+    torch.library.wrap_triton(_unpack_norm_q)[(rows,)](
+        gathered, q_weight, q_norm_out, gathered.stride(0), gathered.stride(1), q_norm_out.stride(0), float(eps),
+        local_q, q_width, q_block, num_warps=4 if q_block <= 2048 else 8)
+    torch.library.wrap_triton(_unpack_norm_kv_and_tail)[(rows,)](
+        gathered, kv_weight, latent_out, gathered.stride(0), gathered.stride(1), latent_out.stride(0), float(eps),
+        local_q, local_kv, kv_norm_width, tail_width, kv_block, num_warps=4 if kv_block <= 2048 else 8)

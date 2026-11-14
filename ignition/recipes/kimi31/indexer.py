@@ -3,42 +3,35 @@
 
 """Per-token Kimi sparse indexing over rank-local FP8 key pages."""
 
+from typing import NamedTuple
+
 import torch
 
-from ignition.components.candidate_rows import PreparedCandidateRows
-from ignition.components.collectives import PreparedAllGather
+from ignition.components.candidate_selection import PreparedCandidateSelection
 from ignition.components.fp8_indexer import PreparedFP8Indexer, write_fp8_index_keys
 from ignition.components.linear import UnquantizedProjection
-from ignition.components.ordered_row_topk import PreparedOrderedRowTopK
+from ignition.preparation.tuning import register_finalizer
+from ignition.preparation.scratch import buffer_rows
 
-from .dcp import TOPK, PREFILL_ROWS, index_pages, pack_candidates
+from .dcp import TOPK, PREFILL_ROWS, index_pages
 
 
 class SharedBuffers:
-    """Named row-capacity storage reused by serial layers and query slices."""
+    """Declaration examples shared by serial layers and query slices."""
 
-    def __init__(self, values, device, allocator=None, prefix=""):
-        self.values, self.device, self.allocator, self.prefix = values, device, allocator, prefix
+    def __init__(self, values, device, prefix=""):
+        self.values, self.device, self.prefix = values, device, prefix
         self.ordinal = 0
-        self.views = values.setdefault("row_views", {})
 
     def buffer(self, name, shape, dtype):
         name = self.prefix + name
         value = self.values.get(name)
         if value is None or value.shape[0] < shape[0]:
-            value = (torch.zeros(shape, dtype=dtype, device=self.device) if self.allocator is None
-                     else self.allocator.zeros(shape, dtype))
+            value = torch.zeros(shape, dtype=dtype, device=self.device)
             self.values[name] = value
         if value.shape[1:] != shape[1:] or value.dtype != dtype:
-            raise ValueError("Kimi index buffers require matching non-row dimensions and dtype")
-        cached = self.views.get(name)
-        if cached is None or cached[0] is not value:
-            cached = (value, {})
-            self.views[name] = cached
-        rows = shape[0]
-        if rows not in cached[1]:
-            cached[1][rows] = value[:rows]
-        return cached[1][rows]
+            raise ValueError("Kimi declaration tensors require matching non-row dimensions and dtype")
+        return buffer_rows(self.values, name, shape[0])
 
     def zeros(self, shape, dtype):
         name = str(self.ordinal)
@@ -46,72 +39,109 @@ class SharedBuffers:
         return self.buffer(name, shape, dtype)
 
 
+class SharedIndexMetadata(NamedTuple):
+    """Layer-independent DSA pages, visible lengths, and cache-write slots."""
+
+    pages: torch.Tensor
+    lengths: torch.Tensor
+    slots: torch.Tensor
+
+    @classmethod
+    def create(cls, metadata, shards, rows):
+        if rows <= 0:
+            raise ValueError("shared DSA metadata requires query rows")
+        positions = metadata.positions[:rows]
+        tables = metadata.token_page_table[:rows]
+        pages = torch.empty((rows, tables.shape[1] * 2), dtype=torch.int32, device=positions.device)
+        index_pages(tables, pages)
+        lengths = shards.local_tokens((positions + 1).clamp(min=0)).to(torch.int32)
+        slots = shards.token_slots(positions, tables)
+        return cls(pages, lengths, slots)
+
+
 class PreparedIndexSelection:
     def __init__(self, query, weights, cache, metadata, shards, context, buffers, *, start, end,
-                 mode, session, name, workspace, allocator, latent_cache):
+                 mode, session, name, workspace, latent_cache):
         rows, width = end - start, metadata.token_page_table.shape[1]
-        self.positions = metadata.positions[start:end]
-        self.tables = metadata.token_page_table[start:end]
+        self.rows, self.width, self.latent_cache = rows, width, latent_cache
+        self.start = start
         self.shards, self.mode = shards, mode
-        storage = SharedBuffers(buffers, query.device, allocator)
+        storage = SharedBuffers(buffers, query.device)
         self.pages = storage.buffer("pages", (1 if mode == "prefill" else rows, width * 2), torch.int32)
         self.lengths = storage.buffer("local_lengths", (rows,), torch.int32)
         self.local = storage.buffer("local_ids", (rows, TOPK), torch.int32)
         self.scores = storage.buffer("local_scores", (rows, TOPK), torch.float32)
-        self.packed = storage.buffer("candidates", (rows, TOPK, 2), torch.float32)
-        self.gathered = storage.buffer("gathered", (rows, TOPK * shards.world, 2), torch.float32)
-        self.global_scores = storage.buffer("global_scores", (rows, TOPK * shards.world), torch.float32)
-        self.global_ids = storage.buffer("global_ids", (rows, TOPK * shards.world), torch.int32)
-        self.fold_lengths = storage.buffer("fold_lengths", (rows,), torch.int32)
-        self.active = storage.buffer("active", (rows,), torch.bool)
-        self.selected_scores = storage.buffer("selected_scores", (rows, TOPK), torch.float32)
         self.selected = storage.buffer("selected", (rows, TOPK), torch.int32)
+        self.candidate_counts = storage.buffer("candidate_counts", (rows,), torch.int32)
         pages = self.pages.expand(rows, -1) if mode == "prefill" else self.pages
         self.indexer = PreparedFP8Indexer(query[start:end].view(rows, 32, 128), weights[start:end],
             cache, pages, self.lengths, None, self.local, mode="prefill" if mode == "prefill" else "decode", session=session,
             name=name + ".local", workspace=workspace,
-            buffers=SharedBuffers(buffers, query.device, allocator, prefix="fp8."), topk=TOPK, scores=self.scores,
+            buffers=SharedBuffers(buffers, query.device, prefix="fp8."), topk=TOPK, scores=self.scores,
             prefill_records_per_call=131072, head_weight_scale=1.0, hadamard=False, key_power_of_two=False)
         runtime = None if context is None else context.candidates
         if shards.world > 1 and runtime is None:
             raise ValueError("Kimi sparse selection requires a candidate exchange for every context rank")
-        self.gather = PreparedAllGather(self.packed.view(torch.bfloat16).view(rows, TOPK * 4),
-            self.gathered.view(torch.bfloat16).view(rows, TOPK * 4 * shards.world), runtime=runtime,
-            session=session, coordinator=None if context is None else context.coordinator,
-            name=name + ".candidates", dependencies=(latent_cache,))
-        self.fold = PreparedOrderedRowTopK(self.global_scores, self.fold_lengths, self.global_ids,
-            self.selected_scores, self.selected, session=session, name=name + ".fold",
-            buffers=SharedBuffers(buffers, query.device, allocator, prefix="agreement."))
-        self.candidate_rows = PreparedCandidateRows(self.gathered, self.active,
-            self.global_scores, self.global_ids, self.fold_lengths, topk=TOPK,
-            buffers=SharedBuffers(buffers, query.device, allocator, prefix="candidate_rows."))
+        tuning = None if context is None else getattr(context, "selection_tuning", None)
+        tune = tuning is not None and mode != "prefill" and metadata.starts.numel() == 1
+        self.merge = PreparedCandidateSelection(self.local, self.scores, metadata.positions[start:end],
+            shards.index, self.selected, world=shards.world, gather_runtime=runtime,
+            owner_runtime=context.candidate_owners if tune else None,
+            reduction_runtime=tuning.reduction if tune else None, session=session,
+            coordinator=None if context is None else context.coordinator, name=name + ".merge",
+            buffers=SharedBuffers(buffers, query.device, prefix="merge."),
+            dependencies=(latent_cache,), alternatives=("replicated", "owner") if tune else ("replicated",),
+            local_counts=self.candidate_counts if tune else None)
+        if tune:
+            tuning.register(self.merge)
+        else:
+            self.merge.bind("replicated")
 
-    def prepare_local(self):
-        """Produce rank-local candidates without using a peer communication channel."""
-        index_pages(self.tables[:1] if self.mode == "prefill" else self.tables, self.pages)
-        self.lengths.copy_(self.shards.local_tokens((self.positions + 1).clamp(min=0)).to(torch.int32))
-        self.indexer()
-        pack_candidates(self.local, self.scores, self.packed, self.shards)
-        return self.packed
+        self.indexer.functional(session=session)
+        self.merge.functional(session=session)
+        register_finalizer(session, self._release_examples)
 
-    def exchange(self):
-        """Exchange local candidates, select global records, and agree on their order."""
-        self.gather(self.packed.view(torch.bfloat16).view(self.packed.shape[0], -1))
-        self.active.copy_(self.positions >= 0)
-        self.candidate_rows()
-        self.fold()
-        return self.selected
+    def _release_examples(self):
+        self.pages = self.lengths = self.local = self.scores = self.selected = self.candidate_counts = None
 
-    def __call__(self):
-        self.prepare_local()
-        return self.exchange()
+    def prepare_local(self, query, weights, positions, tables, *, shared_index=None):
+        return self.prepare_local_result(query, weights, positions, tables, shared_index=shared_index)[0]
+
+    def prepare_local_result(self, query, weights, positions, tables, *, shared_index=None):
+        if shared_index is None:
+            pages = torch.empty((1 if self.mode == "prefill" else self.rows, self.width * 2),
+                                dtype=torch.int32, device=query.device)
+            index_pages(tables[:1] if self.mode == "prefill" else tables, pages)
+            lengths = self.shards.local_tokens((positions + 1).clamp(min=0)).to(torch.int32)
+        else:
+            if self.mode == "prefill":
+                raise ValueError("shared DSA metadata applies only to decode and verification")
+            pages = shared_index.pages[self.start:self.start + self.rows]
+            lengths = shared_index.lengths[self.start:self.start + self.rows]
+        (indices, scores), quantized, scales, scaled_weights = self.indexer._run_observed(
+            query.view(query.shape[0], 32, 128), weights,
+            pages.expand(self.rows, -1) if self.mode == "prefill" else pages, lengths)
+        packed = self.merge.pack(indices=indices, scores=scores)
+        return packed, indices, scores, quantized, scales, scaled_weights
+
+    def exchange(self, packed, positions, *, dependencies=()):
+        return self.exchange_result(packed, positions, dependencies=dependencies)[0]
+
+    def exchange_result(self, packed, positions, *, dependencies=()):
+        return self.merge.exchange_with_scores(packed=packed, positions=positions,
+                                   dependencies=(self.latent_cache, *dependencies))
+
+    def __call__(self, query, weights, positions, tables, *, shared_index=None):
+        packed = (self.prepare_local(query, weights, positions, tables) if shared_index is None else
+                  self.prepare_local(query, weights, positions, tables, shared_index=shared_index))
+        return self.exchange(packed, positions)
 
 
 class PreparedDSAIndexer:
     """BF16 projections and head normalization, FP32 LayerNorm, and global top-2048 selection."""
 
     def __init__(self, weights, source, query_latent, metadata, cache, shards, *, context, eps, mode,
-                 session, name, workspace, buffers, latent_cache, allocator=None):
+                 session, name, workspace, buffers, latent_cache):
         rows = source.shape[0]
         expected = {"indexer.wq_b": (4096, 1536), "indexer.wk": (128, 7168),
             "indexer.weights_proj": (32, 7168), "indexer.k_norm.weight": (128,),
@@ -123,7 +153,7 @@ class PreparedDSAIndexer:
                 raise ValueError(f"Kimi sparse index weight {field} requires BF16{shape}")
         if cache.dtype != torch.uint8 or cache.numel() % (64 * 132):
             raise ValueError("Kimi sparse index cache requires planar 64-record uint8 pages")
-        storage = SharedBuffers(buffers, source.device, allocator)
+        storage = SharedBuffers(buffers, source.device)
         self.query = storage.buffer("query", (rows, 4096), torch.bfloat16)
         self.key = storage.buffer("key", (rows, 128), torch.bfloat16)
         self.normalized_key = storage.buffer("normalized_key", (rows, 128), torch.bfloat16)
@@ -146,31 +176,46 @@ class PreparedDSAIndexer:
 
             self.sharded = PreparedQuerySelection(self.query, self.head_weights, cache_pages,
                 metadata, shards, context, buffers.setdefault("query_selection", {}),
-                session=session, name=name + ".queries", workspace=workspace, allocator=allocator)
-            self.parts = self.sharded.parts
-        else:
-            self.parts = tuple(PreparedIndexSelection(self.query, self.head_weights, cache_pages,
-                metadata, shards, context, selection_buffers, start=start, end=end, mode=mode,
-                session=session, name=f"{name}.slice{start}", workspace=workspace, allocator=allocator,
-                latent_cache=latent_cache)
-                for start, end in self.bounds)
+                session=session, name=name + ".queries", workspace=workspace)
+        self.selections = {}
+        for start, end in (() if self.sharded is not None else self.bounds):
+            rows = end - start
+            if rows not in self.selections:
+                self.selections[rows] = PreparedIndexSelection(self.query, self.head_weights, cache_pages,
+                    metadata, shards, context, selection_buffers, start=start, end=end, mode=mode,
+                    session=session, name=f"{name}.slice{start}", workspace=workspace,
+                    latent_cache=latent_cache)
+
+        for projection in self.projections:
+            projection.functional(session=session)
+        register_finalizer(session, self._release_examples)
+
+    def _release_examples(self):
+        self.query = self.key = self.normalized_key = self.head_weights = None
+        self.query_latent = self.metadata = self.slots = None
 
     @property
     def local_plans(self):
         """Projection, query-quantization, and index-scoring plans with no peer exchange."""
-        indexers = ([part.indexer for part in self.parts] if self.sharded is None else self.sharded.indexers)
+        indexers = ([part.indexer for part in self.selections.values()] if self.sharded is None
+                    else [part[0] for part in self.sharded.indexers.values()])
         return (*[projection.plan for projection in self.projections],
                 *[plan for indexer in indexers for plan in (indexer.query_plan, indexer.selection.plan)])
 
-    def project(self, source):
-        self.projections[0](self.query_latent)
-        self.projections[1](source)
-        self.projections[2](source)
-        self.head_weights.mul_(32 ** -.5)
-        key = self.key.float()
+    def project(self, source, query_latent, metadata, *, slots=None):
+        query, _, _, head_weights = self.project_result(source, query_latent, metadata, slots=slots)
+        return query, head_weights
+
+    def project_result(self, source, query_latent, metadata, *, slots=None):
+        query = self.projections[0](query_latent)
+        key = self.projections[1](source).float()
+        head_weights = self.projections[2](source) * (32 ** -.5)
         centered = key - key.mean(-1, keepdim=True)
         variance = centered.square().mean(-1, keepdim=True)
-        self.normalized_key.copy_(centered * torch.rsqrt(variance + self.eps)
-            * self.weights["indexer.k_norm.weight"].float() + self.weights["indexer.k_norm.bias"].float())
-        self.slots.copy_(self.shards.token_slots(self.metadata.positions, self.metadata.token_page_table))
-        write_fp8_index_keys(self.normalized_key, self.slots, self.cache, hadamard=False, power_of_two=False)
+        normalized_key = (centered * torch.rsqrt(variance + self.eps)
+            * self.weights["indexer.k_norm.weight"].float()
+            + self.weights["indexer.k_norm.bias"].float()).to(source.dtype)
+        if slots is None:
+            slots = self.shards.token_slots(metadata.positions, metadata.token_page_table)
+        write_fp8_index_keys(normalized_key, slots, self.cache, hadamard=False, power_of_two=False)
+        return query, key.to(source.dtype), normalized_key, head_weights

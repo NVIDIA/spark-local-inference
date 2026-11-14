@@ -34,7 +34,7 @@ def join(address, rank, world=2, *, identity="same", boot=None, results=None):
             results.append(error)
 
 
-@pytest.mark.parametrize("world", [3, 4])
+@pytest.mark.parametrize("world", [3, 4, 6])
 def test_admits_every_peer_rank_with_its_executor_connection(world):
     owner, address = rendezvous(world)
     results = []
@@ -126,8 +126,8 @@ def test_local_checkpoint_source_must_match_its_declared_directory(tmp_path):
 
 
 def test_export_manifest_transfers_only_absent_files(tmp_path):
-    from ignition.preparation.package_file import container_header, read_sources, write_sources
-    from ignition.preparation.runtime_package_pb2 import ModelIndex, BundleIndex, Span
+    from ignition.preparation.core_file import container_header, read_sources, write_sources
+    from ignition.preparation.runtime_core_pb2 import ModelIndex, BundleIndex, Span
     from tests.preparation.test_export_transfer import transfer
     import hashlib
 
@@ -164,13 +164,13 @@ def test_export_subprocess_reopens_more_sources_than_descriptor_limit(tmp_path):
 import resource, socket, sys
 from ignition.preparation.host_ranks import send_export_sources
 from ignition.preparation.checkpoint_source import Channel
-from tests.preparation.test_export_transfer import package
+from tests.preparation.test_export_transfer import core
 resource.setrlimit(resource.RLIMIT_NOFILE, (64, resource.getrlimit(resource.RLIMIT_NOFILE)[1]))
 with socket.socket(fileno=int(sys.argv[1])) as control:
     control.settimeout(10)
     connections = [socket.socket(fileno=int(fd)) for fd in sys.argv[3:]]
     channels = [Channel(connection, b'k' * 32, server=False) for connection in connections]
-    send_export_sources(control, package(sys.argv[2]), {}, channels=channels)
+    send_export_sources(control, core(sys.argv[2]), {}, channels=channels)
 """
     with ExitStack() as stack:
         control, peer = sockets(stack)
@@ -194,10 +194,10 @@ with socket.socket(fileno=int(sys.argv[1])) as control:
             child.communicate(timeout=10)
 
 
-def test_cluster_export_combines_received_sources_into_payload_package(tmp_path):
+def test_cluster_export_combines_received_sources_into_payload_core(tmp_path):
     from helios.tests.signing import publisher
-    from ignition.preparation.package_file import combine
-    from ignition.preparation.package_snapshot import export_options
+    from ignition.preparation.core_file import combine
+    from ignition.preparation.core_snapshot import export_options
     from tests.preparation.test_export_transfer import transfer
     from tests.preparation.payload_fixture import rank_source, manifest, schema
     from safetensors import safe_open
@@ -207,7 +207,7 @@ def test_cluster_export_combines_received_sources_into_payload_package(tmp_path)
     received = tmp_path / 'received' / 'rank-1.json'
     report = transfer(remote, received, tmp_path / 'cache', streams=2)
     assert report['files'] == 3
-    output = tmp_path / 'package'
+    output = tmp_path / 'core'
     with export_options(tmp_path / 'cache'):
         combine(output, [local, received], [], publisher=publisher(), cluster=(2, 'fixture-cluster'))
     envelope = manifest(output)
@@ -228,7 +228,7 @@ def test_host_export_cache_only_uses_native_workspace_and_staging(tmp_path, monk
     from types import SimpleNamespace
 
     import flare_heliopause
-    from ignition.preparation import host_ranks, package_file, runtime_package
+    from ignition.preparation import host_ranks, core_file, runtime_core
 
     calls = {}
 
@@ -256,8 +256,8 @@ def test_host_export_cache_only_uses_native_workspace_and_staging(tmp_path, monk
         return SimpleNamespace(model='m', entry='e')
 
     monkeypatch.setattr(flare_heliopause, 'NativeExportStage', Stage)
-    monkeypatch.setattr(runtime_package, 'export_model', fake_export_model)
-    monkeypatch.setattr(package_file, 'combine', fake_combine)
+    monkeypatch.setattr(runtime_core, 'export_model', fake_export_model)
+    monkeypatch.setattr(core_file, 'combine', fake_combine)
     monkeypatch.setattr(host_ranks, 'send_object', lambda control, value: None)
     from ignition.preparation import memory_inventory
     monkeypatch.setattr(memory_inventory, 'print_inventory', lambda *args, **kwargs: None)
@@ -285,7 +285,7 @@ def test_host_export_cache_only_uses_native_workspace_and_staging(tmp_path, monk
 
     options = {}
 
-    from ignition.preparation.package_snapshot import export_options
+    from ignition.preparation.core_snapshot import export_options
     with export_options(tmp_path / 'cache'):
         result = host_ranks.HostRankGroup.export(
             group, None, options=options, export_id='export', images=None,
@@ -299,7 +299,7 @@ def test_host_export_cache_only_uses_native_workspace_and_staging(tmp_path, monk
 
 
 def test_host_export_without_configured_cache_fails_before_peer_commands(tmp_path, monkeypatch):
-    """Missing package-cache configuration fails before any workspace or peer side effect."""
+    """Missing core-cache configuration fails before any workspace or peer side effect."""
     from types import SimpleNamespace
 
     import flare_heliopause
@@ -324,7 +324,7 @@ def test_host_export_without_configured_cache_fails_before_peer_commands(tmp_pat
     group._closed = False
 
     # No export_options context: settings are absent.
-    with pytest.raises(RuntimeError, match='configured package cache'):
+    with pytest.raises(RuntimeError, match='configured core cache'):
         host_ranks.HostRankGroup.export(
             group, None, options={}, export_id='export', images=None,
             storage=SimpleNamespace(host_regions=[]), publisher=object())

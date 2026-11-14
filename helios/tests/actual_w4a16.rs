@@ -6,11 +6,11 @@
 //! Exercise actual Heliopause W4A16 rank exports through Rust combine/cache.
 //!
 //! The fixture is external and deliberately test-only. It must contain signed
-//! TP1 and TP2 packages produced from actual prepared rank metadata and bytes;
+//! TP1 and TP2 cores produced from actual prepared rank metadata and bytes;
 //! this test never synthesizes prepared weights or substitutes a weight-only
 //! matrix for the real weight/scale owner layout.
 
-#![cfg(feature = "runtime-package")]
+#![cfg(feature = "runtime-core")]
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -20,11 +20,11 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use flare_helios::package::{
+use flare_helios::core::{
     cache, container, conversion, derivation, prepared_weights, protection, reader,
     schema::wire, PayloadId,
 };
-use flare_helios::runtime_package::Publisher;
+use flare_helios::runtime_core::Publisher;
 use prost::Message as _;
 use ring::signature::Ed25519KeyPair;
 
@@ -106,7 +106,7 @@ fn tp_selection(
 
 fn read_payload_range(
     metadata: &reader::Metadata,
-    verified: &protection::VerifiedPackage,
+    verified: &protection::VerifiedCore,
     id: &[u8],
     offset: u64,
     nbytes: u64,
@@ -150,7 +150,7 @@ struct GlobalBytes {
 
 fn initializer_snapshot(
     metadata: &reader::Metadata,
-    verified: &protection::VerifiedPackage,
+    verified: &protection::VerifiedCore,
 ) -> (Vec<InitializerBytes>, Vec<GlobalBytes>) {
     let mut initializers = Vec::new();
     let mut globals = Vec::new();
@@ -204,7 +204,7 @@ fn initializer_snapshot(
 }
 
 #[test]
-#[ignore = "requires FLARE_ACTUAL_W4A16_FIXTURE with signed TP1/TP2 actual W4A16 packages"]
+#[ignore = "requires FLARE_ACTUAL_W4A16_FIXTURE with signed TP1/TP2 actual W4A16 cores"]
 fn actual_w4a16_combine_preserves_all_initializers_and_globals() {
     let root = fixture_root().expect("FLARE_ACTUAL_W4A16_FIXTURE must point at the fixture");
     let profiles = load_profiles(&root.join("publisher.json"));
@@ -587,8 +587,8 @@ fn actual_w4a16_combine_preserves_all_initializers_and_globals() {
     );
 
     let store = cache::Root::open(scratch.join("cache")).unwrap();
-    let package = cache::PackageSource::open(&unpacked, &profiles, combined_selection).unwrap();
-    let entry = store.install_package(package, "actual-w4a16", "entry").unwrap();
+    let core = cache::CoreSource::open(&unpacked, &profiles, combined_selection).unwrap();
+    let entry = store.install_core(core, "actual-w4a16", "entry").unwrap();
     let installed_metadata = reader::Metadata::open(entry.directory()).unwrap();
     let installed_selection = tp_selection(&installed_metadata, &profiles, 2);
     let installed_verified =
@@ -598,12 +598,12 @@ fn actual_w4a16_combine_preserves_all_initializers_and_globals() {
     assert_eq!(
         installed_initializers.len(),
         expected_initializers.len(),
-        "combined package initializer count differs"
+        "combined core initializer count differs"
     );
     assert_eq!(
         installed_globals.len(),
         expected_globals.len(),
-        "combined package module-global count differs"
+        "combined core module-global count differs"
     );
 
     for expected in expected_initializers {

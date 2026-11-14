@@ -16,6 +16,7 @@ from ignition.recipes.kimi3 import weights
 @dataclass
 class Converted:
     shape: tuple
+    retain_scale_rows: bool = True
 
 
 @dataclass
@@ -54,7 +55,7 @@ class MetadataLoader(weights.KimiWeightLoader):
     def __exit__(self, *exc):
         return False
 
-    def linear(self, prefix, *, rows=None, columns=None):
+    def linear(self, prefix, *, rows=None, columns=None, temporary=False):
         name = prefix.rsplit(".", 1)[-1]
         output, source = {
             "embed_tokens": (256, 64),
@@ -73,7 +74,7 @@ class MetadataLoader(weights.KimiWeightLoader):
             source = columns[1] - columns[0]
         return torch.empty((output, source), device="meta", dtype=torch.bfloat16)
 
-    def load_tensor(self, name, *, extent=None):
+    def load_tensor(self, name, *, extent=None, temporary=False):
         if "conv1d.weight" in name:
             shape, dtype = (2048, 1, 4), torch.bfloat16
         elif name.endswith("A_log"):
@@ -87,7 +88,7 @@ class MetadataLoader(weights.KimiWeightLoader):
         value = torch.empty(shape, device="meta", dtype=dtype)
         return value if extent is None else value[extent]
 
-    def load_tensors(self, names):
+    def load_tensors(self, names, *, temporary=False):
         return tuple(torch.empty(64, device="meta", dtype=torch.bfloat16) for _ in names)
 
     def load_fp4_experts(self, *args, **kwargs):
@@ -110,7 +111,8 @@ def metadata_config(monkeypatch):
     )
     monkeypatch.setattr(weights.ModelConfig, "load", lambda snapshot: config)
     monkeypatch.setattr(weights, "quantize_bf16_linear_as_mxfp8",
-                        lambda tensor: Converted(tuple(tensor.shape)))
+                        lambda tensor, *, retain_scale_rows=True:
+                        Converted(tuple(tensor.shape), retain_scale_rows))
     return config
 
 
@@ -130,6 +132,7 @@ def test_scope_selects_actual_loader_projection_groups(metadata_config, scope, o
                     else {"latent_gate", "q_b", "output"}) if broad else (
                         {"input"} if online and kind == "kda" else set())
         assert converted == expected
+        assert all(not layer["attention"][name].retain_scale_rows for name in converted)
         assert all(isinstance(value, Converted) == broad for value in layer["shared"].values())
         assert all(isinstance(layer[name], Converted) == broad
                    for name in ("latent_down", "latent_down_rows", "latent_up"))
@@ -155,7 +158,7 @@ def test_loader_rejects_unknown_scope_before_checkpoint_access(scope):
     (None, True), ("all", True), ("kda-input", True), ("all", False),
 ])
 def test_model_loader_forwards_scope_without_changing_dspark_family(
-        monkeypatch, metadata_config, sparse, scope, online):
+        monkeypatch, metadata_config, sparse, scope, online, tmp_path):
     from ignition.recipes.kimi3 import dspark_weights
     from ignition.recipes.kimi31 import dspark_config, dspark_weights as sparse_draft_weights
 
@@ -183,9 +186,11 @@ def test_model_loader_forwards_scope_without_changing_dspark_family(
         return draft
 
     monkeypatch.setattr(draft_owner, "load", load_draft)
+    (tmp_path / "config.json").write_text('{"architectures": ["K3DSparkModel"]}' if sparse
+                                         else '{"architectures": ["DSparkDraftModel"]}')
     options = {} if scope is None else {"online_mxfp8_scope": scope}
     result = weights.ModelWeights.load(SimpleNamespace(snapshot="metadata"), torch.device("meta"),
-        shard=TensorParallelShard(0, 1), online_mxfp8=online, draft_checkpoint="draft",
+        shard=TensorParallelShard(0, 1), online_mxfp8=online, draft_checkpoint=tmp_path,
         vision=False, **options)
     assert loaders[0].online_mxfp8_scope == (scope or "all")
     assert loaders[0].online_mxfp8 == online
@@ -195,3 +200,60 @@ def test_model_loader_forwards_scope_without_changing_dspark_family(
     assert ("target_embedding" in calls[0]) == sparse
     if sparse:
         assert calls[0]["target_embedding"] is result.embedding
+
+
+@pytest.mark.parametrize("online,scope,body,expected", [
+    (True, "kda-input", "mxfp8", True),
+    (False, "kda-input", "mxfp8", True),
+    (True, "kda-input", None, False),
+    (True, "all", None, True),
+])
+def test_dflash_body_and_head_conversion_are_independent_of_target_scope(
+        monkeypatch, metadata_config, tmp_path, online, scope, body, expected):
+    from ignition.recipes.kimi31 import dflash_weights
+
+    metadata_config.layers = ()
+    loaders = []
+
+    def load_target(*args, **kwargs):
+        loader = MetadataLoader(*args, **kwargs)
+        loaders.append(loader)
+        return loader
+
+    draft_config = SimpleNamespace(family="dflash2")
+    calls = []
+    draft = object()
+    monkeypatch.setattr(weights, "KimiWeightLoader", load_target)
+    monkeypatch.setattr(weights.DSparkConfig, "load", lambda snapshot, config: draft_config)
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda device: 0)
+
+    def load_draft(snapshot, config, device, shard, **kwargs):
+        calls.append(kwargs)
+        assert config.draft is draft_config
+        return draft
+
+    monkeypatch.setattr(dflash_weights.DraftWeights, "load", load_draft)
+    (tmp_path / "config.json").write_text('{"architectures": ["DFlash2DraftModel"]}')
+    result = weights.ModelWeights.load(SimpleNamespace(snapshot="metadata"), torch.device("meta"),
+        shard=TensorParallelShard(0, 1), online_mxfp8=online, online_mxfp8_scope=scope,
+        draft_checkpoint=tmp_path, draft_body_quantization=body,
+        draft_head_quantization="nvfp4", vision=False)
+    assert loaders[0].online_mxfp8 == online
+    assert loaders[0].online_mxfp8_scope == scope
+    assert calls[0]["online_mxfp8"] is expected
+    assert calls[0]["draft_head_quantization"] == "nvfp4"
+    assert calls[0]["target_head"] is result.head
+    assert result.head.dtype == torch.bfloat16
+    assert result.draft is draft
+
+
+def test_dflash_body_conversion_rejects_dspark(monkeypatch, metadata_config, tmp_path):
+    metadata_config.layers = ()
+    metadata_config.dsa = None
+    monkeypatch.setattr(weights, "KimiWeightLoader", MetadataLoader)
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda device: 0)
+    (tmp_path / "config.json").write_text('{"architectures": ["DSparkDraftModel"]}')
+    with pytest.raises(ValueError, match="requires DFlash2 draft weights"):
+        weights.ModelWeights.load(SimpleNamespace(snapshot="metadata"), torch.device("meta"),
+            shard=TensorParallelShard(0, 1), online_mxfp8_scope="kda-input",
+            draft_checkpoint=tmp_path, draft_body_quantization="mxfp8", vision=False)

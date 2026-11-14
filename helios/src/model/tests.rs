@@ -195,7 +195,7 @@ fn admission_histogram_seed_and_partial_page_uploads_preserve_native_semantics()
 }
 
 #[test]
-#[cfg(any(feature = "runtime-package", feature = "frontend"))]
+#[cfg(any(feature = "runtime-core", feature = "frontend"))]
 fn large_prefill_uploads_preserve_token_position_and_image_indices_without_tail_padding() {
     let mut config = config();
     let image_contract: PreparedContract =
@@ -1103,10 +1103,16 @@ fn state_transfer_and_resume_upload_fixture() {
         scheduler_capabilities(&config),
     )
     .unwrap();
-    scheduler
-        .measured_graph_durations(&self::manifest(&config).graphs)
-        .unwrap();
-    let mut inputs = Inputs::new(&config, &manifest(&config)).unwrap();
+    let mut manifest = manifest(&config);
+    // Keep transfer copies within the default checkpoint work allowance.
+    for graph in &mut manifest.graphs {
+        if graph.kind == GraphKind::Snapshot {
+            graph.estimated_duration_ns = 1;
+        }
+    }
+    scheduler.prefill_graphs(&[config.limits.prefill_chunk_size]).unwrap();
+    scheduler.measured_graph_durations(&manifest.graphs).unwrap();
+    let mut inputs = Inputs::new(&config, &manifest).unwrap();
     for cycle in 0..2 {
         let prompt = vec![7; 64];
         let handle = scheduler
@@ -1153,7 +1159,11 @@ fn state_transfer_and_resume_upload_fixture() {
             ]
         } {
             let fence = Fence(cycle * 5 + offset);
-            let step = scheduler.plan().unwrap();
+            let step = scheduler.plan().unwrap_or_else(|| {
+                let request = scheduler.request(handle).unwrap();
+                panic!("missing {kind:?} in cycle {cycle}: phase {:?}, accounting {:?}",
+                    request.phase, request.checkpoint_accounting());
+            });
             assert_eq!(step.kind, kind);
             scheduler.commit(&step, fence).unwrap();
             crate::model::pack_inputs(&mut inputs, &config, &scheduler, &step, &admissions)
@@ -1198,9 +1208,9 @@ fn state_transfer_and_resume_upload_fixture() {
                 status,
                 ..Default::default()
             };
-            scheduler
-                .complete(fence, &records, Default::default())
-                .unwrap();
+            let mut timing = crate::execution::ExecutionTiming::default();
+            timing.gpu_ns[0] = Some(step.estimated_duration_ns());
+            scheduler.complete(fence, &records, timing).unwrap();
         }
         scheduler.finish(handle).unwrap();
     }
@@ -1541,7 +1551,7 @@ fn grammar_mask_cache_discards_unsubmitted_rows_after_pack_error() {
 }
 
 #[test]
-#[cfg(any(feature = "runtime-package", feature = "frontend"))]
+#[cfg(any(feature = "runtime-core", feature = "frontend"))]
 fn prefill_compacts_execution_feature_indices_and_preserves_admission_metadata() {
     let mut config = config();
     let image_contract: PreparedContract =

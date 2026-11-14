@@ -29,13 +29,13 @@ macro_rules! contract_enum {
                 }
             }
         }
-        #[cfg(any(feature = "frontend", feature = "runtime-package"))]
+        #[cfg(any(feature = "frontend", feature = "runtime-core"))]
         impl serde::Serialize for $name {
             fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
                 serializer.serialize_i32(*self as i32)
             }
         }
-        #[cfg(any(feature = "frontend", feature = "runtime-package"))]
+        #[cfg(any(feature = "frontend", feature = "runtime-core"))]
         impl<'de> serde::Deserialize<'de> for $name {
             fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
                 let value = <i32 as serde::Deserialize>::deserialize(deserializer)?;
@@ -90,11 +90,11 @@ impl TryFrom<GraphKind> for GraphOperation {
 
 #[derive(Clone, Debug)]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     derive(serde::Serialize, serde::Deserialize)
 )]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     serde(deny_unknown_fields)
 )]
 pub struct PreparedContract {
@@ -109,11 +109,11 @@ pub struct PreparedContract {
 
 #[derive(Clone, Debug)]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     derive(serde::Serialize, serde::Deserialize)
 )]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     serde(deny_unknown_fields)
 )]
 pub struct CacheContract {
@@ -124,11 +124,11 @@ pub struct CacheContract {
 
 #[derive(Clone, Debug)]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     derive(serde::Serialize, serde::Deserialize)
 )]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     serde(deny_unknown_fields)
 )]
 pub struct HistoryRegion {
@@ -140,11 +140,11 @@ pub struct HistoryRegion {
 
 #[derive(Clone, Debug)]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     derive(serde::Serialize, serde::Deserialize)
 )]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     serde(deny_unknown_fields)
 )]
 pub struct PageTableView {
@@ -154,11 +154,11 @@ pub struct PageTableView {
 
 #[derive(Clone, Debug)]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     derive(serde::Serialize, serde::Deserialize)
 )]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     serde(deny_unknown_fields)
 )]
 pub struct ValueBinding {
@@ -172,11 +172,11 @@ pub struct ValueBinding {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     derive(serde::Serialize, serde::Deserialize)
 )]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     serde(deny_unknown_fields)
 )]
 pub struct StateView {
@@ -188,11 +188,11 @@ pub struct StateView {
 
 #[derive(Clone, Debug)]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     derive(serde::Serialize, serde::Deserialize)
 )]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     serde(deny_unknown_fields)
 )]
 pub struct StateAccess {
@@ -202,11 +202,11 @@ pub struct StateAccess {
 
 #[derive(Clone, Debug)]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     derive(serde::Serialize, serde::Deserialize)
 )]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     serde(deny_unknown_fields)
 )]
 pub struct CompletionCursor {
@@ -216,11 +216,11 @@ pub struct CompletionCursor {
 
 #[derive(Clone, Debug)]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     derive(serde::Serialize, serde::Deserialize)
 )]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     serde(deny_unknown_fields)
 )]
 pub struct GraphContract {
@@ -237,11 +237,11 @@ pub struct GraphContract {
 
 #[derive(Clone, Debug)]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     derive(serde::Serialize, serde::Deserialize)
 )]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     serde(deny_unknown_fields)
 )]
 pub struct ToolParser {
@@ -252,11 +252,11 @@ pub struct ToolParser {
 
 #[derive(Clone, Debug)]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     derive(serde::Serialize, serde::Deserialize)
 )]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     serde(deny_unknown_fields)
 )]
 pub struct ReasoningParser {
@@ -269,11 +269,11 @@ pub struct ReasoningParser {
 
 #[derive(Clone, Debug)]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     derive(serde::Serialize, serde::Deserialize)
 )]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     serde(deny_unknown_fields)
 )]
 pub struct PrefixBoundary {
@@ -288,11 +288,11 @@ pub struct PrefixBoundary {
 
 #[derive(Clone, Debug)]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     derive(serde::Serialize, serde::Deserialize)
 )]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     serde(deny_unknown_fields)
 )]
 pub struct FrontendContract {
@@ -310,11 +310,11 @@ pub struct FrontendContract {
 
 #[derive(Clone, Debug)]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     derive(serde::Serialize, serde::Deserialize)
 )]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     serde(deny_unknown_fields)
 )]
 pub struct ImageTokenLayout {
@@ -324,11 +324,11 @@ pub struct ImageTokenLayout {
 
 #[derive(Clone, Debug)]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     derive(serde::Serialize, serde::Deserialize)
 )]
 #[cfg_attr(
-    any(feature = "frontend", feature = "runtime-package"),
+    any(feature = "frontend", feature = "runtime-core"),
     serde(deny_unknown_fields)
 )]
 pub struct ImageSpan {
@@ -349,7 +349,7 @@ impl PreparedContract {
 
     pub fn validate(&self, manifest: &ExecutionManifest) -> Result<()> {
         if !(1..=3).contains(&self.version) {
-            return Err("unsupported prepared model contract version; re-export the model package".into());
+            return Err("unsupported prepared model contract version; re-export the model core".into());
         }
         if self.vocabulary == 0
             || self.input_vocabulary < self.vocabulary

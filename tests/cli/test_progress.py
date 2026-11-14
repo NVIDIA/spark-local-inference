@@ -138,7 +138,7 @@ def test_nonlive_export_only_prints_its_terminal_result(fail):
     progress = StartupProgress(stream=stream)
     progress.console = Console(file=stream, width=120, color_system=None)
     try:
-        with phase(progress, 'Export native package', live=False):
+        with phase(progress, 'Export native core', live=False):
             assert stream.getvalue() == ''
             if fail:
                 raise RuntimeError('publication failed')

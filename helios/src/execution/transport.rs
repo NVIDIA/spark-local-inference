@@ -14,6 +14,75 @@ use crate::{
 
 use super::{ExecutionManifest, GraphKind, DEFAULT_COMPLETION_TOKEN_CAPACITY, REQUEST_LANES, COMPLETION_METADATA_FIELDS, ReadinessIntervals};
 
+/// Frame-completion wake for threads that would otherwise poll a running frame in a
+/// `sched_yield` loop. On aarch64 cores with FEAT_WFxT (HWCAP2_WFXT, e.g. the Cortex-X925/A725
+/// cores of GB10), the copy stream writes each frame's fence to a mapped host word right after
+/// the frame's `transferred` event, and [`GraphExecutor::park`] waits in WFET with the exclusive
+/// monitor armed on that word. The event query in [`GraphExecutor::poll`] stays the only
+/// completion signal; the word can only end a park early, best effort (it relies on the GPU's
+/// write to the coherent mapped word clearing the monitor). `PARK_LIMIT_US` is the longest
+/// intentional wait per park; scheduling can add to it.
+struct CompletionWake {
+    word: PinnedHost,
+    device: usize,
+}
+
+#[cfg(target_arch = "aarch64")]
+mod host_wait {
+    use std::sync::OnceLock;
+
+    const HWCAP2_WFXT: libc::c_ulong = 1 << 31;
+
+    pub(super) fn available() -> bool {
+        static AVAILABLE: OnceLock<bool> = OnceLock::new();
+        // SAFETY: getauxval reads the process auxiliary vector and has no preconditions.
+        *AVAILABLE.get_or_init(|| unsafe { libc::getauxval(libc::AT_HWCAP2) } & HWCAP2_WFXT != 0)
+    }
+
+    pub(super) fn ticks() -> u64 {
+        let ticks: u64;
+        // SAFETY: CNTVCT_EL0 is readable at EL0 on Linux; the ISB orders the read after earlier loads.
+        unsafe { std::arch::asm!("isb", "mrs {t}, cntvct_el0", t = out(reg) ticks, options(nostack)) };
+        ticks
+    }
+
+    pub(super) fn frequency() -> u64 {
+        let hz: u64;
+        // SAFETY: CNTFRQ_EL0 is readable at EL0 on Linux.
+        unsafe { std::arch::asm!("mrs {f}, cntfrq_el0", f = out(reg) hz, options(nomem, nostack)) };
+        hz
+    }
+
+    /// Park until `word` may differ from `old` or CNTVCT reaches `deadline`, whichever is first.
+    /// Same sequence as Linux `__cmpwait_case_32`, with WFET bounded by an absolute deadline.
+    ///
+    /// # Safety
+    /// `word` must point to a live, 4-byte aligned u32 in coherent memory, and WFxT must be available.
+    pub(super) unsafe fn wait_change(word: *const u32, old: u32, deadline: u64) {
+        unsafe {
+            std::arch::asm!(
+                "sevl",
+                "wfe",
+                "ldxr {tmp:w}, [{word}]",
+                "eor {tmp:w}, {tmp:w}, {old:w}",
+                "cbnz {tmp:w}, 2f",
+                ".inst 0xd5031009", // wfet x9
+                "2:",
+                word = in(reg) word,
+                old = in(reg) old,
+                tmp = out(reg) _,
+                in("x9") deadline,
+                options(nostack),
+            );
+        }
+    }
+}
+
+/// Longest intentional wait per park. The GPU's wake-word write may end it early; anything that
+/// cannot touch the word (a peer's socket message, a new request, a deadline check) waits for the
+/// deadline, GB10's ~100-130 us WFE event stream, or a spurious wake, whichever comes first.
+const PARK_LIMIT_US: u64 = 100;
+
 pub struct Upload<'a> {
     pub buffer: &'a str,
     pub offset: usize,
@@ -377,6 +446,7 @@ struct Resources {
     frames: [Frame; 2],
     engram: Option<crate::engram::Transfers>,
     input_copies: InputCopyBatches,
+    wake: Option<CompletionWake>,
 }
 
 /// Thread-bound executor over one borrowed prepared model and its CUDA context.
@@ -466,6 +536,18 @@ impl GraphExecutor {
             })
         };
         let frames = [frame()?, frame()?];
+        #[cfg(target_arch = "aarch64")]
+        let wake = if host_wait::available() {
+            let word = copy.mapped_host_buffer(64)?;
+            let device = copy.mapped_address(&word)?;
+            static ANNOUNCED: std::sync::Once = std::sync::Once::new();
+            ANNOUNCED.call_once(|| eprintln!("[flare] frame completion wait: WFET"));
+            Some(CompletionWake { word, device })
+        } else {
+            None
+        };
+        #[cfg(not(target_arch = "aarch64"))]
+        let wake = None;
         let engram = manifest
             .engram
             .clone()
@@ -480,6 +562,7 @@ impl GraphExecutor {
                 frames,
                 engram,
                 input_copies: InputCopyBatches::new(upload_capacity.saturating_add(2)),
+                wake,
             }),
             resolved_uploads: Vec::with_capacity(upload_capacity),
             startup_next: 0,
@@ -598,6 +681,39 @@ impl GraphExecutor {
             && (!grammar_constrained
                 || resources.frames.iter().all(|frame| frame.pending.is_none()))
     }
+    /// Wait briefly for the oldest pending frame instead of yielding the CPU. Returns false,
+    /// without waiting, when no frame is pending, the wake word already reached the frame, or
+    /// this CPU has no WFxT; the caller then keeps its own polling step.
+    pub fn park(&self) -> bool {
+        #[cfg(target_arch = "aarch64")]
+        {
+            let Some(resources) = self.resources.as_ref() else { return false };
+            let Some(wake) = resources.wake.as_ref() else { return false };
+            let Some(target) = resources
+                .frames
+                .iter()
+                .filter_map(|frame| frame.pending.as_ref())
+                .map(|pending| pending.fence.0)
+                .min()
+            else {
+                return false;
+            };
+            let word = wake.word.address() as *const u32;
+            // SAFETY: The mapped word is live, aligned and written only by the copy stream.
+            let seen = unsafe { std::sync::atomic::AtomicU32::from_ptr(word as *mut u32) }
+                .load(std::sync::atomic::Ordering::Acquire);
+            if (seen.wrapping_sub(target as u32) as i32) >= 0 {
+                return false;
+            }
+            let deadline = host_wait::ticks() + host_wait::frequency() * PARK_LIMIT_US / 1_000_000;
+            // SAFETY: As above; `available` gated the creation of `wake`.
+            unsafe { host_wait::wait_change(word, seen, deadline) };
+            true
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        false
+    }
+
     pub fn outstanding(&self) -> usize {
         self.resources.as_ref().map_or(0, |resources| {
             resources
@@ -793,7 +909,12 @@ impl GraphExecutor {
                     }
                 }
             }
-            resources.copy.record(&frame.transferred)
+            resources.copy.record(&frame.transferred)?;
+            if let Some(wake) = &resources.wake {
+                // SAFETY: Resources retain the mapped word until close drains both streams.
+                unsafe { resources.copy.write_value(wake.device, fence.0 as u32) }?;
+            }
+            Ok(())
         };
         if let Err(error) = operation() {
             self.poison = Some(error.clone());
@@ -1503,10 +1624,10 @@ mod input_copy_tests {
     }
 }
 
-#[cfg(all(test, feature = "runtime-package"))]
+#[cfg(all(test, feature = "runtime-core"))]
 mod confidence_tests {
     use super::*;
-    use crate::runtime_package::driver::{CopyEndpoint, CopyParams, Driver};
+    use crate::runtime_core::driver::{CopyEndpoint, CopyParams, Driver};
 
     #[test]
     #[ignore = "requires a CUDA device selected through CUDA_VISIBLE_DEVICES"]

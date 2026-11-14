@@ -45,10 +45,16 @@ def test_actual_sigmoid_router_compiled_graph(tokens):
         projection = UnquantizedProjection(source, module.weight, logits, session=session, name="router")
         routing = PreparedRouter(logits, scratch, session=session, name="sigmoid", score_func="sigmoid",
                                   correction_bias=module.e_score_correction_bias, routed_scaling_factor=2.5)
+        projection.functional(session=session)
+        routing.functional(session=session)
         session.tune()
 
         def forward():
-            routing(projection(source))
+            values = projection(source)
+            selected = routing(values)
+            logits.copy_(values)
+            scratch.ids.copy_(selected.ids)
+            scratch.weights.copy_(selected.weights)
 
         compiled = compile_forward(forward)
         compiled()

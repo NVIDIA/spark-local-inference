@@ -5,7 +5,7 @@
 
 import numpy as np
 
-from ignition.preparation import runtime_package_pb2 as p
+from ignition.preparation import runtime_core_pb2 as p
 
 
 def pack(layout, step):

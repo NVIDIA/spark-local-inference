@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use helios_core::package::{cache, protection, reader, schema::wire as pwire};
+use helios_core::core::{cache, protection, reader, schema::wire as pwire};
 use pyo3::{exceptions::PyValueError, prelude::*};
 use serde::{Deserialize, Serialize};
 
@@ -18,10 +18,47 @@ use super::{
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct Source {
+    #[serde(with = "envelope_base64")]
     envelope: Vec<u8>,
-    publishers: Vec<helios_core::runtime_package::Publisher>,
+    publishers: Vec<helios_core::runtime_core::Publisher>,
     #[serde(default)]
     rebuild_manifest: Option<serde_json::Value>,
+}
+
+mod envelope_base64 {
+    use base64::{Engine, display::Base64Display, engine::general_purpose::STANDARD};
+    use serde::{Deserializer, Serializer, de};
+
+    pub(super) fn serialize<S>(envelope: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.collect_str(&Base64Display::new(envelope, &STANDARD))
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct EnvelopeVisitor;
+
+        impl de::Visitor<'_> for EnvelopeVisitor {
+            type Value = Vec<u8>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a base64-encoded signed weight envelope")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                STANDARD.decode(value).map_err(E::custom)
+            }
+        }
+
+        deserializer.deserialize_str(EnvelopeVisitor)
+    }
 }
 
 #[pyclass(module = "flare_heliopause")]
@@ -68,7 +105,7 @@ pub(crate) fn open_source(
         &publishers,
         protection::Selection::Catalog,
     )?;
-    if catalog.package().model_identity != model {
+    if catalog.core().model_identity != model {
         return Err(invalid("cached weight source belongs to a different model"));
     }
     let mut payloads = BTreeSet::new();
@@ -97,7 +134,7 @@ pub(crate) fn open_source(
                 if payloads.contains(&slice.payload_id) {
                     continue;
                 }
-                let id = helios_core::package::PayloadId::from_bytes(
+                let id = helios_core::core::PayloadId::from_bytes(
                     slice.payload_id.as_slice().try_into()?,
                 );
                 let object = root.payload(id)?.ok_or_else(|| {
@@ -117,7 +154,7 @@ pub(crate) fn open_source(
                     .slice
                     .as_ref()
                     .ok_or_else(|| invalid("cached Engram plane has no slice"))?;
-                let id = helios_core::package::PayloadId::from_bytes(
+                let id = helios_core::core::PayloadId::from_bytes(
                     slice.payload_id.as_slice().try_into()?,
                 );
                 let object = root.payload(id)?.ok_or_else(|| {
@@ -189,6 +226,15 @@ pub(crate) fn numeric_ranges(
     Ok(super::reachability::merge_ranges(ranges))
 }
 
+fn same_draft_body_quantization(
+    previous: &super::wire::RebuildManifest,
+    expected: &super::wire::RebuildManifest,
+) -> bool {
+    // An export without a draft only reuses target views, checked separately.
+    expected.speculation.is_none()
+        || previous.effective_draft_body_quantization() == expected.effective_draft_body_quantization()
+}
+
 impl Source {
     pub(crate) fn engram(
         &self,
@@ -243,7 +289,7 @@ impl Source {
         &self,
         request: &CaptureRequest,
         output: &RankOutput,
-    ) -> Result<protection::VerifiedPackage> {
+    ) -> Result<protection::VerifiedCore> {
         let expected: super::wire::RebuildManifest = super::binding::message(
             "RebuildManifest",
             self.rebuild_manifest
@@ -274,9 +320,10 @@ impl Source {
                 || previous.online_mxfp8 != expected.online_mxfp8
                 || (if previous.online_mxfp8_scope.is_empty() { "all" } else { &previous.online_mxfp8_scope })
                     != (if expected.online_mxfp8_scope.is_empty() { "all" } else { &expected.online_mxfp8_scope })
+                || !same_draft_body_quantization(previous, &expected)
             {
                 return Err(invalid(
-                    "--reuse-weights requires the same recipe, checkpoint revision, tensor-parallel size, and online MXFP8 conversion settings",
+                    "--reuse-weights requires the same recipe, checkpoint revision, tensor-parallel size, and draft conversion settings",
                 ));
             }
             return Ok(protection::verify(
@@ -399,7 +446,7 @@ fn rebind_engram(previous: &pwire::Engram, current: &super::wire::Engram) -> Res
 
 fn map_groups(
     previous: &pwire::RankBody,
-    payloads: &helios_core::package::schema::Catalog,
+    payloads: &helios_core::core::schema::Catalog,
     output: &RankOutput,
     catalog: &weight_payload::WeightPayloadCatalog,
     views: &WeightPayloadSources,
@@ -409,8 +456,8 @@ fn map_groups(
         .rebuild_weights
         .as_ref()
         .ok_or_else(|| invalid("--reuse-weights requires declared weight views"))?;
-    let current = super::package::convert_prepared(rebuild, bundle, Some(views))?;
-    let prior = helios_core::package::prepared_weights::catalog(previous)?.ok_or_else(|| {
+    let current = super::core::convert_prepared(rebuild, bundle, Some(views))?;
+    let prior = helios_core::core::prepared_weights::catalog(previous)?.ok_or_else(|| {
         invalid("cached rank has no prepared weight catalog; export with weights first")
     })?;
     let old_views: BTreeMap<_, _> = prior
@@ -543,4 +590,127 @@ pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(export_reuse_weights, module)?)?;
     module.add_class::<NativeWeightSource>()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Source, same_draft_body_quantization};
+    use helios_core::runtime_core::wire::{RebuildManifest, RebuildSpeculation};
+
+    #[test]
+    fn draft_body_quantization_must_match_for_weight_reuse() {
+        let manifest = |value: Option<&str>| RebuildManifest {
+            speculation: Some(RebuildSpeculation {
+                draft_body_quantization: value.map(str::to_string),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(same_draft_body_quantization(&manifest(None), &manifest(None)));
+        assert!(same_draft_body_quantization(
+            &manifest(Some("mxfp8")),
+            &manifest(Some("mxfp8"))
+        ));
+        for (previous, expected) in [(None, Some("mxfp8")), (Some("mxfp8"), None)] {
+            assert!(!same_draft_body_quantization(
+                &manifest(previous),
+                &manifest(expected)
+            ));
+        }
+    }
+
+    #[test]
+    fn weight_reuse_resolves_inherited_dflash_body_precision() {
+        for (online, scope, equivalent) in [
+            (true, "all", true),
+            (true, "", true),
+            (false, "all", false),
+            (false, "", false),
+            (true, "kda-input", false),
+        ] {
+            let implicit = RebuildManifest {
+                online_mxfp8: online,
+                online_mxfp8_scope: scope.into(),
+                speculation: Some(RebuildSpeculation {
+                    method: "dflash2".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let mut explicit = implicit.clone();
+            explicit
+                .speculation
+                .as_mut()
+                .unwrap()
+                .draft_body_quantization = Some("mxfp8".into());
+            assert_eq!(
+                same_draft_body_quantization(&implicit, &explicit),
+                equivalent
+            );
+            assert_eq!(
+                same_draft_body_quantization(&explicit, &implicit),
+                equivalent
+            );
+            // Disabling drafts reuses only target views, whose compatibility is
+            // validated independently of the unconsumed draft-body setting.
+            let mut target_only = implicit.clone();
+            target_only.speculation = None;
+            assert!(same_draft_body_quantization(&implicit, &target_only));
+            assert!(same_draft_body_quantization(&explicit, &target_only));
+            assert!(!same_draft_body_quantization(&target_only, &explicit));
+        }
+    }
+
+    #[test]
+    fn source_metadata_preserves_envelope_bytes() {
+        let bytes: Vec<u8> = (0..=255).collect();
+        for length in [0, 1, 2, 3, 255, 256] {
+            let source = Source {
+                envelope: bytes[..length].to_vec(),
+                publishers: Vec::new(),
+                rebuild_manifest: Some(serde_json::json!({"recipe":"fixture"})),
+            };
+            let json = serde_json::to_string(&source).unwrap();
+            let metadata: serde_json::Value = serde_json::from_str(&json).unwrap();
+            let encoded = metadata["envelope"].as_str().unwrap();
+            assert_eq!(encoded.len(), length.div_ceil(3) * 4);
+            let from_json: Source = serde_json::from_str(&json).unwrap();
+            let from_value: Source = serde_json::from_value(metadata).unwrap();
+            for restored in [from_json, from_value] {
+                assert_eq!(restored.envelope, source.envelope);
+                assert_eq!(restored.rebuild_manifest, source.rebuild_manifest);
+            }
+        }
+    }
+
+    #[test]
+    fn source_metadata_uses_standard_padded_base64() {
+        let source = Source {
+            envelope: vec![0xfb, 0xff],
+            publishers: Vec::new(),
+            rebuild_manifest: None,
+        };
+        let metadata = serde_json::to_value(&source).unwrap();
+        assert_eq!(metadata["envelope"], "+/8=");
+        let restored: Source = serde_json::from_value(metadata).unwrap();
+        assert_eq!(restored.envelope, source.envelope);
+    }
+
+    #[test]
+    fn source_metadata_rejects_invalid_envelope_encoding() {
+        for envelope in [
+            serde_json::json!("*"),
+            serde_json::json!("+/8"),
+            serde_json::json!("+/9="),
+            serde_json::json!("+/8=\n"),
+            serde_json::json!([251, 255]),
+            serde_json::Value::Null,
+        ] {
+            let metadata = serde_json::json!({"envelope":envelope,"publishers":[]});
+            assert!(
+                serde_json::from_value::<Source>(metadata.clone()).is_err(),
+                "{metadata}"
+            );
+        }
+    }
 }

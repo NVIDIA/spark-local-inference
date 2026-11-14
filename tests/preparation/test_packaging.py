@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""CPU preparation package and command-line smoke checks."""
+"""CPU preparation core and command-line smoke checks."""
 
 from __future__ import annotations
 
@@ -19,9 +19,9 @@ FLASHINFER_REQUIREMENT = re.compile(
 )
 
 
-def test_pyproject_declares_preparation_entrypoint_and_packages():
+def test_pyproject_declares_preparation_entrypoint_and_cores():
     pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text())
-    includes = set(pyproject["tool"]["setuptools"]["packages"]["find"]["include"])
+    includes = set(pyproject["tool"]["setuptools"]["cores"]["find"]["include"])
 
     assert pyproject["project"]["name"] == "ignition"
     assert "ignition*" in includes
@@ -69,7 +69,7 @@ def test_flashinfer_declaration_tracks_main_statically():
     ]
 
 
-def test_package_import_has_no_runtime_or_cuda_side_effects():
+def test_core_import_has_no_runtime_or_cuda_side_effects():
     result = subprocess.run(
         [sys.executable, "-c", "import sys, ignition; "
          "assert ignition.__all__ == ['__version__']; "

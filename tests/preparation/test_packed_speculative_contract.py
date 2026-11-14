@@ -6,7 +6,7 @@
 import pytest
 
 from ignition.preparation import contract as c
-from ignition.preparation import runtime_package_pb2 as p
+from ignition.preparation import runtime_core_pb2 as p
 from ignition.preparation.execution import GraphSignature
 from tests.preparation.test_execution import _execution, _tensor
 

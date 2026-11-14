@@ -233,11 +233,11 @@ def test_ordinary_fp4_experts_graph(tmp_path, monkeypatch, fmt, mode, compressio
     native_scales = []
     prepare_weights = fused_moe.prepare_weights
 
-    def inspect_scales(*, plan, weights, scale_scratch=None):
+    def inspect_scales(*, plan, weights, scale_scratch=None, allocate=None):
         if compression is not None:
             native_scales.extend(StorageWeakRef(t.untyped_storage())
                                  for t in (weights.w13_block_scales, weights.w2_block_scales))
-        return prepare_weights(plan=plan, weights=weights, scale_scratch=scale_scratch)
+        return prepare_weights(plan=plan, weights=weights, scale_scratch=scale_scratch, allocate=allocate)
 
     monkeypatch.setattr(fused_moe, "prepare_weights", inspect_scales)
     with DirectWeightLoader(manifest, "cuda:0") as loader:
@@ -323,7 +323,7 @@ def test_bf16_experts_convert_to_nvfp4_w4a16(tmp_path, monkeypatch, local, token
         torch.empty(shape, dtype=torch.float8_e4m3fn, device="cuda")
         for shape in ((count, 2 * padded, hidden // 16), (count, hidden, padded // 16)))
 
-    def inspect_quantized(*, plan, weights, scale_scratch=None):
+    def inspect_quantized(*, plan, weights, scale_scratch=None, allocate=None):
         assert plan.activation.mode is fused_moe.ActivationMode.A16
         assert plan.scale_compression == compression
         assert weights.input_scale is None and weights.intermediate_scale is None
@@ -342,7 +342,7 @@ def test_bf16_experts_convert_to_nvfp4_w4a16(tmp_path, monkeypatch, local, token
             values = lut[torch.stack((packed_weights & 15, packed_weights >> 4), -1).long()].flatten(-2)
             decoded[name] = values * scales.repeat_interleave(16, -1) * gains[:, None, None]
             assert not decoded[name][0].any()
-        return prepare_weights(plan=plan, weights=weights, scale_scratch=scale_scratch)
+        return prepare_weights(plan=plan, weights=weights, scale_scratch=scale_scratch, allocate=allocate)
 
     monkeypatch.setattr(fused_moe, "prepare_weights", inspect_quantized)
     with DirectWeightLoader(manifest, "cuda:0") as loader:

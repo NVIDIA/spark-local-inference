@@ -146,7 +146,7 @@ def test_proposal_precision_is_independent_plan_metadata(draft, markov, monkeypa
     assert (f"draft head {(draft or '').upper()}" in summary) == bool(draft)
     assert (f"markov head {(markov or '').upper()}" in summary) == bool(markov)
     from google.protobuf import json_format
-    from ignition.preparation import runtime_package_pb2 as proto
+    from ignition.preparation import runtime_core_pb2 as proto
 
     manifest = rebuild_manifest.from_plan(SimpleNamespace(directory=None), result, compiled_forwards=True)
     encoded = proto.RebuildManifest()
@@ -177,7 +177,7 @@ def test_mla_arithmetic_is_explicit_plan_metadata_without_changing_capacity():
 def test_joint_tuning_is_opt_in_and_serialized_without_changing_shapes(monkeypatch):
     from types import SimpleNamespace
     from google.protobuf import json_format
-    from ignition.preparation import rebuild_manifest, runtime_package_pb2 as proto
+    from ignition.preparation import rebuild_manifest, runtime_core_pb2 as proto
 
     monkeypatch.setattr("ignition.preparation.source_identity.source_identity", lambda: "test-source")
     ordinary = derive(model=replace(SOLO, name="deepseek41"))
@@ -271,7 +271,7 @@ def test_speculation_settings_are_validated_and_described():
     assert fixed.widths == (1, 2, 3) and fixed.fixed_width == 3
     assert Speculation(0).widths == (1,) and Speculation(0, adaptive=False).fixed_width == 1
     record = derive(speculation=Speculation(5)).to_dict()["speculation"]
-    assert record == {"draft_tokens": 5, "adaptive": True,
+    assert record == {"draft_tokens": 5, "adaptive": True, "mtp_only": False,
                       "packed_verification": False, "draft_prefix_selection": "cpu",
                       "draft_head_quantization": None, "markov_head_quantization": None,
                       "vocabulary_parallel_sampling": False}
@@ -308,7 +308,7 @@ def test_prefill_chunk_defaults_to_the_recipe_and_accepts_an_override():
 
 @pytest.mark.parametrize("model,world_size,packed", [
     pytest.param(ResolvedModel(recipe, checkpoint),
-                 8 if recipe.name == "mimo_v2" else recipe.tensor_parallel[0],
+                 recipe.checkpoint_tensor_parallel(checkpoint)[-1] if recipe.name == "mimo_v2" else recipe.tensor_parallel[0],
                  recipe.speculation.packed_verification, id=checkpoint.alias)
     for recipe in recipes() if recipe.speculation is not None for checkpoint in recipe.checkpoints
 ])
@@ -363,7 +363,7 @@ def test_kimi_online_mxfp8_recipe_default_reaches_cli_plan_and_metadata(tmp_path
     from google.protobuf import json_format
     from ignition.cli import _parser, preparation
     from ignition.cli.config import Configuration
-    from ignition.preparation import rebuild_manifest, runtime_package_pb2 as proto
+    from ignition.preparation import rebuild_manifest, runtime_core_pb2 as proto
     from ignition.recipes import resolve
 
     monkeypatch.setattr("ignition.preparation.source_identity.source_identity", lambda: "test-source")
@@ -425,14 +425,37 @@ def test_online_mxfp8_scope_must_be_declared_by_recipe():
 
 
 @pytest.mark.parametrize("command", ["export", "debug-serve", "bench"])
-def test_online_mxfp8_has_no_user_scope_option(command, capsys):
+def test_online_mxfp8_scope_option(command):
     from ignition.cli import _parser
 
-    with pytest.raises(SystemExit) as error:
-        _parser().parse_args([command, "kimi-k3.1-pro", "--online-mxfp8",
-                              "--online-mxfp8-scope", "all"])
-    assert error.value.code == 2
-    assert "unrecognized arguments: --online-mxfp8-scope all" in capsys.readouterr().err
+    default = _parser().parse_args([command, "kimi-k3.1-pro", "--online-mxfp8"])
+    args = _parser().parse_args([command, "kimi-k3.1-pro", "--online-mxfp8",
+                                 "--online-mxfp8-scope", "all"])
+    assert default.online_mxfp8_scope is None
+    assert args.online_mxfp8_scope == "all"
+
+
+@pytest.mark.parametrize("command", ["export", "debug-serve", "bench"])
+def test_draft_body_quantization_option(command):
+    from ignition.cli import _parser
+
+    default = _parser().parse_args([command, "kimi-k3.1-pro", "--speculative-method", "dflash2"])
+    args = _parser().parse_args([command, "kimi-k3.1-pro", "--speculative-method", "dflash2",
+                                 "--draft-body-quantization", "mxfp8"])
+    assert default.draft_body_quantization is None
+    assert args.draft_body_quantization == "mxfp8"
+
+
+def test_draft_body_quantization_requires_dflash2_and_positive_depth():
+    from ignition.recipes.kimi31.recipe import RECIPE
+
+    with pytest.raises(UsageError, match="requires --speculative-method dflash2"):
+        devices = tuple(replace(gpu(i, 95), total_bytes=256 * GIB, free_bytes=255 * GIB) for i in range(16))
+        planning.fit(RECIPE, RECIPE.checkpoints[0], devices, concurrency=1,
+                     reserve_bytes=0, speculation=replace(RECIPE.speculation,
+                                                          draft_body_quantization="mxfp8"))
+    with pytest.raises(ValueError, match="positive learned draft depth"):
+        Speculation(0, draft_body_quantization="mxfp8")
 
 
 @pytest.mark.parametrize("alias,default", [("kimi-k3", "all"), ("kimi-k3.1-pro", "kda-input")])
@@ -738,7 +761,7 @@ def test_recipe_b12x_settings_name_b12x_variables():
 def test_sharded_hyperconnections_require_qwen_tp_and_survive_rebuild_serialization(monkeypatch):
     from types import SimpleNamespace
     from google.protobuf import json_format
-    from ignition.preparation import rebuild_manifest, runtime_package_pb2 as proto
+    from ignition.preparation import rebuild_manifest, runtime_core_pb2 as proto
 
     monkeypatch.setattr("ignition.preparation.source_identity.source_identity", lambda: "test-source")
     ordinary = derive(model=replace(SOLO, name="qwen38"), gpus=(gpu(0, 95), gpu(1, 95)), selected=(0, 1))
@@ -816,7 +839,7 @@ def test_cli_derive_carries_resolved_collective_policy(tmp_path, configured, fla
 
 def test_collective_ladder_plan_and_rebuild_round_trip():
     from google.protobuf import json_format
-    from ignition.preparation import rebuild_manifest, runtime_package_pb2 as proto
+    from ignition.preparation import rebuild_manifest, runtime_core_pb2 as proto
     from ignition.preparation.collective_ladder import load
 
     ladder = load("ignition/preparation/ladders/gb202_pcie_tp4.json")
@@ -839,7 +862,7 @@ def test_collective_ladder_plan_and_rebuild_round_trip():
 def test_moe_decode_a16_geometry_and_rebuild_metadata(monkeypatch):
     from types import SimpleNamespace
     from google.protobuf import json_format
-    from ignition.preparation import rebuild_manifest, runtime_package_pb2 as proto
+    from ignition.preparation import rebuild_manifest, runtime_core_pb2 as proto
 
     monkeypatch.setattr("ignition.preparation.source_identity.source_identity", lambda: "test-source")
     ordinary = derive(model=replace(SOLO, name="qwen38"))

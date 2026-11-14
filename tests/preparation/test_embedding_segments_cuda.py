@@ -19,7 +19,7 @@ from ignition.components.ngram_delivery import publish_requests
 from ignition.components.parallel import TensorParallelShard
 from ignition.preparation.compilation import compile_forward
 from ignition.preparation.execution import GraphSignature, PreparedExecution
-from ignition.preparation.runtime_package import FileSource
+from ignition.preparation.runtime_core import FileSource
 from ignition.recipes.deepseek41.engram import Tables
 
 

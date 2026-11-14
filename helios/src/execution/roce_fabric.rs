@@ -5,7 +5,7 @@
 
 //! The RoCE fabric a rank's transport uses, found on its host when it serves.
 //!
-//! A package records what its kernels need of the transport (world, region layout, proxy ABI),
+//! A core records what its kernels need of the transport (world, region layout, proxy ABI),
 //! but not the fabric it was prepared on: which RDMA devices a host has, their GIDs, and how
 //! hosts are cabled differ between clusters and even between launches. Each rank discovers its
 //! active RoCEv2 devices, ranks exchange those endpoint lists at the rendezvous, and every rank
@@ -13,8 +13,39 @@
 //!
 //! Routing follows b12x's `_routes.py`. On a switched fabric rail `h` pairs device `h` at both
 //! ends. Hosts cabled point to point (three Sparks in a ring) reach a neighbour only through
-//! devices on a shared subnet, so rails then pair devices per peer by subnet, ordered by link
-//! address so both ends agree.
+//! devices on a shared subnet, so rails then pair devices per peer by subnet. A fabric can combine
+//! both: Sparks whose first port joins a switch and whose second port is cabled to one partner
+//! reach that partner over subnets only the two of them hold and every other peer over the
+//! switch's subnets. A subnet's breadth is the number of ranks holding an address on it: two for a
+//! direct cable, the whole world for a switch. Index pairing applies only when every subnet joining
+//! two or more ranks joins all of them; otherwise per-peer pairing prefers the narrowest subnets,
+//! so a cabled partner is reached over its cable. IPv4 link-local subnets (169.254.0.0/16) count as
+//! world-wide, because hosts using link-local addressing share that subnet whether or not their
+//! ports are cabled together. A link-local pair carries a rail only between LLDP neighbors, which
+//! per-peer pairing alone considers, so index pairing never applies to a rail device with a
+//! link-local address. Rails are ordered by breadth and then link address so both ends agree. Every rank plans over every
+//! rank's endpoints, including in ring and chain mode, so both ends of each link see the same
+//! breadths and choose the same devices.
+//!
+//! Each endpoint also records its PCIe link (PCI domain:bus:device): a Spark's ConnectX-7 exposes
+//! each port as two functions, one behind each of its two PCIe x4 links, and the functions behind
+//! one link share its bandwidth. Index pairing requires distinct links among every rank's rail
+//! devices, and per-peer pairing prefers rails on distinct links at both ends before it compares
+//! breadth, so two ranks that hold every subnet in common (a cabled pair that also shares a switch)
+//! still place one rail behind each link.
+//!
+//! Subnet breadth cannot identify a cable between two ranks that hold every subnet in common, such
+//! as a two-rank group on a cabled pair of Sparks that also share a switch. Each endpoint therefore
+//! also records its network device's MAC address and the MAC addresses that its LLDP neighbors
+//! advertise as their port IDs, read from `lldpctl` when lldpd runs on the host. LLDP frames do not
+//! cross a bridge, so two devices of different ranks that list each other are joined by a cable.
+//! Index pairing requires that no such pair exists, and per-peer pairing prefers links between LLDP
+//! neighbors after PCIe link separation and before breadth. One device listing the other suffices,
+//! so lldpd on one host of a cabled pair identifies its cable. Without LLDP data, a two-rank group
+//! on a cabled pair has no evidence of its cable: its rails take one device behind each PCIe link
+//! and then the lowest network and addresses, which is the switch only when the switch's subnets
+//! sort first. Routes and the `direct` marker describe the topology these records imply, not
+//! verified reachability.
 
 use std::net::Ipv4Addr;
 use std::path::Path;
@@ -33,11 +64,130 @@ fn failure(message: impl Into<String>) -> crate::Error {
     ExecutionError::Poisoned(Failure::new(message.into())).into()
 }
 
-/// One RDMA device: its name and, when its GID is IPv4-mapped, the address and prefix length.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// One RDMA device: its name, the address and prefix length when its GID is IPv4-mapped, the PCIe
+/// link it shares with sibling functions (PCI domain:bus:device) when known, its network device's
+/// MAC address when known, and the MAC addresses its LLDP neighbors advertise as port IDs (sorted,
+/// lowercase).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Endpoint {
     pub name: String,
     pub ipv4: Option<(Ipv4Addr, u8)>,
+    pub link: Option<String>,
+    pub mac: Option<String>,
+    pub neighbors: Vec<String>,
+}
+
+/// The PCI domain:bus:device of an RDMA function's `device` entry under `root/name`.
+fn pcie_link(root: &Path, name: &str) -> Option<String> {
+    let target = std::fs::read_link(root.join(name).join("device")).ok()?;
+    let address = target.file_name()?.to_str()?;
+    let (base, function) = address.rsplit_once('.')?;
+    (base.matches(':').count() == 2
+        && !function.is_empty()
+        && function.bytes().all(|b| b.is_ascii_digit()))
+    .then(|| base.to_owned())
+}
+
+/// `text` as a lowercase MAC address (six colon-separated pairs of hex digits), or None.
+fn mac_address(text: &str) -> Option<String> {
+    let text = text.trim();
+    let valid = text.len() == 17
+        && text.split(':').count() == 6
+        && text
+            .split(':')
+            .all(|pair| pair.len() == 2 && pair.bytes().all(|b| b.is_ascii_hexdigit()));
+    valid.then(|| text.to_ascii_lowercase())
+}
+
+/// Per network device in `netdevs`, the sorted MAC addresses that `lldpctl -f keyvalue` lists as
+/// neighbor port IDs (`lldp.<netdev>.port.mac=<mac>` lines).
+fn parse_lldp(text: &str, netdevs: &[String]) -> std::collections::BTreeMap<String, Vec<String>> {
+    let mut neighbors = std::collections::BTreeMap::<String, Vec<String>>::new();
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let Some(key) = key.strip_prefix("lldp.") else {
+            continue;
+        };
+        for netdev in netdevs {
+            if key.strip_prefix(netdev.as_str()) == Some(".port.mac") {
+                if let Some(mac) = mac_address(value) {
+                    neighbors.entry(netdev.clone()).or_default().push(mac);
+                }
+            }
+        }
+    }
+    for macs in neighbors.values_mut() {
+        macs.sort();
+        macs.dedup();
+    }
+    neighbors
+}
+
+/// The standard output of `command` when it exits successfully within `limit`; None when it
+/// cannot start, fails, or is still running at the deadline, which covers both its output and
+/// its exit. A command still running at the deadline is killed and reaped.
+#[cfg(target_os = "linux")]
+fn bounded_output(
+    mut command: std::process::Command,
+    limit: std::time::Duration,
+) -> Option<String> {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + limit;
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let Some(mut stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+    };
+    let (send, receive) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = std::io::Read::read_to_string(&mut stdout, &mut text);
+        let _ = send.send(text);
+    });
+    let text = receive
+        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        .ok();
+    let mut status = None;
+    if text.is_some() {
+        while Instant::now() < deadline {
+            match child.try_wait() {
+                Ok(Some(exit)) => {
+                    status = Some(exit);
+                    break;
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(5)),
+                Err(_) => break,
+            }
+        }
+    }
+    if status.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    text.filter(|_| status.is_some_and(|s| s.success()))
+}
+
+/// LLDP neighbors of `netdevs` from lldpd (see `parse_lldp`); empty when lldpctl is missing, fails,
+/// or has not answered and exited within two seconds.
+#[cfg(target_os = "linux")]
+fn lldp_neighbors(netdevs: &[String]) -> std::collections::BTreeMap<String, Vec<String>> {
+    if netdevs.is_empty() {
+        return Default::default();
+    }
+    let mut command = std::process::Command::new("lldpctl");
+    command.args(["-f", "keyvalue"]).args(netdevs);
+    bounded_output(command, std::time::Duration::from_secs(2))
+        .map(|text| parse_lldp(&text, netdevs))
+        .unwrap_or_default()
 }
 
 impl Endpoint {
@@ -61,7 +211,7 @@ pub struct Fabric {
     pub endpoints: Vec<Endpoint>,
 }
 
-/// How the ranks of a multi-host package link over RoCE.
+/// How the ranks of a multi-host core link over RoCE.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Shape {
     /// Every rank links to every other rank.
@@ -111,6 +261,32 @@ impl Shape {
     }
 }
 
+/// Which links may carry rails.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Links {
+    /// Every verified link. A peer reached over a direct cable (devices that are LLDP neighbors, or
+    /// a subnet held by fewer ranks than the world) is reached over it rather than over a subnet
+    /// every rank holds (a switch).
+    #[default]
+    All,
+    /// Only subnets every rank holds, between devices that are not LLDP neighbors, as if the fabric
+    /// were a switch alone: direct cables carry no rails. With two ranks every subnet joins both,
+    /// so only LLDP identifies a cable. A device without a known subnet outside link-local space
+    /// carries no rails, since nothing shows that its link joins every rank.
+    Shared,
+}
+
+impl Links {
+    /// The links a command-line flag selects.
+    pub fn from_switch_only(switch_only: bool) -> Self {
+        if switch_only {
+            Links::Shared
+        } else {
+            Links::All
+        }
+    }
+}
+
 /// The devices this rank opens and, per peer, the (local, remote) device indexes of each rail.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Topology {
@@ -119,7 +295,36 @@ pub struct Topology {
     pub traffic_class: u32,
     pub rails: usize,
     pub routes: Vec<Vec<(u32, u32)>>,
+    /// Per peer, whether every rail rides a direct cable as inferred from the endpoint records:
+    /// devices that are LLDP neighbors, or, with three or more ranks, a subnet held by fewer ranks
+    /// than the world. It does not verify that the cable carries traffic.
+    pub direct: Vec<bool>,
     pub shape: Shape,
+    pub links: Links,
+}
+
+impl Topology {
+    /// Each linked peer with the local devices carrying its rails, in rail order, marked `direct`
+    /// when every rail rides a direct cable, for example `rank 1 direct roceP2p1s0f1,rocep1s0f1`.
+    pub fn peer_routes(&self) -> Vec<String> {
+        self.routes
+            .iter()
+            .enumerate()
+            .filter(|(_, links)| !links.is_empty())
+            .map(|(peer, links)| {
+                let devices: Vec<&str> = links
+                    .iter()
+                    .map(|&(local, _)| self.hcas[local as usize].as_str())
+                    .collect();
+                let direct = if self.direct.get(peer) == Some(&true) {
+                    " direct"
+                } else {
+                    ""
+                };
+                format!("rank {peer}{direct} {}", devices.join(","))
+            })
+            .collect()
+    }
 }
 
 fn read(path: &Path) -> Option<String> {
@@ -143,8 +348,13 @@ fn mapped_ipv4(gid: &str) -> Option<Ipv4Addr> {
 /// Discover the RoCE devices under `root` (normally /sys/class/infiniband): every device whose
 /// port 1 is active and holds a RoCEv2 GID at the chosen index. The index is 3 when every active
 /// device has a RoCEv2 IPv4 GID there, otherwise the lowest index at which one does. `prefix`
-/// gives a network device's prefix length for an address it holds.
-pub fn discover_in(root: &Path, prefix: impl Fn(&str, Ipv4Addr) -> Option<u8>) -> Result<Fabric> {
+/// gives a network device's prefix length for an address it holds, and `lldp` the LLDP neighbor
+/// MAC addresses of each listed network device (see `parse_lldp`).
+pub fn discover_in(
+    root: &Path,
+    prefix: impl Fn(&str, Ipv4Addr) -> Option<u8>,
+    lldp: impl Fn(&[String]) -> std::collections::BTreeMap<String, Vec<String>>,
+) -> Result<Fabric> {
     let mut names: Vec<String> = std::fs::read_dir(root)
         .map_err(|error| {
             failure(format!(
@@ -183,22 +393,44 @@ pub fn discover_in(root: &Path, prefix: impl Fn(&str, Ipv4Addr) -> Option<u8>) -
             .find(|&index| names.iter().any(|name| roce_v2_ipv4(name, index)))
             .ok_or_else(|| failure("no active RDMA device has a RoCEv2 IPv4 GID"))?
     };
-    let endpoints: Vec<Endpoint> = names
+    let devices: Vec<(&String, Option<String>)> = names
         .iter()
         .filter(|name| roce_v2_ipv4(name, gid_index))
         .take(MAX_DEVICES)
         .map(|name| {
             let port = root.join(name).join("ports/1");
+            (
+                name,
+                read(&port.join(format!("gid_attrs/ndevs/{gid_index}"))),
+            )
+        })
+        .collect();
+    let netdevs: Vec<String> = devices.iter().filter_map(|(_, n)| n.clone()).collect();
+    let mut neighbors = lldp(&netdevs);
+    let endpoints: Vec<Endpoint> = devices
+        .into_iter()
+        .map(|(name, netdev)| {
+            let port = root.join(name).join("ports/1");
             let address = read(&port.join(format!("gids/{gid_index}")))
                 .as_deref()
                 .and_then(mapped_ipv4);
-            let device = read(&port.join(format!("gid_attrs/ndevs/{gid_index}")));
             let ipv4 = address
-                .zip(device)
-                .and_then(|(address, device)| prefix(&device, address).map(|p| (address, p)));
+                .zip(netdev.as_deref())
+                .and_then(|(address, netdev)| prefix(netdev, address).map(|p| (address, p)));
+            // The network device sits under the RDMA device's PCI function.
+            let mac = netdev.as_deref().and_then(|netdev| {
+                read(&root.join(name).join(format!("device/net/{netdev}/address")))
+                    .as_deref()
+                    .and_then(mac_address)
+            });
             Endpoint {
                 name: name.clone(),
                 ipv4,
+                link: pcie_link(root, name),
+                mac,
+                neighbors: netdev
+                    .and_then(|netdev| neighbors.remove(&netdev))
+                    .unwrap_or_default(),
             }
         })
         .collect();
@@ -249,29 +481,89 @@ fn interface_prefix(device: &str, address: Ipv4Addr) -> Option<u8> {
 /// Discover this host's RoCE devices.
 #[cfg(target_os = "linux")]
 pub fn discover() -> Result<Fabric> {
-    discover_in(Path::new("/sys/class/infiniband"), interface_prefix)
+    discover_in(
+        Path::new("/sys/class/infiniband"),
+        interface_prefix,
+        lldp_neighbors,
+    )
 }
 
-/// Encode endpoints for the rendezvous exchange: one `name address/prefix` line per device, or
-/// `name -` for a device without an IPv4 GID.
+/// Encode endpoints for the rendezvous exchange, one line per device: its name; `address/prefix`,
+/// or `-` without an IPv4 GID; its PCIe link (domain:bus:device); then its network device's MAC
+/// address and its comma-separated LLDP neighbor MAC addresses. Unknown fields are `-`, and
+/// unknown trailing fields after the PCIe link are omitted. Every line has at least three fields,
+/// so builds that read only a name and an address reject it instead of planning other rails.
 pub fn encode(endpoints: &[Endpoint]) -> Vec<u8> {
     endpoints
         .iter()
-        .map(|e| match e.ipv4 {
-            Some((address, prefix)) => format!("{} {address}/{prefix}\n", e.name),
-            None => format!("{} -\n", e.name),
+        .map(|e| {
+            let address = match e.ipv4 {
+                Some((address, prefix)) => format!("{address}/{prefix}"),
+                None => "-".to_owned(),
+            };
+            let mut fields = vec![
+                e.name.clone(),
+                address,
+                e.link.clone().unwrap_or_else(|| "-".into()),
+                e.mac.clone().unwrap_or_else(|| "-".into()),
+                if e.neighbors.is_empty() {
+                    "-".into()
+                } else {
+                    e.neighbors.join(",")
+                },
+            ];
+            while fields.len() > 3 && fields.last().is_some_and(|f| f == "-") {
+                fields.pop();
+            }
+            format!("{}\n", fields.join(" "))
         })
         .collect::<String>()
         .into_bytes()
 }
 
+/// Decode one rank's endpoints. A line with only a name and an address comes from a build that
+/// plans rails without PCIe links or LLDP neighbors, which would choose other rails than this one,
+/// so it is rejected.
 pub fn decode(bytes: &[u8]) -> Result<Vec<Endpoint>> {
     let text = std::str::from_utf8(bytes).map_err(|_| failure("RoCE endpoints are not text"))?;
     text.lines()
         .map(|line| {
-            let (name, address) = line
-                .split_once(' ')
-                .ok_or_else(|| failure("malformed RoCE endpoint"))?;
+            if line.split(' ').count() == 2 {
+                return Err(failure(
+                    "RoCE endpoint record has no PCIe link field: its rank runs a build that \
+                     plans rails from addresses alone, and every rank needs a build that records \
+                     PCIe links and LLDP neighbors",
+                ));
+            }
+            let mut fields = line.split(' ');
+            let (Some(name), Some(address), Some(link), mac, neighbors, None) = (
+                fields.next(),
+                fields.next(),
+                fields.next(),
+                fields.next().filter(|f| *f != "-"),
+                fields.next().filter(|f| *f != "-"),
+                fields.next(),
+            ) else {
+                return Err(failure("malformed RoCE endpoint"));
+            };
+            let link = Some(link).filter(|f| *f != "-");
+            if link.is_some_and(|link| link.matches(':').count() != 2) {
+                return Err(failure("malformed RoCE endpoint PCIe link"));
+            }
+            let mac = mac
+                .map(|mac| mac_address(mac).ok_or_else(|| failure("malformed RoCE endpoint MAC")))
+                .transpose()?;
+            let neighbors = neighbors
+                .map(|list| {
+                    list.split(',')
+                        .map(|mac| {
+                            mac_address(mac)
+                                .ok_or_else(|| failure("malformed RoCE endpoint LLDP neighbor"))
+                        })
+                        .collect::<Result<Vec<_>>>()
+                })
+                .transpose()?
+                .unwrap_or_default();
             let ipv4 = match address {
                 "-" => None,
                 _ => {
@@ -293,6 +585,9 @@ pub fn decode(bytes: &[u8]) -> Result<Vec<Endpoint>> {
             Ok(Endpoint {
                 name: name.to_owned(),
                 ipv4,
+                link: link.map(str::to_owned),
+                mac,
+                neighbors,
             })
         })
         .collect()
@@ -302,9 +597,100 @@ fn same_link(a: &Endpoint, b: &Endpoint) -> bool {
     matches!((a.network(), b.network()), (Some(x), Some(y)) if x == y)
 }
 
-/// True when rail `h` can pair device `h` with device `h` between every pair of ranks.
-fn index_pairing_valid(endpoints: &[Vec<Endpoint>], rails: usize) -> bool {
+/// Whether either device lists the other's MAC address among its LLDP neighbors: LLDP frames do
+/// not cross a bridge, so the two devices share a cable. Callers compare devices of different ranks.
+fn lldp_adjacent(a: &Endpoint, b: &Endpoint) -> bool {
+    let lists =
+        |x: &Endpoint, y: &Endpoint| y.mac.as_ref().is_some_and(|m| x.neighbors.contains(m));
+    lists(a, b) || lists(b, a)
+}
+
+/// Whether any device of one rank is an LLDP neighbor of a device of another rank.
+fn any_lldp_adjacency(endpoints: &[Vec<Endpoint>]) -> bool {
+    (0..endpoints.len()).any(|a| {
+        (a + 1..endpoints.len()).any(|b| {
+            endpoints[a]
+                .iter()
+                .any(|x| endpoints[b].iter().any(|y| lldp_adjacent(x, y)))
+        })
+    })
+}
+
+/// Whether `network` lies in IPv4 link-local space (169.254.0.0/16). Hosts using link-local
+/// addressing share that subnet whether or not their ports are linked.
+fn link_local((address, prefix): (u32, u8)) -> bool {
+    prefix >= 16 && address & 0xffff_0000 == 0xa9fe_0000
+}
+
+/// Per IPv4 network, the number of ranks holding an address on it. A link-local network counts
+/// as held by every rank, since sharing it does not imply a cable.
+fn breadths(endpoints: &[Vec<Endpoint>]) -> std::collections::BTreeMap<(u32, u8), usize> {
+    let world = endpoints.len();
+    let mut counts = std::collections::BTreeMap::new();
+    for devices in endpoints {
+        let networks: std::collections::BTreeSet<_> =
+            devices.iter().filter_map(Endpoint::network).collect();
+        for network in networks {
+            *counts.entry(network).or_insert(0) += 1;
+        }
+    }
+    for (network, count) in counts.iter_mut() {
+        if link_local(*network) {
+            *count = world;
+        }
+    }
+    counts
+}
+
+/// How many of `devices` share a known PCIe link with an earlier one.
+fn shared_links<'a>(devices: impl IntoIterator<Item = &'a Endpoint>) -> usize {
+    let known: Vec<&str> = devices
+        .into_iter()
+        .filter_map(|d| d.link.as_deref())
+        .collect();
+    let distinct: std::collections::BTreeSet<&str> = known.iter().copied().collect();
+    known.len() - distinct.len()
+}
+
+/// True when rail `h` can pair device `h` with device `h` between every pair of ranks, no rank's
+/// rail devices share a PCIe link, no devices of two ranks are LLDP neighbors (a cable that
+/// per-peer pairing prefers or, with `Links::Shared`, avoids), and, when `links` admits direct
+/// cables, no subnet links some ranks but not all of them (a direct cable that per-peer pairing
+/// prefers). No rail device may have a link-local address, which links only LLDP neighbors, and
+/// LLDP neighbors already rule index pairing out. With `Links::Shared`, every rail device must
+/// also have a known address, so that each rail verifiably rides a subnet every rank holds.
+fn index_pairing_valid(
+    endpoints: &[Vec<Endpoint>],
+    rails: usize,
+    breadths: &std::collections::BTreeMap<(u32, u8), usize>,
+    links: Links,
+) -> bool {
+    let world = endpoints.len();
+    if links == Links::All
+        && breadths
+            .values()
+            .any(|&breadth| 2 <= breadth && breadth < world)
+    {
+        return false;
+    }
+    if any_lldp_adjacency(endpoints) {
+        return false;
+    }
     if endpoints.iter().any(|devices| devices.len() < rails) {
+        return false;
+    }
+    if endpoints
+        .iter()
+        .any(|devices| shared_links(&devices[..rails]) != 0)
+    {
+        return false;
+    }
+    if endpoints.iter().any(|devices| {
+        devices[..rails].iter().any(|d| match d.network() {
+            Some(network) => link_local(network),
+            None => links == Links::Shared,
+        })
+    }) {
         return false;
     }
     for a in 0..endpoints.len() {
@@ -321,12 +707,21 @@ fn index_pairing_valid(endpoints: &[Vec<Endpoint>], rails: usize) -> bool {
     true
 }
 
-type Key = (u32, u64, u64, u64);
+/// (unverified, not LLDP neighbors, subnet breadth, network, lower address, higher address) of a
+/// candidate link.
+type Key = (u32, u32, u64, u64, u64, u64);
 
 /// The `rails` candidates with distinct local and remote devices that use the most verified
-/// links, ties broken by the smallest sorted keys; None when no such set exists.
-fn best_matching(candidates: &[(Key, u32, u32)], rails: usize) -> Option<Vec<(u32, u32)>> {
-    let mut best: Option<((u32, Vec<Key>), Vec<(u32, u32)>)> = None;
+/// links, then the fewest rails sharing a PCIe link at either end (`local` and `remote` name the
+/// devices), then the most links between LLDP neighbors, then the narrowest subnets (smallest
+/// total breadth), ties broken by the smallest sorted keys; None when no such set exists.
+fn best_matching(
+    candidates: &[(Key, u32, u32)],
+    rails: usize,
+    local: &[Endpoint],
+    remote: &[Endpoint],
+) -> Option<Vec<(u32, u32)>> {
+    let mut best: Option<((u32, usize, u32, u64, Vec<Key>), Vec<(u32, u32)>)> = None;
     let mut visit = |combo: &[usize]| {
         let chosen: Vec<_> = combo.iter().map(|&i| candidates[i]).collect();
         let locals: std::collections::BTreeSet<_> = chosen.iter().map(|c| c.1).collect();
@@ -334,8 +729,13 @@ fn best_matching(candidates: &[(Key, u32, u32)], rails: usize) -> Option<Vec<(u3
         if locals.len() < rails || remotes.len() < rails {
             return;
         }
+        let shared = shared_links(chosen.iter().filter_map(|c| local.get(c.1 as usize)))
+            + shared_links(chosen.iter().filter_map(|c| remote.get(c.2 as usize)));
         let score = (
             chosen.iter().map(|c| c.0.0).sum(),
+            shared,
+            chosen.iter().map(|c| c.0.1).sum(),
+            chosen.iter().map(|c| c.0.2).sum(),
             chosen.iter().map(|c| c.0).collect(),
         );
         if best.as_ref().is_none_or(|(current, _)| score < *current) {
@@ -361,112 +761,213 @@ fn best_matching(candidates: &[(Key, u32, u32)], rails: usize) -> Option<Vec<(u3
     best.map(|(_, links)| links)
 }
 
+/// Route planning over every rank's endpoints: subnet breadths and whether index pairing applies
+/// are properties of the whole fabric, so every rank and every peer see the same ones.
+struct Planner<'a> {
+    endpoints: &'a [Vec<Endpoint>],
+    breadths: std::collections::BTreeMap<(u32, u8), usize>,
+    rails: usize,
+    links: Links,
+    index_pairing: bool,
+}
+
+impl<'a> Planner<'a> {
+    fn new(endpoints: &'a [Vec<Endpoint>], rails: usize, links: Links) -> Result<Self> {
+        if !(1..=MAX_RAILS).contains(&rails) {
+            return Err(failure("invalid RoCE route request"));
+        }
+        let breadths = breadths(endpoints);
+        let index_pairing = index_pairing_valid(endpoints, rails, &breadths, links);
+        Ok(Self {
+            endpoints,
+            breadths,
+            rails,
+            links,
+            index_pairing,
+        })
+    }
+
+    /// The (local device, remote device) indexes carrying each rail from `rank` to `peer`.
+    fn peer(&self, rank: usize, peer: usize) -> Result<Vec<(u32, u32)>> {
+        let rails = self.rails;
+        if rank >= self.endpoints.len() || peer >= self.endpoints.len() {
+            return Err(failure("invalid RoCE route request"));
+        }
+        if peer == rank {
+            return Ok(Vec::new());
+        }
+        if self.index_pairing {
+            return Ok((0..rails as u32).map(|h| (h, h)).collect());
+        }
+        let (local, remote) = (&self.endpoints[rank], &self.endpoints[peer]);
+        let world = self.endpoints.len();
+        // Verified same-subnet links keyed by LLDP adjacency and subnet breadth (a cable precedes a
+        // switch), network and the link's two addresses. Keys are symmetric. A link-local pair is
+        // a link only when its devices are LLDP neighbors. Links::Shared admits only subnets every
+        // rank holds between devices that are not LLDP neighbors.
+        let mut candidates: Vec<(Key, u32, u32)> = Vec::new();
+        let mut unverified_link_local = false;
+        for (l, x) in local.iter().enumerate() {
+            for (r, y) in remote.iter().enumerate() {
+                if !same_link(x, y) {
+                    continue;
+                }
+                let network = x.network().unwrap();
+                let breadth = self.breadths[&network];
+                let adjacent = lldp_adjacent(x, y);
+                if link_local(network) && !adjacent {
+                    unverified_link_local = true;
+                    continue;
+                }
+                if self.links == Links::Shared && (breadth < world || adjacent) {
+                    continue;
+                }
+                let (a, b) = (
+                    u32::from(x.ipv4.unwrap().0) as u64,
+                    u32::from(y.ipv4.unwrap().0) as u64,
+                );
+                candidates.push((
+                    (
+                        0,
+                        u32::from(!adjacent),
+                        breadth as u64,
+                        network.0 as u64,
+                        a.min(b),
+                        a.max(b),
+                    ),
+                    l as u32,
+                    r as u32,
+                ));
+            }
+        }
+        // Same-index pairs without an IPv4 GID at either end are trusted in device order. Their
+        // subnet is unknown, so Links::Shared cannot admit them.
+        if self.links == Links::All {
+            for h in 0..local.len().min(remote.len()) {
+                if local[h].ipv4.is_none() || remote[h].ipv4.is_none() {
+                    candidates.push(((1, 1, 0, h as u64, 0, 0), h as u32, h as u32));
+                }
+            }
+        }
+        candidates.sort();
+        best_matching(&candidates, rails, local, remote).ok_or_else(|| {
+            let reach = (1..rails).rev().find(|&k| best_matching(&candidates, k, local, remote).is_some()).unwrap_or(0);
+            let hint = if unverified_link_local {
+                "; link-local addresses link only devices that are LLDP neighbors"
+            } else {
+                ""
+            };
+            failure(format!(
+                "rank {rank}: {reach} of {rails} RoCE rails have a link to rank {peer}{hint}; local {local:?}, remote {remote:?}"
+            ))
+        })
+    }
+}
+
 /// Per peer, the (local device, remote device) indexes carrying each rail; empty for `rank`.
 pub fn plan_routes(
     endpoints: &[Vec<Endpoint>],
     rank: usize,
     rails: usize,
+    links: Links,
 ) -> Result<Vec<Vec<(u32, u32)>>> {
-    if !(1..=MAX_RAILS).contains(&rails) || rank >= endpoints.len() {
+    if rank >= endpoints.len() {
         return Err(failure("invalid RoCE route request"));
     }
-    if index_pairing_valid(endpoints, rails) {
-        return Ok((0..endpoints.len())
-            .map(|peer| {
-                if peer == rank {
-                    Vec::new()
-                } else {
-                    (0..rails as u32).map(|h| (h, h)).collect()
-                }
-            })
-            .collect());
-    }
-    let local = &endpoints[rank];
-    let mut routes = Vec::with_capacity(endpoints.len());
-    for (peer, remote) in endpoints.iter().enumerate() {
-        if peer == rank {
-            routes.push(Vec::new());
-            continue;
-        }
-        // Verified same-subnet links keyed by network and the link's two addresses, and same-index
-        // pairs without an IPv4 GID at either end, trusted in device order. Keys are symmetric.
-        let mut candidates: Vec<(Key, u32, u32)> = Vec::new();
-        for (l, x) in local.iter().enumerate() {
-            for (r, y) in remote.iter().enumerate() {
-                if same_link(x, y) {
-                    let (a, b) = (
-                        u32::from(x.ipv4.unwrap().0) as u64,
-                        u32::from(y.ipv4.unwrap().0) as u64,
-                    );
-                    candidates.push((
-                        (0, x.network().unwrap().0 as u64, a.min(b), a.max(b)),
-                        l as u32,
-                        r as u32,
-                    ));
-                }
-            }
-        }
-        for h in 0..local.len().min(remote.len()) {
-            if local[h].ipv4.is_none() || remote[h].ipv4.is_none() {
-                candidates.push(((1, h as u64, 0, 0), h as u32, h as u32));
-            }
-        }
-        candidates.sort();
-        let chosen = best_matching(&candidates, rails).ok_or_else(|| {
-            let reach = (1..rails).rev().find(|&k| best_matching(&candidates, k).is_some()).unwrap_or(0);
-            failure(format!(
-                "rank {rank}: {reach} of {rails} RoCE rails have a link to rank {peer}; local {local:?}, remote {remote:?}"
-            ))
-        })?;
-        routes.push(chosen);
-    }
-    Ok(routes)
+    let planner = Planner::new(endpoints, rails, links)?;
+    (0..endpoints.len())
+        .map(|peer| planner.peer(rank, peer))
+        .collect()
+}
+
+/// The rails from `rank` to `peer` alone, planned over every rank's endpoints exactly as
+/// `plan_routes` plans them, so that a caller connecting one pair at a time (fabric TCP transfers)
+/// uses the links the RDMA transport uses.
+pub fn plan_link(
+    endpoints: &[Vec<Endpoint>],
+    rank: usize,
+    peer: usize,
+    rails: usize,
+    links: Links,
+) -> Result<Vec<(u32, u32)>> {
+    Planner::new(endpoints, rails, links)?.peer(rank, peer)
+}
+
+/// Per peer of `rank`, whether every rail rides a direct cable: its two devices are LLDP neighbors,
+/// or, with three or more ranks, its subnet is narrower than the world.
+fn direct_peers(endpoints: &[Vec<Endpoint>], rank: usize, routes: &[Vec<(u32, u32)>]) -> Vec<bool> {
+    let world = endpoints.len();
+    let breadths = breadths(endpoints);
+    routes
+        .iter()
+        .enumerate()
+        .map(|(peer, links)| {
+            !links.is_empty()
+                && links.iter().all(|&(local, remote)| {
+                    let x = &endpoints[rank][local as usize];
+                    lldp_adjacent(x, &endpoints[peer][remote as usize])
+                        || (world > 2
+                            && x.network()
+                                .is_some_and(|network| breadths[&network] < world))
+                })
+        })
+        .collect()
 }
 
 /// The routes of `shape` for `rank`: a mesh routes to every rank; a ring or chain routes only to
 /// the ranks `shape` links, and the native proxy forwards writes to the others. The same plan works
-/// over a switch while keeping unlinked QPs unconnected.
+/// over a switch while keeping unlinked QPs unconnected. Routes are planned over every rank's
+/// endpoints, so both ends of an edge see the same subnet breadths and index-pairing validity.
 pub fn plan_shape_routes(
     endpoints: &[Vec<Endpoint>],
     rank: usize,
     rails: usize,
     shape: Shape,
+    links: Links,
 ) -> Result<Vec<Vec<(u32, u32)>>> {
     if shape == Shape::Mesh {
-        return plan_routes(endpoints, rank, rails);
+        return plan_routes(endpoints, rank, rails, links);
     }
     if !(2..=16).contains(&endpoints.len()) || rank >= endpoints.len() {
         return Err(failure("experimental RoCE ring requires 2..16 ranks"));
     }
     let world = endpoints.len();
-    let peers: Vec<_> = (0..world).filter(|p| *p == rank || shape.linked(rank, *p, world)).collect();
-    let subset: Vec<_> = peers.iter().map(|p| endpoints[*p].clone()).collect();
-    let local = peers.iter().position(|p| *p == rank).unwrap();
-    let planned = plan_routes(&subset, local, rails)?;
-    Ok((0..world)
-        .map(|p| {
-            peers
-                .iter()
-                .position(|q| *q == p)
-                .map_or_else(Vec::new, |i| planned[i].clone())
+    let planner = Planner::new(endpoints, rails, links)?;
+    (0..world)
+        .map(|peer| {
+            if peer != rank && shape.linked(rank, peer, world) {
+                planner.peer(rank, peer)
+            } else {
+                Ok(Vec::new())
+            }
         })
-        .collect())
+        .collect()
 }
 
 impl Fabric {
-    /// The topology this rank opens for `shape`, from every rank's endpoints in rank order.
-    pub fn topology(&self, endpoints: &[Vec<Endpoint>], rank: usize, shape: Shape) -> Result<Topology> {
+    /// The topology this rank opens for `shape` over `links`, from every rank's endpoints in rank
+    /// order.
+    pub fn topology(
+        &self,
+        endpoints: &[Vec<Endpoint>],
+        rank: usize,
+        shape: Shape,
+        links: Links,
+    ) -> Result<Topology> {
         if endpoints.get(rank) != Some(&self.endpoints) || endpoints.iter().any(Vec::is_empty) {
             return Err(failure("every rank needs at least one RoCE device"));
         }
         let rails = endpoints.iter().map(Vec::len).min().unwrap().min(MAX_RAILS);
+        let routes = plan_shape_routes(endpoints, rank, rails, shape, links)?;
         Ok(Topology {
             hcas: self.endpoints.iter().map(|e| e.name.clone()).collect(),
             gid_index: self.gid_index,
             traffic_class: self.traffic_class,
             rails,
-            routes: plan_shape_routes(endpoints, rank, rails, shape)?,
+            direct: direct_peers(endpoints, rank, &routes),
+            routes,
             shape,
+            links,
         })
     }
 }
@@ -480,6 +981,7 @@ mod tests {
         Endpoint {
             name: name.into(),
             ipv4: Some((ip.parse().unwrap(), prefix.parse().unwrap())),
+            ..Default::default()
         }
     }
 
@@ -527,28 +1029,53 @@ mod tests {
             &[(1, "IB/RoCE v1", a), (3, "RoCE v2", a)],
         );
         device(&root, "roceP2p1s0f0", "4: ACTIVE", &[(3, "RoCE v2", b)]);
+        // sysfs links each RDMA device to its PCI function; the link drops the function number.
+        let function = root.join("pci/0002:01:00.0");
+        std::fs::create_dir_all(&function).unwrap();
+        std::os::unix::fs::symlink(&function, root.join("roceP2p1s0f0/device")).unwrap();
+        // The network device and its MAC address sit under the PCI function.
+        std::fs::create_dir_all(function.join("net/net-roceP2p1s0f0")).unwrap();
+        std::fs::write(
+            function.join("net/net-roceP2p1s0f0/address"),
+            "4C:BB:47:2C:1E:AA\n",
+        )
+        .unwrap();
         device(
             &root,
             "rocep1s0f1",
             "1: DOWN",
             &[(3, "RoCE v2", Ipv4Addr::new(10, 9, 9, 9))],
         );
-        let fabric = discover_in(&root, |device, _| {
-            (device != "net-rocep1s0f0").then_some(24)
-        })
+        let asked = std::cell::RefCell::new(Vec::new());
+        let fabric = discover_in(
+            &root,
+            |device, _| (device != "net-rocep1s0f0").then_some(24),
+            |netdevs| {
+                asked.borrow_mut().extend_from_slice(netdevs);
+                [(
+                    "net-roceP2p1s0f0".to_owned(),
+                    vec!["4c:bb:47:7f:c3:c6".to_owned()],
+                )]
+                .into()
+            },
+        )
         .unwrap();
+        assert_eq!(*asked.borrow(), ["net-roceP2p1s0f0", "net-rocep1s0f0"]);
         assert_eq!(fabric.gid_index, 3);
         assert_eq!(
             fabric.endpoints,
             vec![
                 Endpoint {
                     name: "roceP2p1s0f0".into(),
-                    ipv4: Some((b, 24))
+                    ipv4: Some((b, 24)),
+                    link: Some("0002:01:00".into()),
+                    mac: Some("4c:bb:47:2c:1e:aa".into()),
+                    neighbors: vec!["4c:bb:47:7f:c3:c6".into()],
                 },
                 // A device whose netmask cannot be read has no checkable address.
                 Endpoint {
                     name: "rocep1s0f0".into(),
-                    ipv4: None
+                    ..Default::default()
                 },
             ]
         );
@@ -565,25 +1092,88 @@ mod tests {
             "4: ACTIVE",
             &[(1, "RoCE v2", a), (3, "IB/RoCE v1", a)],
         );
-        let fabric = discover_in(&root, |_, _| Some(16)).unwrap();
+        let fabric = discover_in(&root, |_, _| Some(16), |_| Default::default()).unwrap();
         assert_eq!((fabric.gid_index, fabric.endpoints.len()), (1, 1));
         std::fs::remove_dir_all(&root).unwrap();
         std::fs::create_dir_all(&root).unwrap();
-        assert!(discover_in(&root, |_, _| Some(16)).is_err());
+        assert!(discover_in(&root, |_, _| Some(16), |_| Default::default()).is_err());
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn endpoints_survive_the_rendezvous_encoding() {
         let endpoints = vec![
-            endpoint("rocep1s0f0", "10.200.1.11/24"),
+            spark("rocep1s0f0", "10.200.1.11/24"),
+            endpoint("rocep1s0f1", "10.200.5.11/24"),
             Endpoint {
                 name: "x".into(),
-                ipv4: None,
+                link: Some("0002:01:00".into()),
+                ..Default::default()
+            },
+            Endpoint {
+                mac: Some("4c:bb:47:2c:1e:a7".into()),
+                neighbors: vec!["4c:bb:47:7f:c3:c3".into(), "4c:bb:47:7f:c3:c7".into()],
+                ..spark("rocep1s0f1", "10.200.5.14/24")
+            },
+            Endpoint {
+                name: "y".into(),
+                mac: Some("4c:bb:47:2c:1e:ab".into()),
+                ..Default::default()
             },
         ];
         assert_eq!(decode(&encode(&endpoints)).unwrap(), endpoints);
-        assert!(decode(b"rocep1s0f0 10.0.0.1/40\n").is_err());
+        assert_eq!(
+            String::from_utf8(encode(&endpoints[3..])).unwrap(),
+            "rocep1s0f1 10.200.5.14/24 0000:01:00 4c:bb:47:2c:1e:a7 \
+             4c:bb:47:7f:c3:c3,4c:bb:47:7f:c3:c7\ny - - 4c:bb:47:2c:1e:ab\n"
+        );
+        // Every line carries the PCIe link field, which builds reading two fields reject; this
+        // build rejects their two-field lines in turn.
+        assert_eq!(
+            encode(&[endpoint("rocep1s0f0", "10.200.1.11/24")]),
+            b"rocep1s0f0 10.200.1.11/24 -\n"
+        );
+        assert_eq!(
+            decode(b"rocep1s0f0 10.200.1.11/24 -\n").unwrap(),
+            vec![endpoint("rocep1s0f0", "10.200.1.11/24")]
+        );
+        let error = decode(b"rocep1s0f0 10.200.1.11/24\n")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("no PCIe link field"), "{error}");
+        assert!(decode(b"rocep1s0f0 10.0.0.1/40 -\n").is_err());
+        assert!(decode(b"rocep1s0f0 10.0.0.1/24 0000:01\n").is_err());
+        assert!(decode(b"rocep1s0f0 10.0.0.1/24 0000:01:00 extra\n").is_err());
+        assert!(decode(b"rocep1s0f0 10.0.0.1/24 - 4c:bb:47:2c:1e:a7 4c:bb\n").is_err());
+        assert!(
+            decode(b"rocep1s0f0 10.0.0.1/24 - 4c:bb:47:2c:1e:a7 4c:bb:47:2c:1e:a6 x\n").is_err()
+        );
+    }
+
+    #[test]
+    fn lldp_neighbors_are_the_port_mac_addresses_listed_per_network_device() {
+        let text = "lldp.enp1s0f1np1.via=LLDP\n\
+                    lldp.enp1s0f1np1.chassis.mac=4c:bb:47:7f:c3:c1\n\
+                    lldp.enp1s0f1np1.port.mac=4C:BB:47:7F:C3:C3\n\
+                    lldp.enp1s0f1np1.port.mac=4c:bb:47:2c:1e:ab\n\
+                    lldp.enp1s0f1np1.port.mac=4c:bb:47:7f:c3:c3\n\
+                    lldp.enp1s0f0np0.port.ifname=qsfp56-dd-1-1\n\
+                    lldp.enp1s0f1np1.100.port.mac=02:00:00:00:00:01\n\
+                    lldp.other.port.mac=02:00:00:00:00:02\n";
+        let netdevs = ["enp1s0f1np1".to_owned(), "enp1s0f0np0".to_owned()];
+        assert_eq!(
+            parse_lldp(text, &netdevs),
+            [(
+                "enp1s0f1np1".to_owned(),
+                vec![
+                    "4c:bb:47:2c:1e:ab".to_owned(),
+                    "4c:bb:47:7f:c3:c3".to_owned()
+                ]
+            )]
+            .into()
+        );
+        assert_eq!(mac_address("4c:bb:47:2c:1e"), None);
+        assert_eq!(mac_address("4c:bb:47:2c:1e:zz"), None);
     }
 
     #[test]
@@ -595,7 +1185,7 @@ mod tests {
             ]
         };
         let endpoints = vec![rank(12), rank(13), rank(11), rank(14)];
-        let routes = plan_routes(&endpoints, 1, 2).unwrap();
+        let routes = plan_routes(&endpoints, 1, 2, Links::All).unwrap();
         assert_eq!(
             routes,
             vec![
@@ -605,6 +1195,375 @@ mod tests {
                 vec![(0, 0), (1, 1)]
             ]
         );
+    }
+
+    /// Four Sparks whose first port joins a switch (10.200.0.0/24 and 10.200.1.0/24) and whose
+    /// second port is cabled to one partner: ranks 1 and 2 over 10.200.2.0/24 and 10.200.3.0/24,
+    /// ranks 0 and 3 over 10.200.4.0/24 and 10.200.5.0/24. Devices are in discovery (name) order.
+    /// A DGX Spark ConnectX-7 function: each PCIe x4 link carries one function of each port.
+    fn spark(name: &str, address: &str) -> Endpoint {
+        let link = if name.starts_with("roceP2") {
+            "0002:01:00"
+        } else {
+            "0000:01:00"
+        };
+        Endpoint {
+            link: Some(link.into()),
+            ..endpoint(name, address)
+        }
+    }
+
+    fn switch_with_partner_cables() -> Vec<Vec<Endpoint>> {
+        (0..4u32)
+            .map(|rank| {
+                let host = 11 + rank;
+                let direct = if rank == 1 || rank == 2 { 2 } else { 4 };
+                vec![
+                    spark("roceP2p1s0f0", &format!("10.200.0.{host}/24")),
+                    spark("roceP2p1s0f1", &format!("10.200.{direct}.{host}/24")),
+                    spark("rocep1s0f0", &format!("10.200.1.{host}/24")),
+                    spark("rocep1s0f1", &format!("10.200.{}.{host}/24", direct + 1)),
+                ]
+            })
+            .collect()
+    }
+
+    const PARTNER: [usize; 4] = [3, 2, 1, 0];
+    const SWITCH_DEVICES: [&str; 2] = ["roceP2p1s0f0", "rocep1s0f0"];
+    const DIRECT_DEVICES: [&str; 2] = ["roceP2p1s0f1", "rocep1s0f1"];
+
+    fn route_devices(
+        endpoints: &[Vec<Endpoint>],
+        rank: usize,
+        links: &[(u32, u32)],
+    ) -> Vec<String> {
+        let mut names: Vec<_> = links
+            .iter()
+            .map(|&(local, _)| endpoints[rank][local as usize].name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn sorted(names: [&str; 2]) -> Vec<String> {
+        let mut names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn a_partner_cable_carries_both_rails_to_the_partner_and_the_switch_the_rest() {
+        // Listing the switch functions first would make index pairing valid; the cable still wins.
+        for switch_first in [false, true] {
+            let mut endpoints = switch_with_partner_cables();
+            if switch_first {
+                for devices in &mut endpoints {
+                    devices.sort_by_key(|e| !SWITCH_DEVICES.contains(&e.name.as_str()));
+                }
+            }
+            let plans: Vec<_> = (0..4)
+                .map(|rank| plan_routes(&endpoints, rank, 2, Links::All).unwrap())
+                .collect();
+            for rank in 0..4 {
+                assert!(plans[rank][rank].is_empty());
+                for peer in (0..4).filter(|&p| p != rank) {
+                    let links = &plans[rank][peer];
+                    let expected = if peer == PARTNER[rank] {
+                        DIRECT_DEVICES
+                    } else {
+                        SWITCH_DEVICES
+                    };
+                    assert_eq!(route_devices(&endpoints, rank, links), sorted(expected));
+                    for &(l, r) in links {
+                        assert!(same_link(
+                            &endpoints[rank][l as usize],
+                            &endpoints[peer][r as usize]
+                        ));
+                    }
+                    let mirrored: Vec<_> = plans[peer][rank].iter().map(|&(l, r)| (r, l)).collect();
+                    assert_eq!(*links, mirrored, "ranks {rank} and {peer} disagree");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_partner_cable_down_at_one_end_moves_that_pair_to_the_switch() {
+        let mut endpoints = switch_with_partner_cables();
+        endpoints[2].retain(|e| SWITCH_DEVICES.contains(&e.name.as_str()));
+        let plans: Vec<_> = (0..4)
+            .map(|rank| plan_routes(&endpoints, rank, 2, Links::All).unwrap())
+            .collect();
+        let devices =
+            |rank: usize, peer: usize| route_devices(&endpoints, rank, &plans[rank][peer]);
+        assert_eq!(devices(1, 2), sorted(SWITCH_DEVICES));
+        let mirrored: Vec<_> = plans[2][1].iter().map(|&(l, r)| (r, l)).collect();
+        assert_eq!(plans[1][2], mirrored);
+        assert_eq!(devices(0, 3), sorted(DIRECT_DEVICES));
+        assert_eq!(devices(3, 0), sorted(DIRECT_DEVICES));
+    }
+
+    #[test]
+    fn link_local_addresses_on_two_uncabled_ports_do_not_attract_rails() {
+        // Ranks 1 and 3 share 169.254.0.0/16 on ports cabled to other hosts.
+        let switch = |host: u8| {
+            vec![
+                endpoint("roceP2p1s0f0", &format!("10.200.0.{host}/24")),
+                endpoint("rocep1s0f0", &format!("10.200.1.{host}/24")),
+            ]
+        };
+        let mut endpoints = vec![switch(14), switch(12), switch(13), switch(11)];
+        endpoints[1].push(endpoint("rocep1s0f1", "169.254.210.217/16"));
+        endpoints[3].push(endpoint("rocep1s0f1", "169.254.21.112/16"));
+        for rank in 0..4 {
+            let routes = plan_routes(&endpoints, rank, 2, Links::All).unwrap();
+            for (peer, links) in routes.iter().enumerate() {
+                let expected = if peer == rank {
+                    vec![]
+                } else {
+                    vec![(0, 0), (1, 1)]
+                };
+                assert_eq!(*links, expected, "rank {rank} to {peer}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_cabled_pair_keeps_its_two_rails_on_separate_pcie_links() {
+        // Two ranks cabled to each other and to a switch hold every subnet in common, and without
+        // LLDP neighbors nothing identifies the cable; index pairing in name order would put both
+        // rails behind one PCIe x4 link.
+        let all = switch_with_partner_cables();
+        let pair = vec![all[0].clone(), all[3].clone()];
+        for rank in 0..2 {
+            let links = &plan_routes(&pair, rank, 2, Links::All).unwrap()[1 - rank];
+            let pcie: std::collections::BTreeSet<_> = links
+                .iter()
+                .map(|&(l, _)| pair[rank][l as usize].link.clone())
+                .collect();
+            assert_eq!(pcie.len(), 2, "rank {rank}: {links:?}");
+            assert_eq!(route_devices(&pair, rank, links), sorted(SWITCH_DEVICES));
+        }
+        // Without PCIe link information the planner keeps device order.
+        let unknown: Vec<Vec<Endpoint>> = pair
+            .iter()
+            .map(|devices| {
+                devices
+                    .iter()
+                    .map(|e| Endpoint {
+                        link: None,
+                        ..e.clone()
+                    })
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            plan_routes(&unknown, 0, 2, Links::All).unwrap()[1],
+            vec![(0, 0), (1, 1)]
+        );
+    }
+
+    /// `endpoints` with the LLDP view of DGX Sparks whose cable joins rank `r` to `partner[r]`:
+    /// each function has its own MAC address and lists its sibling function on the same port; a
+    /// switch function also lists the switch, and a cable function both functions of the partner's
+    /// cable port.
+    fn with_lldp(endpoints: &[Vec<Endpoint>], partner: &[usize]) -> Vec<Vec<Endpoint>> {
+        let cable = |e: &Endpoint| DIRECT_DEVICES.contains(&e.name.as_str());
+        let mac = |rank: usize, device: usize| format!("02:00:00:00:{rank:02x}:{device:02x}");
+        let ports = |rank: usize, on_cable: bool| -> Vec<String> {
+            endpoints[rank]
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| cable(e) == on_cable)
+                .map(|(device, _)| mac(rank, device))
+                .collect()
+        };
+        (0..endpoints.len())
+            .map(|rank| {
+                endpoints[rank]
+                    .iter()
+                    .enumerate()
+                    .map(|(device, e)| {
+                        let mut neighbors = ports(rank, cable(e));
+                        neighbors.retain(|m| *m != mac(rank, device));
+                        if cable(e) {
+                            neighbors.extend(ports(partner[rank], true));
+                        } else {
+                            neighbors.push("02:00:00:00:ff:00".into());
+                        }
+                        neighbors.sort();
+                        Endpoint {
+                            mac: Some(mac(rank, device)),
+                            neighbors,
+                            ..e.clone()
+                        }
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn lldp_neighbors_route_a_two_rank_cabled_pair_over_its_cable() {
+        let all = with_lldp(&switch_with_partner_cables(), &PARTNER);
+        let pair = vec![all[0].clone(), all[3].clone()];
+        let plans: Vec<_> = (0..2)
+            .map(|rank| plan_routes(&pair, rank, 2, Links::All).unwrap())
+            .collect();
+        for rank in 0..2 {
+            let links = &plans[rank][1 - rank];
+            assert_eq!(route_devices(&pair, rank, links), sorted(DIRECT_DEVICES));
+            let pcie: std::collections::BTreeSet<_> = links
+                .iter()
+                .map(|&(l, _)| pair[rank][l as usize].link.clone())
+                .collect();
+            assert_eq!(pcie.len(), 2, "rank {rank}: {links:?}");
+            let mirrored: Vec<_> = plans[1 - rank][rank].iter().map(|&(l, r)| (r, l)).collect();
+            assert_eq!(*links, mirrored, "the pair disagrees");
+            assert_eq!(
+                plan_link(&pair, rank, 1 - rank, 2, Links::All).unwrap(),
+                *links
+            );
+            // Switch-only links leave the cable unused.
+            let switched = &plan_routes(&pair, rank, 2, Links::Shared).unwrap()[1 - rank];
+            assert_eq!(route_devices(&pair, rank, switched), sorted(SWITCH_DEVICES));
+        }
+        let fabric = Fabric {
+            gid_index: 3,
+            traffic_class: 0,
+            endpoints: pair[0].clone(),
+        };
+        let topology = fabric.topology(&pair, 0, Shape::Mesh, Links::All).unwrap();
+        assert_eq!(topology.direct, vec![false, true]);
+        assert_eq!(
+            topology.peer_routes(),
+            vec!["rank 1 direct roceP2p1s0f1,rocep1s0f1"]
+        );
+        let switched = fabric
+            .topology(&pair, 0, Shape::Mesh, Links::Shared)
+            .unwrap();
+        assert_eq!(
+            switched.peer_routes(),
+            vec!["rank 1 roceP2p1s0f0,rocep1s0f0"]
+        );
+        let decoded: Vec<_> = pair.iter().map(|d| decode(&encode(d)).unwrap()).collect();
+        assert_eq!(decoded, pair);
+    }
+
+    /// `2 * pairs` ranks on one switch; ranks 2i and 2i + 1 are also cabled to each other.
+    fn paired_switch(pairs: usize) -> Vec<Vec<Endpoint>> {
+        (0..2 * pairs)
+            .map(|rank| {
+                let (host, pair) = (11 + rank, rank / 2);
+                vec![
+                    spark("roceP2p1s0f0", &format!("10.200.0.{host}/24")),
+                    spark("roceP2p1s0f1", &format!("10.201.{}.{host}/24", 2 * pair)),
+                    spark("rocep1s0f0", &format!("10.200.1.{host}/24")),
+                    spark("rocep1s0f1", &format!("10.201.{}.{host}/24", 2 * pair + 1)),
+                ]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn lldp_neighbors_leave_routes_planned_by_breadth_unchanged() {
+        for (endpoints, partner) in [
+            (switch_with_partner_cables(), PARTNER.to_vec()),
+            (paired_switch(2), vec![1, 0, 3, 2]),
+        ] {
+            let lldp = with_lldp(&endpoints, &partner);
+            for links in [Links::All, Links::Shared] {
+                for rank in 0..endpoints.len() {
+                    let routes = plan_routes(&lldp, rank, 2, links).unwrap();
+                    assert_eq!(
+                        routes,
+                        plan_routes(&endpoints, rank, 2, links).unwrap(),
+                        "{links:?} rank {rank}"
+                    );
+                    assert_eq!(
+                        direct_peers(&lldp, rank, &routes),
+                        direct_peers(&endpoints, rank, &routes)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn switch_only_links_route_every_peer_over_the_switch_despite_partner_cables() {
+        let endpoints = switch_with_partner_cables();
+        let plans: Vec<_> = (0..4)
+            .map(|rank| plan_routes(&endpoints, rank, 2, Links::Shared).unwrap())
+            .collect();
+        for rank in 0..4 {
+            for peer in (0..4).filter(|&p| p != rank) {
+                let links = &plans[rank][peer];
+                assert_eq!(
+                    route_devices(&endpoints, rank, links),
+                    sorted(SWITCH_DEVICES)
+                );
+                let mirrored: Vec<_> = plans[peer][rank].iter().map(|&(l, r)| (r, l)).collect();
+                assert_eq!(*links, mirrored, "ranks {rank} and {peer} disagree");
+            }
+        }
+        // Hosts cabled only to each other have no subnet every rank holds.
+        let ring: Vec<Vec<Endpoint>> = (0..4u32)
+            .map(|rank| {
+                let previous = (rank + 3) % 4;
+                vec![
+                    endpoint("p0f0", &format!("10.{}.0.1/30", rank + 1)),
+                    endpoint("p1f0", &format!("10.{}.0.2/30", previous + 1)),
+                ]
+            })
+            .collect();
+        let error = plan_shape_routes(&ring, 0, 1, Shape::Ring, Links::Shared)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("0 of 1 RoCE rails"), "{error}");
+    }
+
+    #[test]
+    fn a_single_link_plan_matches_the_full_plan_for_every_pair() {
+        let mut down = switch_with_partner_cables();
+        down[2].retain(|e| SWITCH_DEVICES.contains(&e.name.as_str()));
+        for endpoints in [switch_with_partner_cables(), down] {
+            for links in [Links::All, Links::Shared] {
+                for rank in 0..4 {
+                    let full = plan_routes(&endpoints, rank, 2, links).unwrap();
+                    for peer in 0..4 {
+                        let link = plan_link(&endpoints, rank, peer, 2, links).unwrap();
+                        assert_eq!(link, full[peer], "{links:?} rank {rank} to {peer}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_topology_marks_and_lists_each_peer_route() {
+        let endpoints = switch_with_partner_cables();
+        let fabric = Fabric {
+            gid_index: 3,
+            traffic_class: 0,
+            endpoints: endpoints[1].clone(),
+        };
+        let topology = fabric
+            .topology(&endpoints, 1, Shape::Mesh, Links::All)
+            .unwrap();
+        assert_eq!(topology.direct, vec![false, false, true, false]);
+        assert_eq!(
+            topology.peer_routes(),
+            vec![
+                "rank 0 roceP2p1s0f0,rocep1s0f0",
+                "rank 2 direct roceP2p1s0f1,rocep1s0f1",
+                "rank 3 roceP2p1s0f0,rocep1s0f0",
+            ]
+        );
+        let switched = fabric
+            .topology(&endpoints, 1, Shape::Mesh, Links::Shared)
+            .unwrap();
+        assert_eq!(switched.direct, vec![false; 4]);
+        assert_eq!(switched.peer_routes()[1], "rank 2 roceP2p1s0f0,rocep1s0f0");
     }
 
     #[test]
@@ -625,7 +1584,7 @@ mod tests {
         };
         let endpoints: Vec<_> = (0..3).map(spark).collect();
         let plans: Vec<_> = (0..3)
-            .map(|rank| plan_routes(&endpoints, rank, 2).unwrap())
+            .map(|rank| plan_routes(&endpoints, rank, 2, Links::All).unwrap())
             .collect();
         for a in 0..3 {
             for b in 0..3 {
@@ -650,7 +1609,9 @@ mod tests {
             .iter()
             .map(|e| vec![e[0].clone(), e[2].clone()])
             .collect();
-        let error = plan_routes(&single, 0, 2).unwrap_err().to_string();
+        let error = plan_routes(&single, 0, 2, Links::All)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("1 of 2 RoCE rails"), "{error}");
     }
 
@@ -676,10 +1637,10 @@ mod tests {
                     })
                     .collect();
                 if !switched && world > 3 {
-                    assert!(plan_routes(&endpoints, 0, 2).is_err());
+                    assert!(plan_routes(&endpoints, 0, 2, Links::All).is_err());
                 }
                 let plans: Vec<_> = (0..world)
-                    .map(|r| plan_shape_routes(&endpoints, r, 2, Shape::Ring).unwrap())
+                    .map(|r| plan_shape_routes(&endpoints, r, 2, Shape::Ring, Links::All).unwrap())
                     .collect();
                 for rank in 0..world {
                     assert!(plans[rank][rank].is_empty());
@@ -705,10 +1666,10 @@ mod tests {
 
     #[test]
     fn ring_rejects_wrong_world_size_and_missing_neighbor_links() {
-        assert!(plan_shape_routes(&[], 0, 2, Shape::Ring).is_err());
+        assert!(plan_shape_routes(&[], 0, 2, Shape::Ring, Links::All).is_err());
         let endpoints = vec![vec![endpoint("f0", "10.0.0.1/30")]; 4];
-        assert!(plan_shape_routes(&endpoints, 4, 2, Shape::Ring).is_err());
-        assert!(plan_shape_routes(&endpoints, 0, 2, Shape::Ring).is_err());
+        assert!(plan_shape_routes(&endpoints, 4, 2, Shape::Ring, Links::All).is_err());
+        assert!(plan_shape_routes(&endpoints, 0, 2, Shape::Ring, Links::All).is_err());
     }
 
     #[test]
@@ -720,14 +1681,14 @@ mod tests {
             vec![endpoint("d", "10.0.1.2/30"), endpoint("e", "10.0.2.1/30")],
             vec![endpoint("f", "10.0.2.2/30")],
         ];
-        let routes = plan_shape_routes(&endpoints, 0, 1, Shape::Chain).unwrap();
+        let routes = plan_shape_routes(&endpoints, 0, 1, Shape::Chain, Links::All).unwrap();
         assert_eq!(routes, vec![vec![], vec![(0, 0)], vec![], vec![]]);
-        let routes = plan_shape_routes(&endpoints, 3, 1, Shape::Chain).unwrap();
+        let routes = plan_shape_routes(&endpoints, 3, 1, Shape::Chain, Links::All).unwrap();
         assert_eq!(routes, vec![vec![], vec![], vec![(0, 1)], vec![]]);
-        let routes = plan_shape_routes(&endpoints, 1, 1, Shape::Chain).unwrap();
+        let routes = plan_shape_routes(&endpoints, 1, 1, Shape::Chain, Links::All).unwrap();
         assert_eq!(routes, vec![vec![(0, 0)], vec![], vec![(1, 0)], vec![]]);
         // The same hosts as a ring need the missing 3-0 link.
-        assert!(plan_shape_routes(&endpoints, 0, 1, Shape::Ring).is_err());
+        assert!(plan_shape_routes(&endpoints, 0, 1, Shape::Ring, Links::All).is_err());
     }
 
     #[test]
@@ -739,7 +1700,12 @@ mod tests {
         };
         let peer = vec![endpoint("c", "10.0.0.2/24")];
         let topology = fabric
-            .topology(&[fabric.endpoints.clone(), peer], 0, Shape::Mesh)
+            .topology(
+                &[fabric.endpoints.clone(), peer],
+                0,
+                Shape::Mesh,
+                Links::All,
+            )
             .unwrap();
         assert_eq!(
             (
@@ -751,8 +1717,227 @@ mod tests {
         );
         assert!(
             fabric
-                .topology(&[fabric.endpoints.clone(), vec![]], 0, Shape::Mesh)
+                .topology(
+                    &[fabric.endpoints.clone(), vec![]],
+                    0,
+                    Shape::Mesh,
+                    Links::All
+                )
                 .is_err()
+        );
+    }
+
+    /// Asserts that `plans[a][b]` mirrors `plans[b][a]` for every pair of ranks.
+    fn assert_both_ends_agree(plans: &[Vec<Vec<(u32, u32)>>], label: &str) {
+        for a in 0..plans.len() {
+            for b in 0..plans.len() {
+                let mirrored: Vec<_> = plans[b][a].iter().map(|&(l, r)| (r, l)).collect();
+                assert_eq!(plans[a][b], mirrored, "{label}: ranks {a} and {b} disagree");
+            }
+        }
+    }
+
+    #[test]
+    fn ring_and_chain_ends_agree_when_subnets_differ_between_neighborhoods() {
+        // Rank 0 and rank 1 share two subnets. Rank 0's neighborhood (ranks 3, 0 and 1) and rank
+        // 1's (ranks 0, 1 and 2) hold them with different breadths, so planning each rank over its
+        // neighborhood alone chose a different subnet at each end of that edge.
+        let endpoints = vec![
+            vec![endpoint("a", "10.0.0.1/24"), endpoint("b", "10.0.1.1/24")],
+            vec![endpoint("a", "10.0.0.2/24"), endpoint("b", "10.0.1.2/24")],
+            vec![endpoint("a", "10.0.0.3/24"), endpoint("c", "10.0.2.3/24")],
+            vec![endpoint("b", "10.0.1.4/24"), endpoint("c", "10.0.2.4/24")],
+        ];
+        for shape in [Shape::Ring, Shape::Chain] {
+            let plans: Vec<_> = (0..4)
+                .map(|rank| plan_shape_routes(&endpoints, rank, 1, shape, Links::All).unwrap())
+                .collect();
+            assert_both_ends_agree(&plans, shape.name());
+            for (rank, plan) in plans.iter().enumerate() {
+                for (peer, links) in plan.iter().enumerate() {
+                    let linked = peer != rank && shape.linked(rank, peer, 4);
+                    assert_eq!(links.len(), usize::from(linked), "{rank} to {peer}");
+                    for &(l, r) in links {
+                        assert!(same_link(
+                            &endpoints[rank][l as usize],
+                            &endpoints[peer][r as usize]
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Four ranks on a switch (192.168.0.0/24 and 192.168.1.0/24, devices 0 and 1) whose device 2
+    /// holds a private cable subnet between ranks 0 and 2, which rules out index pairing, and
+    /// link-local addresses on unrelated ports of ranks 1 and 3.
+    fn switch_with_a_cable_and_link_local_ports() -> Vec<Vec<Endpoint>> {
+        let third = [
+            "10.9.0.1/24",
+            "169.254.7.1/16",
+            "10.9.0.3/24",
+            "169.254.9.4/16",
+        ];
+        (0..4)
+            .map(|rank| {
+                vec![
+                    endpoint("s0", &format!("192.168.0.{}/24", rank + 1)),
+                    endpoint("s1", &format!("192.168.1.{}/24", rank + 1)),
+                    endpoint("c", third[rank]),
+                ]
+            })
+            .collect()
+    }
+
+    #[test]
+    fn link_local_pairs_carry_rails_only_between_lldp_neighbors() {
+        let endpoints = switch_with_a_cable_and_link_local_ports();
+        let plans: Vec<_> = (0..4)
+            .map(|rank| plan_routes(&endpoints, rank, 2, Links::All).unwrap())
+            .collect();
+        assert_both_ends_agree(&plans, "unverified link-local");
+        assert_eq!(plans[1][3], vec![(0, 0), (1, 1)]);
+        assert_eq!(plans[0][2], vec![(2, 2), (0, 0)]);
+        // LLDP adjacency is positive evidence that the two link-local ports share a cable.
+        let mut adjacent = endpoints.clone();
+        adjacent[1][2].mac = Some("02:00:00:00:01:02".into());
+        adjacent[3][2].mac = Some("02:00:00:00:03:02".into());
+        adjacent[3][2].neighbors = vec!["02:00:00:00:01:02".into()];
+        let plans: Vec<_> = (0..4)
+            .map(|rank| plan_routes(&adjacent, rank, 2, Links::All).unwrap())
+            .collect();
+        assert_both_ends_agree(&plans, "LLDP-adjacent link-local");
+        assert_eq!(plans[1][3], vec![(2, 2), (0, 0)]);
+        // Switch-only routing never uses either link-local pair or the private cable.
+        for rank in 0..4 {
+            for fabric in [&endpoints, &adjacent] {
+                let routes = plan_routes(fabric, rank, 2, Links::Shared).unwrap();
+                for (peer, links) in routes.iter().enumerate() {
+                    let expected = if peer == rank {
+                        vec![]
+                    } else {
+                        vec![(0, 0), (1, 1)]
+                    };
+                    assert_eq!(*links, expected, "switch-only rank {rank} to {peer}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn index_pairing_admits_no_link_local_rail_device() {
+        // Device 0 holds a link-local address on an unconnected private port, and devices 1 and 2
+        // are on a switch. Every subnet joins every rank and no PCIe link is shared, so only the
+        // link-local device stands between this fabric and index pairing.
+        let rank = |r: u8| {
+            vec![
+                endpoint("p", &format!("169.254.1.{r}/16")),
+                endpoint("s0", &format!("192.168.0.{r}/24")),
+                endpoint("s1", &format!("192.168.1.{r}/24")),
+            ]
+        };
+        let endpoints: Vec<_> = (1..=4).map(rank).collect();
+        let plans: Vec<_> = (0..4)
+            .map(|rank| plan_routes(&endpoints, rank, 2, Links::All).unwrap())
+            .collect();
+        assert_both_ends_agree(&plans, "link-local device first");
+        for rank in 0..4 {
+            for peer in (0..4).filter(|&p| p != rank) {
+                assert_eq!(plans[rank][peer], vec![(1, 1), (2, 2)], "{rank} to {peer}");
+            }
+        }
+        // With the link-local device after the rail devices, index pairing still applies.
+        let last: Vec<Vec<Endpoint>> = endpoints
+            .iter()
+            .map(|d| vec![d[1].clone(), d[2].clone(), d[0].clone()])
+            .collect();
+        assert!(index_pairing_valid(&last, 2, &breadths(&last), Links::All));
+        assert_eq!(
+            plan_routes(&last, 0, 2, Links::All).unwrap()[2],
+            vec![(0, 0), (1, 1)]
+        );
+        // Ranks addressed only by link-local addresses have a link only between LLDP neighbors.
+        let only: Vec<Vec<Endpoint>> = (1..=2)
+            .map(|r| vec![endpoint("p", &format!("169.254.1.{r}/16"))])
+            .collect();
+        let error = plan_routes(&only, 0, 1, Links::All)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("link-local addresses link only devices that are LLDP neighbors"),
+            "{error}"
+        );
+        let mut cabled = only.clone();
+        cabled[0][0].mac = Some("02:00:00:00:00:01".into());
+        cabled[1][0].neighbors = vec!["02:00:00:00:00:01".into()];
+        assert_eq!(
+            plan_routes(&cabled, 0, 1, Links::All).unwrap()[1],
+            vec![(0, 0)]
+        );
+    }
+
+    #[test]
+    fn switch_only_routing_rejects_links_whose_subnet_is_unknown() {
+        // Discovery leaves an address unknown when it cannot resolve the interface prefix.
+        let unaddressed = |rank: u8| Endpoint {
+            name: "a".into(),
+            mac: Some(format!("02:00:00:00:{rank:02x}:00")),
+            ..Default::default()
+        };
+        let mut cabled = vec![vec![unaddressed(0)], vec![unaddressed(1)]];
+        cabled[1][0].neighbors = vec!["02:00:00:00:00:00".into()];
+        assert_eq!(
+            plan_routes(&cabled, 0, 1, Links::All).unwrap()[1],
+            vec![(0, 0)]
+        );
+        let error = plan_routes(&cabled, 0, 1, Links::Shared)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("0 of 1 RoCE rails"), "{error}");
+        // Without LLDP data the subnet is still unknown, so index pairing cannot admit it either.
+        let unknown = vec![vec![unaddressed(0)], vec![unaddressed(1)]];
+        assert!(plan_routes(&unknown, 0, 1, Links::Shared).is_err());
+        // A device with a known switch subnet still carries the rail.
+        let mixed: Vec<Vec<Endpoint>> = (0..2)
+            .map(|rank| {
+                vec![
+                    unaddressed(rank),
+                    endpoint("b", &format!("10.200.0.{}/24", rank + 11)),
+                ]
+            })
+            .collect();
+        assert_eq!(
+            plan_routes(&mixed, 0, 1, Links::Shared).unwrap()[1],
+            vec![(1, 1)]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_command_is_bounded_by_one_deadline_for_its_output_and_exit() {
+        let shell = |script: &str| {
+            let mut command = std::process::Command::new("sh");
+            command.args(["-c", script]);
+            command
+        };
+        let limit = std::time::Duration::from_millis(300);
+        assert_eq!(
+            bounded_output(shell("echo listed"), limit).as_deref(),
+            Some("listed\n")
+        );
+        assert_eq!(bounded_output(shell("echo listed; exit 1"), limit), None);
+        // Closing standard output and staying alive, or holding it open, both meet the deadline.
+        for script in ["echo listed; exec >&-; sleep 10", "sleep 10"] {
+            let started = std::time::Instant::now();
+            assert_eq!(bounded_output(shell(script), limit), None, "{script}");
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "{script}"
+            );
+        }
+        assert_eq!(
+            bounded_output(std::process::Command::new("/nonexistent/lldpctl"), limit),
+            None
         );
     }
 }

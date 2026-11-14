@@ -15,6 +15,7 @@ from ignition.planning import SUPPORTED_ARCHITECTURES, SUPPORTED_CAPABILITIES
 
 if TYPE_CHECKING:
     import torch
+    from .runtime_core import RecordedExportGraph
 
 
 def _named_copy(values: Mapping[str, Any], kind: str) -> MappingProxyType:
@@ -31,6 +32,8 @@ class PreparedGraphBundle:
     does not expose a graph's capture device, so capture on that device remains
     a preparation invariant. Registration checks its capability and context,
     every declared buffer's device and extent, and instantiated graph handles.
+    Export accepts live CUDA graphs or recorded metadata with retained external
+    pool owners. Native replay requires instantiated executables.
 
     Graphs must not use PyTorch generator-backed random operations: raw native
     launch bypasses PyTorch RNG bookkeeping. After handoff, callers must not
@@ -48,7 +51,7 @@ class PreparedGraphBundle:
         self,
         *,
         device: int,
-        graphs: Mapping[str, torch.cuda.CUDAGraph],
+        graphs: Mapping[str, torch.cuda.CUDAGraph | RecordedExportGraph],
         buffers: Mapping[str, torch.Tensor],
         resources: Iterable[Any] = (),
     ) -> None:
@@ -69,7 +72,7 @@ class PreparedGraphBundle:
         return self._device
 
     @property
-    def graphs(self) -> Mapping[str, torch.cuda.CUDAGraph]:
+    def graphs(self) -> Mapping[str, torch.cuda.CUDAGraph | RecordedExportGraph]:
         return self._graphs
 
     @property
@@ -119,9 +122,10 @@ class PreparedGraphBundle:
             self, context, self._device, handles, spans, queue_capacity=queue_capacity,
         )
 
-    def _validate_resources(self) -> tuple[int, list[int], list[tuple[int, int]]]:
+    def _validate_resources(self, *, export_graphs=False) -> tuple[int, list[int], list[tuple[int, int]]]:
         import torch
         import flare_heliopause
+        from .runtime_core import RecordedExportGraph
 
         with torch.cuda.device(self._device):
             capability = torch.cuda.get_device_capability(self._device)
@@ -129,7 +133,17 @@ class PreparedGraphBundle:
                 raise ValueError(f"CUDA device {self._device} is SM{capability[0]}{capability[1]};"
                                  f" {SUPPORTED_ARCHITECTURES} is required")
             handles = []
+            identities = []
             for name, graph in self._graphs.items():
+                if export_graphs and isinstance(graph, RecordedExportGraph):
+                    context, device = flare_heliopause.current_context()
+                    if graph.context != context or device != self._device:
+                        raise ValueError(f"graph {name!r} export metadata belongs to another CUDA context")
+                    if not graph.recorded:
+                        raise ValueError(f"graph {name!r} export metadata has been released")
+                    handles.append(graph.recorded)
+                    identities.append(("recorded", id(graph.recorder), graph.recorded))
+                    continue
                 if not isinstance(graph, torch.cuda.CUDAGraph):
                     raise TypeError(f"graph {name!r} must be a torch.cuda.CUDAGraph")
                 try:
@@ -139,7 +153,8 @@ class PreparedGraphBundle:
                 if not isinstance(handle, int) or handle <= 0:
                     raise ValueError(f"graph {name!r} has no instantiated executable handle")
                 handles.append(handle)
-            if len(set(handles)) != len(handles):
+                identities.append(("executable", handle))
+            if len(set(identities)) != len(identities):
                 raise ValueError("named graphs must have unique executable handles")
 
             spans = []

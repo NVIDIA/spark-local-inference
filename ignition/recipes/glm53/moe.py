@@ -73,15 +73,20 @@ class PreparedGlmMoe:
                 parallel_plans=(self.routing.plan, self.experts.plan),
                 session=session, workspace=workspace, defer_launch=source.shape[0] == 1)
 
-    def __call__(self, source):
-        if source is not self.source and (source.data_ptr() != self.source.data_ptr() or source.shape != self.source.shape):
-            raise ValueError("prepared GLM MoE requires its fixed source storage")
-        self.router_projection(source)
+    def functional(self, *, session):
+        self.router_projection.functional(session=session)
+        self.routing.functional(session=session)
+        self.shared.functional(session=session)
+        self.experts.functional(session=session)
         if self.concurrent_shared is not None:
-            self.concurrent_shared.start(source)
-        self.routing(self.scratch.router_logits)
-        routed = self.experts()
-        shared = (self.shared(source) if self.concurrent_shared is None
-                  else self.concurrent_shared.finish(source, routed))
-        torch.add(routed, shared, out=self.output)
-        return self.output
+            self.concurrent_shared.functional(session=session)
+        self.source = self.scratch = self.output = None
+        return self
+
+    def __call__(self, source):
+        logits = self.router_projection(source)
+        pending = None if self.concurrent_shared is None else self.concurrent_shared.start(source)
+        routes = self.routing(logits)
+        routed = self.experts(source, routes.ids, routes.weights)
+        shared = self.shared(source) if pending is None else self.concurrent_shared.finish(pending, routed)
+        return torch.add(routed, shared)

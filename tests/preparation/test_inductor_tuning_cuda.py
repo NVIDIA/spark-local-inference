@@ -95,7 +95,7 @@ def test_cooperative_vision_validation_freezes_and_restores(tmp_path, monkeypatc
     from torch._inductor.async_compile import CompiledTritonKernels
     from torch._inductor.codecache import PyCodeCache
     from torch._inductor.runtime.triton_heuristics import CachingAutotuner
-    from ignition.preparation.runtime_package import _Cuda
+    from ignition.preparation.runtime_core import _Cuda
 
     coordinator = None
     root = tmp_path
@@ -109,6 +109,7 @@ def test_cooperative_vision_validation_freezes_and_restores(tmp_path, monkeypatc
         root = Path(roots[0])
         coordinator = CollectivePreparation(dist.group.WORLD)
     device = torch.device('cuda', torch.cuda.current_device())
+    inventories = []
 
     class Probe(inductor_tuning.InductorSelections):
         def register(self, bound):
@@ -119,6 +120,19 @@ def test_cooperative_vision_validation_freezes_and_restores(tmp_path, monkeypatc
             assert cooperative, 'the vision validation must generate a cooperative reduction'
             assert all(not tuner.triton_meta.get('launch_pdl', False) for tuner in cooperative)
             super().register(bound)
+
+        def freeze(self, bound):
+            super().freeze(bound)
+            results = {}
+            for identity, _, tuner in self.forwards[id(bound)][2].values():
+                result = inductor_tuning._selected(tuner)
+                results[identity] = result._flare_config_state, result.kernel.cubin_raw
+            assert results, 'the vision validation must retain a nonempty kernel inventory'
+            if coordinator is not None:
+                peers = [None] * dist.get_world_size()
+                dist.all_gather_object(peers, results)
+                assert all(peer == results for peer in peers)
+            inventories.append(results)
 
     monkeypatch.setattr(inductor_tuning, 'InductorSelections', Probe)
     cache = ForwardCache(namespace={'model': 'cooperative-vision-validation'}, device=device,
@@ -131,19 +145,6 @@ def test_cooperative_vision_validation_freezes_and_restores(tmp_path, monkeypatc
             return cache.prepare(forward, name='vision1024', signature=signature)
         return cache.prepare_many({'vision1024': forward}, {'vision1024': signature},
             coordinator=coordinator, materialize=lambda: None)['vision1024']
-
-    def selected(bound):
-        selections = Probe(device)
-        selections.register(bound)
-        results = {}
-        for identity, instances in selections.instances.items():
-            result = inductor_tuning._selected(next(iter(instances.values())))
-            results[identity] = result._flare_config_state, result.kernel.cubin_raw
-        if coordinator is not None:
-            peers = [None] * dist.get_world_size()
-            dist.all_gather_object(peers, results)
-            assert all(peer == results for peer in peers)
-        return results
 
     def replay(bound, forward):
         graph = torch.cuda.CUDAGraph(keep_graph=True)
@@ -184,7 +185,8 @@ def test_cooperative_vision_validation_freezes_and_restores(tmp_path, monkeypatc
 
     forward = VisionPixelValidationForward()
     bound = prepare(forward)
-    winners = selected(bound)
+    winners, = inventories
+    inventories.clear()
     replay(bound, forward)
     CompiledTritonKernels.cache_clear()
     PyCodeCache.cache_clear()
@@ -197,7 +199,7 @@ def test_cooperative_vision_validation_freezes_and_restores(tmp_path, monkeypatc
     fresh = VisionPixelValidationForward()
     restored = prepare(fresh)
     assert restored.cache_hit
-    assert selected(restored) == winners
+    assert inventories == [winners]
     replay(restored, fresh)
 
 

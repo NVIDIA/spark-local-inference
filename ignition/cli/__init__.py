@@ -18,7 +18,7 @@ def _parser() -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(
         prog="ignition", allow_abbrev=False,
-        description="Prepare native runtime packages for NVIDIA SM103, SM120, and SM121 GPUs.",
+        description="Prepare native runtime cores for NVIDIA SM103, SM120, and SM121 GPUs.",
         formatter_class=argparse.RawDescriptionHelpFormatter, epilog=recipe_help())
     subparsers = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
 
@@ -34,7 +34,7 @@ def _parser() -> argparse.ArgumentParser:
                                help="configuration file (default: ~/.config/flare/config.toml)")
         return subparser
 
-    exporting = command("export", serve.export, "prepare a native model package in the shared cache")
+    exporting = command("export", serve.export, "prepare a native model core in the shared cache")
     weights = exporting.add_mutually_exclusive_group()
     weights.add_argument("--no-weights", action="store_true",
                            help="require cached stored-data blobs; export execution resources and metadata")
@@ -97,31 +97,31 @@ def _parser() -> argparse.ArgumentParser:
     keys.add_argument("--namespace", required=True, help="publisher Hugging Face namespace")
     password = command("key-password", publishing.key_password, "change a signing key's passphrase")
     password.add_argument("--signing-key", required=True, type=Path, help="Ed25519 PEM key to re-encrypt in place")
-    signing = command("sign", publishing.sign, "verify and sign a development package for production")
-    signing.add_argument("package", type=Path, help="signed development .safetensors package")
-    signing.add_argument("--output", required=True, type=Path, help="destination package; must not exist")
+    signing = command("sign", publishing.sign, "verify and sign a development core for production")
+    signing.add_argument("core", type=Path, help="signed development .safetensors core")
+    signing.add_argument("--output", required=True, type=Path, help="destination core; must not exist")
     signing.add_argument("--signing-key", type=Path, help="Ed25519 PEM key (default: publishing.signing_key)")
     signing.add_argument("--namespace", help="publisher namespace (default: publishing.namespace)")
     signing.add_argument("--official-source", help="published repository URL (default: publishing.official_source)")
     signing.add_argument("--development-publisher", type=Path, help="source public profile (default: beside config)")
-    editing = command("edit", publishing.edit, "edit package frontend metadata without rebuilding the model")
-    editing.add_argument("package", type=Path, help="signed payload package file or directory")
+    editing = command("edit", publishing.edit, "edit core frontend metadata without rebuilding the model")
+    editing.add_argument("core", type=Path, help="signed payload core file or directory")
     editing.add_argument("--output", required=True, type=Path, help="destination directory; must not exist")
     editing.add_argument("--served-model-name", help="replace the served alias for every deployment")
     editing.add_argument("--chat-template", type=Path, help="replacement UTF-8 Jinja template with message-boundary marks")
     editing.add_argument("--publisher-keys", type=Path, action="append", default=[],
                          help="public publisher profiles authenticating the source; repeatable")
     editing.add_argument("--development-publisher", type=Path, help="source development public profile (default: beside config)")
-    combining = command("combine", publishing.combine, "combine prepared TP packages into one signed package")
-    combining.add_argument("sources", nargs="+", type=Path, help="prepared payload-format packages")
-    combining.add_argument("--output", required=True, type=Path, help="destination package directory; must not exist")
+    combining = command("combine", publishing.combine, "combine prepared TP cores into one signed core")
+    combining.add_argument("sources", nargs="+", type=Path, help="prepared payload-format cores")
+    combining.add_argument("--output", required=True, type=Path, help="destination core directory; must not exist")
     combining.add_argument("--signing-key", type=Path, help="Ed25519 PEM key (default: publishing.signing_key)")
     combining.add_argument("--namespace", help="publisher namespace (default: publishing.namespace)")
     combining.add_argument("--official-source", help="published repository URL (default: publishing.official_source)")
     combining.add_argument("--publisher-keys", type=Path, action="append", default=[],
                            help="trusted public publisher profiles of the sources; repeatable")
-    converting = command("convert", publishing.convert, "convert a package to the selected canonical container form")
-    converting.add_argument("package", type=Path, help="existing signed package file or directory, including a cache entry")
+    converting = command("convert", publishing.convert, "convert a core to the selected canonical container form")
+    converting.add_argument("core", type=Path, help="existing signed core file or directory, including a cache entry")
     converting.add_argument("--output", type=Path, help="standalone destination (default: shared model cache entry)")
     converting.add_argument("--publisher-keys", type=Path, action="append", default=[],
                             help="trusted public publisher profiles; repeatable")
@@ -174,6 +174,9 @@ def _preparation_arguments(running, *, model_default="defaults.model"):
     speculative.add_argument("--no-mtp", action="store_true",
                           help="disable multi-token speculation: load no draft model and decode one token"
                                " per step; cannot accompany other speculation flags")
+    speculative.add_argument("--mtp-only", action="store_true",
+                          help="omit MTP-disabled execution graphs; package requires speculation at runtime."
+                               " Requires positive draft depth and cannot accompany --no-mtp")
     speculative.add_argument("--mtp-draft-tokens", type=int, metavar="N",
                           help="most draft tokens verified per round; limits and defaults depend on MODEL."
                                " 0 selects width-one rounds while retaining draft state; --no-mtp excludes it")
@@ -195,6 +198,9 @@ def _preparation_arguments(running, *, model_default="defaults.model"):
     advanced.add_argument("--native-dense-activations", action="store_true",
                           help="use quantized activations instead of auto precision for dense projections:"
                                " A8 for FP8 weights and A4 for FP4 weights; explicit recipe precision is retained")
+    advanced.add_argument("--draft-body-quantization", choices=("mxfp8",),
+                          help="prepare eligible DFlash2 draft-body projections as MXFP8 independently of"
+                               " target and proposal-head precision (Kimi K3.1; default: checkpoint precision)")
     advanced.add_argument("--draft-head-quantization", choices=("nvfp4", "mxfp8"),
                           help="prepare a separate quantized vocabulary head for learned draft proposals;"
                                " target verification retains its precision (NVFP4: DeepSeek V4/V4.1;"
@@ -235,6 +241,9 @@ def _preparation_arguments(running, *, model_default="defaults.model"):
     advanced.add_argument("--tuning-gpus", metavar="LIST",
                           help="local GPUs for kernel tuning, starting with --gpus and followed by complete"
                                " TP replicas; serving TP size is unchanged (default: serving GPUs)")
+    advanced.add_argument("--dcp-size", type=int, choices=(8, 16), metavar="N",
+                          help="decode context-parallel ranks per group; Kimi K3.1 TP16 supports 16 or 8"
+                               " (default: tensor-parallel size)")
     advanced.add_argument("--no-context-parallel", action="store_true",
                           help="keep each rank's attention context whole instead of sharding it across"
                                " tensor-parallel ranks; fewer cached tokens (default: the recipe's)")
@@ -250,6 +259,9 @@ def _preparation_arguments(running, *, model_default="defaults.model"):
                                " experts, MoE latent projections, and DSpark draft context, outputs and MLPs;"
                                " Qwen3.8 dense target attention/MLPs and DFlash2 context, attention and MLPs; Flash Next DFlash2 projections;"
                                " default: checkpoint precision)")
+    advanced.add_argument("--online-mxfp8-scope", metavar="SCOPE",
+                          help="select the recipe's online MXFP8 conversion group; Kimi K3.1 supports all"
+                               " (every eligible target and DFlash2 projection) or kda-input (default: recipe scope)")
     advanced.add_argument("--language-model-only", action="store_true",
                           help="prepare no vision encoder and reject images; its weights and scratch become KV"
                                " pages (recipes with a separable encoder; default: the recipe's image support)")

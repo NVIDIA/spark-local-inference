@@ -50,7 +50,7 @@ before committing; a design acknowledgment cannot authorize them.
 4. **Use FlashInfer/b12x and NVIDIA directly.** Target SM103/SM120/SM121, reuse proven
    operators and sampling, and avoid interchangeable backends or portability layers.
    Retain internal paths required to load and serve previously supported models.
-   Package version validation is required by principle 13.
+   Model core compatibility is required by principle 13.
 5. **Finish preparation before capture.** Constructors declare operations; one
    preparation batch tunes the complete shape catalog. Size scratch from tuned
    plans, refresh bindings, compile complete forwards, and warm every variant
@@ -96,21 +96,21 @@ before committing; a design acknowledgment cannot authorize them.
     lifecycle, and allocation stability. Preserve native frontend and request-local
     sampling semantics. Performance claims require equivalent baselines, complete
     GPU steps across all ranks, and actual Helios service measurements. Comparisons
-    against other runtimes must use exported packages with `flare run`;
+    against other runtimes must use exported cores with `flare run`;
     `ignition debug-serve` timings are diagnostic only. Correctness
     failures block performance claims; keep raw measurements and disclose unrun
     checks and material limitations.
-13. **Preserve model package compatibility.** Every engine version must load
+13. **Preserve model core compatibility.** Every engine version must load
     models supported by previous engine versions without re-export, re-signing,
     or graph changes. Execution ABI numbers are descriptive metadata, not loading
     gates. Validate actual operations, buffers, capacities, dependencies, signatures,
     and resources. Protobuf additions must preserve existing behavior through
     compatible defaults; an absent or zero completion token capacity means eight.
     Reserve removed wire identifiers and retain readers and tests needed by
-    existing packages. Validate previous packages through loading and serving.
+    existing cores. Validate previous cores through loading and serving.
 14. **Restrict Claude Opus 5.5 authorship of CUDA kernels and model optimizations.**
-    Claude Opus 5.5 has repeatedly produced defective low-level kernel changes
-    in this project. It must not design or implement low-level CUDA kernels
+    Claude Opus 5.5 is not reliable for low-level kernel changes in this
+    project. It must not design or implement low-level CUDA kernels
     (CUDA C++, PTX, CuTe DSL, or Triton) or changes to existing model fusion and
     GPU execution optimizations, including projection packing, fused arithmetic,
     stream overlap, and scratch aliasing in optimized model paths. Do not

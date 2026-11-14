@@ -1,10 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Muse Spark text acceptance against an exported package served by ``flare run``.
+"""Muse Spark text acceptance against an exported core served by ``flare run``.
 
 Set FLARE_RUN_CUDA_TESTS=1, FLARE_MUSE_TEST_URL, and FLARE_MUSE_SPARK_SNAPSHOT.
-Export with --prompt-logprobs. The package must prepare TP8 SM120, context
+Export with --prompt-logprobs. The core must prepare TP8 SM120, context
 262144, concurrency four, and a 4096-token prefill chunk. These tests never launch a diagnostic Python server.
 """
 
@@ -21,7 +21,7 @@ import pytest
 
 pytestmark = pytest.mark.skipif(
     os.environ.get('FLARE_RUN_CUDA_TESTS') != '1' or not os.environ.get('FLARE_MUSE_TEST_URL'),
-    reason='requires an exported Muse Spark package running through flare run',
+    reason='requires an exported Muse Spark core running through flare run',
 )
 
 EFFORTS = ('low', 'medium', 'high', 'xhigh')

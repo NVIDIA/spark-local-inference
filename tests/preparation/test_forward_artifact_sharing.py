@@ -99,6 +99,7 @@ class _Artifact:
         from torch._dynamo.guards import GuardManagerWrapper
 
         backend = StorageBackend.__new__(StorageBackend)
+        backend.artifact = SimpleNamespace(inner_fn=SimpleNamespace(compiled_fn=execute))
         backend._serialized_artifact = b"portable backend"
         backend._tuning_frozen = False
         guards = SimpleNamespace(check=lambda arguments: isinstance(arguments["forward"], _Forward),
@@ -118,7 +119,7 @@ class _Artifact:
 def _replace_gpu_preparation():
     from types import SimpleNamespace
     import torch
-    from ignition.preparation import inductor_tuning
+    from ignition.preparation import compile_pool, inductor_tuning
 
     class Selections(inductor_tuning.InductorSelections):
         def register(self, bound):
@@ -129,6 +130,8 @@ def _replace_gpu_preparation():
             self.forwards[id(bound)][0]._tuning_frozen = True
 
     inductor_tuning.InductorSelections = Selections
+    compile_pool.compiler_resources = lambda *args, **kwargs: compile_pool.CompilerResources(
+        1, 128 << 30, 16, 32 << 30, 8 << 30)
     torch.cuda.current_stream = lambda device: SimpleNamespace(synchronize=lambda: None)
 
 
@@ -138,7 +141,7 @@ class _Pool:
     workers = 1
 
     def __init__(self, device, **kwargs):
-        pass
+        self.workers = kwargs.get("workers", 1)
 
     def __enter__(self):
         return self
@@ -164,7 +167,7 @@ class _Pool:
         return future
 
 
-def _lending_rank(rank, world, store, root, outcome, lifecycle=None, fail_shutdown=False):
+def _lending_rank(rank, world, store, root, outcome, lifecycle=None, fail_shutdown=False, scenario=None):
     from contextlib import nullcontext
     from types import SimpleNamespace
 
@@ -187,6 +190,14 @@ def _lending_rank(rank, world, store, root, outcome, lifecycle=None, fail_shutdo
             def submit_payload(self, payload, path):
                 from ignition.preparation.forward_metadata import loads
 
+                if scenario == "two_hosts":
+                    assert hosts[loads(payload).rank] == hosts[rank], "forward metadata crossed hosts"
+                if scenario == "worker_failure" and rank == 1:
+                    from concurrent.futures import Future
+
+                    future = Future()
+                    future.set_exception(RuntimeError("forward worker failed on rank 1"))
+                    return future
                 if lifecycle is not None and rank == 1 and loads(payload).compilation_variant == "sample":
                     started, closed, finished = lifecycle
                     started.set()
@@ -198,6 +209,16 @@ def _lending_rank(rank, world, store, root, outcome, lifecycle=None, fail_shutdo
 
         compile_pool.CompilePool = Pool
         _replace_gpu_preparation()
+        hosts = ("a", "b", "a", "b") if scenario == "two_hosts" else ("host",) * world
+        if scenario == "two_hosts":
+            os.chdir(root / hosts[rank])
+            root = Path("forwards")
+        if scenario in ("two_hosts", "zero_owners", "no_capacity", "worker_failure"):
+            capacity = (rank in (2, 3) if scenario == "two_hosts" else rank == 1)
+            if scenario == "no_capacity":
+                capacity = False
+            compile_pool.compiler_resources = lambda *args, **kwargs: compile_pool.CompilerResources(
+                int(capacity), 40 << 30, 16, 32 << 30, 8 << 30)
         aot.ForwardCache._load = lambda self, forward, path, required=False, before_run=None: aot.BoundForward(
             _Artifact(lambda owner: None), forward, True)
         dist.init_process_group("gloo", init_method=f"file://{store}", rank=rank, world_size=world)
@@ -207,11 +228,17 @@ def _lending_rank(rank, world, store, root, outcome, lifecycle=None, fail_shutdo
         cache.lock_gpu_clocks = False
         variant = "sample" if rank == 0 else "consume"
         functions = {name: _Forward(variant) for name in "abcd"}
-        coordinator = SimpleNamespace(group=dist.group.WORLD, ranks=tuple(range(world)), spans_hosts=False,
+        for forward in functions.values():
+            forward.rank = rank
+        coordinator = SimpleNamespace(group=dist.group.WORLD, ranks=tuple(range(world)), hosts=hosts,
+            spans_hosts=len(set(hosts)) > 1,
             local_ranks=world, barrier=lambda key, ranks: dist.monitored_barrier(group=dist.group.WORLD))
         selected = cache._prepare_ranks(functions, {name: name for name in functions}, coordinator, progress=None,
                                         materialize=lambda: None, warmup=nullcontext, before_run=None)
-        outcome.put((rank, sorted(selected)))
+        if scenario == "two_hosts":
+            outcome.put((rank, (sorted(selected), sorted(path.read_text() for path in root.glob("*.bin")))))
+        else:
+            outcome.put((rank, sorted(selected)))
     except Exception:  # noqa: BLE001 - The parent reports every rank's failure.
         import traceback
 
@@ -292,6 +319,47 @@ def test_compiler_shutdown_failure_is_reported_to_every_rank(tmp_path):
                 process.join(timeout=30)
 
 
+@pytest.mark.parametrize("scenario", ["zero_owners", "two_hosts", "no_capacity", "worker_failure"])
+def test_host_admission_lends_to_local_workers_and_reports_failures_collectively(tmp_path, scenario):
+    context = multiprocessing.get_context("fork")
+    world = 4 if scenario == "two_hosts" else 3
+    root = tmp_path / "forwards"
+    root.mkdir()
+    if scenario == "two_hosts":
+        for host in ("a", "b"):
+            (root / host / "forwards").mkdir(parents=True)
+    outcome = context.Queue()
+    processes = [context.Process(target=_lending_rank,
+        args=(rank, world, tmp_path / "store", root, outcome, None, False, scenario)) for rank in range(world)]
+    try:
+        for process in processes:
+            process.start()
+        results = dict(outcome.get(timeout=120) for _ in processes)
+        for process in processes:
+            process.join(timeout=30)
+            assert process.exitcode == 0
+        if scenario == "two_hosts":
+            for selected, compiled in results.values():
+                assert selected == list("abcd")
+                assert len(compiled) == 8
+                assert compiled.count("sample compiled by rank 2") == 4
+                assert all("rank 2" in item or "rank 3" in item for item in compiled)
+            assert results[0] == results[1] == results[2] == results[3]
+        elif scenario == "zero_owners":
+            assert results == {rank: list("abcd") for rank in range(world)}
+            assert all("rank 1" in path.read_text() for path in root.glob("*.bin"))
+        else:
+            reason = "no capacity for a forward compiler" if scenario == "no_capacity" else "forward worker failed on rank 1"
+            assert all(reason in result for result in results.values())
+        assert not list(root.rglob("*.forward"))
+        assert not list(root.rglob("*.tmp"))
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=30)
+
+
 def _cached_rank(rank, world, store, root, deferred, outcome):
     import gc
     import weakref
@@ -335,6 +403,7 @@ def _cached_rank(rank, world, store, root, deferred, outcome):
             cache._path(forward, name=f"{name}.shared", signature=name).write_text("cached")
         dist.barrier()
         coordinator = SimpleNamespace(group=dist.group.WORLD, ranks=tuple(range(world)), spans_hosts=False,
+            hosts=("host",) * world,
             local_ranks=world, barrier=lambda key, ranks: dist.monitored_barrier(group=dist.group.WORLD))
         selected = cache._prepare_ranks(functions, signatures, coordinator, progress=None,
             materialize=materialize if deferred else None, warmup=nullcontext, before_run=None)

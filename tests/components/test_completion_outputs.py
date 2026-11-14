@@ -17,10 +17,9 @@ from ignition.components.completion import (
 
 @pytest.mark.skipif(os.environ.get('FLARE_RUN_CUDA_TESTS') != '1', reason='CUDA opt-in')
 @pytest.mark.parametrize("tokens", [1, 8, 13, 16, 32])
-def test_mixed_roles_merge_only_the_active_frame_and_reuse_the_catalog_pool(tokens):
+def test_mixed_roles_merge_only_the_active_frame(tokens):
     outputs = CompletionOutputs.allocate((2, 4, 16 + tokens), device='cuda')
-    cursor = outputs.private_storage.cursor()
-    prompt, decode = outputs.private(cursor), outputs.private(cursor)
+    prompt, decode = outputs.private(), outputs.private()
     assert prompt.requested is decode.requested is outputs.requested
     prompt.records.fill_(11)
     prompt.logprobs.fill_(12)
@@ -43,13 +42,6 @@ def test_mixed_roles_merge_only_the_active_frame_and_reuse_the_catalog_pool(toke
         assert torch.all(outputs.speculative_survival[0] == -1)
         assert torch.all(outputs.speculative_survival[1, 2] == -1)
         assert torch.all(outputs.speculative_survival[1, [0, 1, 3]] == .5)
-    size = outputs.private_storage.nbytes
-    for _ in range(20):
-        cursor = outputs.private_storage.cursor()
-        a, b = outputs.private(cursor), outputs.private(cursor)
-        assert a.logprobs.data_ptr() == prompt.logprobs.data_ptr()
-        assert b.logprobs.data_ptr() == decode.logprobs.data_ptr()
-    assert outputs.private_storage.nbytes == size
     assert outputs.zero_ranges()
 
 
@@ -105,3 +97,18 @@ def test_completion_storage_covers_sixteen_tokens_and_fifteen_survival_values():
     validate_completion_buffers(outputs.buffers(), 4)
     with pytest.raises(ValueError, match="token_capacity"):
         CompletionOutputs.allocate((2, 4, 16), device="meta")
+
+
+def test_private_completion_outputs_are_disjoint_and_accounted():
+    outputs = CompletionOutputs.allocate((2, 4, 24), device="cpu")
+    base = outputs.nbytes
+    prompt, decode = outputs.private(), outputs.private()
+    assert prompt.records.data_ptr() != decode.records.data_ptr()
+    assert prompt.logprobs.data_ptr() != decode.logprobs.data_ptr()
+    assert prompt.requested is decode.requested is outputs.requested
+    private_bytes = sum(t.nbytes for role in (prompt, decode)
+                        for t in (role.records, role.logprobs, role.speculative_survival))
+    assert outputs.nbytes == base + private_bytes
+    ranges = outputs.zero_ranges()
+    assert any(start <= prompt.records.data_ptr() < start + size for start, size in ranges)
+    assert any(start <= decode.logprobs.data_ptr() < start + size for start, size in ranges)

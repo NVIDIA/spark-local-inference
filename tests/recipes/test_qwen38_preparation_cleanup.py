@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from ignition.preparation.package_storage import PackageStorage
+from ignition.preparation.core_storage import CoreStorage
 from ignition.recipes.qwen38 import bootstrap
 
 
@@ -36,10 +36,14 @@ class Routing:
         self.events.append(("release", pool))
 
     def storage(self):
-        storage = PackageStorage.__new__(PackageStorage)
+        storage = CoreStorage.__new__(CoreStorage)
         storage.device = 0
         storage._allocator = self.pool()
         storage._preparation_pools = set()
+        storage._retention_scope = False
+        storage._context_tokens = []
+        storage._persistent_arena = None
+        storage._persistent_model_owned = False
         storage.numeric_storage = contextlib.nullcontext()
         storage._scope = torch.cuda.use_mem_pool(self.pool(), device=0)
         storage.seal_low_window = lambda: self.events.append(("seal", 0))
@@ -63,6 +67,7 @@ def routing(monkeypatch):
     hooks = Routing()
     monkeypatch.setattr(torch.cuda, "_lazy_init", lambda: pytest.fail("CPU test initialized CUDA"))
     monkeypatch.setattr(torch.cuda, "MemPool", hooks.pool)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     monkeypatch.setattr(torch.cuda, "set_device", lambda device: None)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda *args: hooks.events.append(("synchronize", 0)))
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: hooks.events.append(("empty-cache", 0)))
@@ -81,7 +86,7 @@ def assert_failure_closes_routing(routing, failure):
     try:
         with pytest.raises(type(failure)) as raised:
             with storage:
-                bootstrap.prepare_model(Path("/unused"), bootstrap.PreparationConfig(), package_storage=storage)
+                bootstrap.prepare_model(Path("/unused"), bootstrap.PreparationConfig(), core_storage=storage)
         assert raised.value is failure
         # Keep the traceback alive: garbage collection must not restore routing.
         assert failure.__traceback__ is not None
@@ -130,7 +135,7 @@ def test_success_preserves_early_close_arguments_and_no_grad(monkeypatch, routin
         assert not torch.is_grad_enabled()
         transient = kwargs.pop("transient")
         assert kwargs == dict(progress=progress, compile_decoder=False, rank=2,
-            group=group, package_storage=storage)
+            group=group, core_storage=storage)
         transient.callback(events.append, "close-at-tuning")
         with transient:
             pass
@@ -139,7 +144,7 @@ def test_success_preserves_early_close_arguments_and_no_grad(monkeypatch, routin
 
     monkeypatch.setattr(bootstrap, "_prepare_model", prepare)
     assert bootstrap.prepare_model(snapshot, config, progress=progress, compile_decoder=False,
-        rank=2, group=group, package_storage=storage) is result
+        rank=2, group=group, core_storage=storage) is result
     assert events == ["close-at-tuning", "compile-start"]
     assert routing.events == []
 

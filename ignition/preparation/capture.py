@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Compile prepared model forwards and capture one native executable per shape."""
+"""Compile prepared model forwards and capture CUDA graphs for their shapes."""
 
 from contextlib import nullcontext
 from time import monotonic
@@ -12,8 +12,27 @@ import torch
 from ignition.progress import graph_catalog, phase
 
 from .aot import ForwardCache
+from .collectives import warmup_wait
 from .compilation import _defer_full_collection
 from .startup_tuning import capture_consumers
+from .runtime_core import capture_graph, instantiate_graph, record_export_graph
+
+
+def _capture_order(names, compiled, coordinator):
+    sizes = {name: forward.capture_allocation_sizes for name, forward in compiled.items()}
+    ranks = [(names, sizes)]
+    if coordinator is not None:
+        ranks = [None] * len(coordinator.ranks)
+        torch.distributed.all_gather_object(ranks, (names, sizes), group=coordinator.group)
+        if any(selected != names or requests.keys() != sizes.keys() for selected, requests in ranks):
+            raise ValueError("tensor-parallel capture requires matching forward catalogs")
+
+    def priority(name):
+        requests = [rank_sizes[name] for _, rank_sizes in ranks if name in rank_sizes]
+        return (bool(requests), max((max(sizes, default=0) for sizes in requests), default=0),
+                max((sum(sizes) for sizes in requests), default=0))
+
+    return tuple(sorted(names, key=priority, reverse=True))
 
 
 @_defer_full_collection()
@@ -21,20 +40,23 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
                      collective=None, coordinator=None, compile_decoder=True, materialize=None,
                      progress=None, label="Prepare serving graphs", cache_root=None, retain_graphs=False,
                      warmup_storage=None, capture_names=None, before_run=None, compile_group=None,
-                     report_catalog=True,
+                     report_catalog=True, retain_forwards=False,
                      compile_kinds=("prefill", "scored_prefill", "decode", "resume", "speculative", "mixed", "vision")):
-    """Retain compiled callables and capture with an optional b12x IPC runtime.
+    """Retain compiled resources and capture with an optional b12x IPC runtime.
 
     Persistent state and graph outputs must live in caller-owned storage.
     Only graph-local intermediates may use the shared graph memory pool;
     serving replays variants serially and may choose them in any order.
     All eager warmups precede capture so their transient workspaces do not
     coexist with retained graph intermediates.
+    ``retain_graphs`` keeps templates and executables for export when
+    ``warmup_storage`` supplies external CUDA pool owners.
     ``before_run`` restores caller-owned trial inputs outside compiled warmup
     and graph capture; it is unused for the ordinary serving catalog.
     ``compile_group`` compiles one representative for same-signature trial
     forwards, then checks every owner's guards and storage aliases before
     capturing their distinct CUDA graphs.
+    ``retain_forwards`` preserves guarded Python execution for eager diagnostics.
     """
     if (report_catalog and progress is not None and not getattr(session, "_graph_catalog_reported", False)
             and (not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0)):
@@ -64,7 +86,7 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
                 raise ValueError("grouped forwards require one type and graph signature")
         stream.wait_stream(torch.cuda.current_stream(device))
         retention = nullcontext() if warmup_storage is None else warmup_storage.retain_transient_backing()
-        with retention:
+        with retention, warmup_wait(collective, coordinator):
             with torch.cuda.stream(stream):
                 if compile_group is None:
                     compiled = cache.prepare_many(forwards, signatures, progress=progress,
@@ -79,6 +101,7 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
         if compile_group is not None:
             compiled = cache.bind_group(template[compile_group], forwards,
                                         signature=signatures[first], coordinator=coordinator)
+            del template
         with phase(progress, "Release serialized compiler state", total=len(compiled)) as stage:
             released, counted = 0, set()
             for forward in compiled.values():
@@ -111,14 +134,16 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
                     function()
             stream.synchronize()
             stage.update(advance=1)
+    ordered_names = _capture_order(names, compiled, coordinator)
     with phase(progress, label, total=len(names)) as stage:
-        for name in names:
+        for name in ordered_names:
             function = compiled.get(name, functions[name])
             if coordinator is not None:
                 coordinator.barrier(f"capture {name}", coordinator.ranks)
             started = monotonic()
             stream.wait_stream(torch.cuda.current_stream(device))
-            graph = torch.cuda.CUDAGraph(keep_graph=True) if retain_graphs else torch.cuda.CUDAGraph()
+            exporting = retain_graphs and warmup_storage is not None
+            graph = torch.cuda.CUDAGraph(keep_graph=True) if exporting else capture_graph(retain_graphs=retain_graphs)
             communication = nullcontext() if collective is None else collective.capture(stream=stream)
             def memory_detail():
                 free, total = torch.cuda.mem_get_info(device)
@@ -138,13 +163,21 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
                     stream.synchronize()
                 with capture_consumers(session, graph), communication, session.capture(), torch.cuda.graph(graph, pool=pool, stream=stream):
                     function()
-                if retain_graphs:
+                if exporting:
+                    recorded = record_export_graph(graph, warmup_storage, owners=(function,))
+                    registry = getattr(session, "_startup_collectives", None)
+                    if registry is not None:
+                        registry.captures[id(recorded)] = registry.captures.pop(id(graph))
+                    graph = recorded
+                elif retain_graphs:
                     if progress is not None:
                         progress(f"instantiating {name}: {memory_detail()}")
-                    graph.instantiate()
+                    instantiate_graph(graph)
             except Exception as error:
                 error.add_note(f"Graph {name!r} on {device}: {memory_detail()}")
                 raise
+            if name in compiled and not retain_forwards:
+                function.retire_after_capture()
             graphs[name] = graph
             stage.update(advance=1)
             if progress is not None:

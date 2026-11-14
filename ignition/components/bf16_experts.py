@@ -9,7 +9,7 @@ import torch
 import triton
 import triton.language as tl
 
-from ignition.preparation.triton import prepare_triton
+from ignition.preparation.triton import launch_triton, prepare_triton
 
 
 @triton.jit
@@ -240,11 +240,11 @@ class BF16ExpertScratch:
     tile_experts: torch.Tensor
 
     @classmethod
-    def allocate(cls, tokens, top_k, experts, intermediate, *, buffers):
+    def allocate(cls, tokens, top_k, experts, intermediate, *, buffers=None, device=None):
         pairs = tokens * top_k
         tiles = min(pairs, triton.cdiv(pairs, 16) + experts)
         def zeros(shape, dtype=torch.int32):
-            return buffers.zeros(shape, dtype)
+            return torch.zeros(shape, dtype=dtype, device=device) if buffers is None else buffers.zeros(shape, dtype)
         return cls(zeros((pairs, intermediate), torch.bfloat16), zeros((experts,)), zeros((experts,)),
                    zeros((experts,)), zeros((pairs,)), zeros((tiles * 16,)), zeros((tiles,)))
 
@@ -275,7 +275,7 @@ class PreparedBF16Experts:
             raise ValueError("BF16 experts require matched source, weights, routes, and raw output geometry")
         self.output = output
         if scratch is None:
-            scratch = BF16ExpertScratch.allocate(tokens, top_k, count, inter, buffers=buffers)
+            scratch = BF16ExpertScratch.allocate(tokens, top_k, count, inter, buffers=buffers, device=source.device)
         self.intermediate = scratch.intermediate
         pairs = tokens * top_k
         tile_m, tile_n, tile_k = 16, 64, 64
@@ -301,6 +301,33 @@ class PreparedBF16Experts:
             (self.intermediate, down, weights, sorted_ids, tile_experts, output,
              hidden, inter, tile_m, tile_n, tile_k, True),
             (tiles, triton.cdiv(hidden, tile_n), 1), num_warps=4)
+
+    def functional(self, *, session=None):
+        values = dict(source=self.first.args[0], ids=self.bins[1].args[0], weights=self.second.args[2],
+            valid_tokens=self.bins[1].args[1], output=self.output, intermediate=self.intermediate,
+            counts=self.bins[0].args[0], tile_experts=self.bins[0].args[1], sorted_ids=self.bins[0].args[2],
+            ranks=self.bins[1].args[3], starts=self.bins[2].args[1], tile_counts=self.bins[2].args[2])
+        self.local_layout = {name: (tuple(value.shape), value.dtype) for name, value in values.items()}
+        names = {id(value): name for name, value in values.items()}
+        for operation in (*self.bins, self.first, self.second):
+            operation.local_slots = tuple((index, names[id(value)]) for index, value in enumerate(operation.args)
+                                          if id(value) in names)
+            operation.args = tuple(None if id(value) in names else value for value in operation.args)
+        self.output = self.intermediate = None
+        return self
+
+    def run(self, source, ids, weights, num_valid_tokens):
+        local = {name: torch.empty(shape, dtype=dtype, device=source.device)
+                 for name, (shape, dtype) in self.local_layout.items()
+                 if name not in ("source", "ids", "weights", "valid_tokens")}
+        local.update(source=source, ids=ids, weights=weights, valid_tokens=num_valid_tokens)
+        local["output"].zero_()
+        for operation in (*self.bins, self.first, self.second):
+            args = list(operation.args)
+            for index, name in operation.local_slots:
+                args[index] = local[name]
+            launch_triton(operation.kernel, operation.compiled, tuple(args), operation.grid, **operation.options)
+        return local["output"]
 
     def __call__(self):
         self.output.zero_()

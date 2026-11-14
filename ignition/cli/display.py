@@ -36,8 +36,11 @@ def speculation(settings, *, brief: bool = False) -> str:
     selection = " · GPU prefix selection" if settings.draft_prefix_selection == "gpu" else ""
     heads = [f"{head} head {getattr(settings, head + '_head_quantization').upper()}"
              for head in ("draft", "markov") if getattr(settings, head + '_head_quantization') is not None]
+    if getattr(settings, "draft_body_quantization", None) is not None:
+        heads.insert(0, f"draft body {settings.draft_body_quantization.upper()}")
     precision = " · " + ", ".join(heads) if heads else ""
+    catalog = " · MTP-only graphs" if settings.mtp_only else ""
     if brief:
-        return depth + selection + precision + parallel
+        return depth + selection + precision + parallel + catalog
     source = "DFlash2" if settings.method == "dflash2" else "MTP module"
-    return f"{depth} per round · {source}" + selection + precision + parallel
+    return f"{depth} per round · {source}" + selection + precision + parallel + catalog

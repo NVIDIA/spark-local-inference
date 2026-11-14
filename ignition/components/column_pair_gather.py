@@ -85,15 +85,32 @@ class PreparedColumnPairGather:
             runtime=runtime, session=session, coordinator=coordinator, name=f"{name}.{index}")
             for index, (begin, end) in enumerate(self.bounds))
 
-    def __call__(self):
+    def functional(self, *, session):
+        self.rows = self.first.shape[0]
+        self.chunk_rows = self.send.shape[0]
+        for part in self.parts:
+            part.functional(session=session)
+        self.first = self.second = self.output_first = self.output_second = self.send = self.received = None
+        return self
+
+    def __call__(self, first=None, second=None):
+        local = self.first is None
+        if local:
+            if first is None or second is None:
+                raise ValueError("functional paired gather requires both column shards")
+            output_first = torch.empty((self.rows, self.world * self.first_width), dtype=first.dtype, device=first.device)
+            output_second = torch.empty((self.rows, self.world * self.second_width), dtype=second.dtype, device=second.device)
+        else:
+            first, second = self.first, self.second
+            output_first, output_second = self.output_first, self.output_second
         for (begin, end), gather in zip(self.bounds, self.parts, strict=True):
             count = end - begin
-            self.send[:count, :self.first_width].copy_(self.first[begin:end])
-            self.send[:count, self.first_width:].copy_(self.second[begin:end].view(torch.bfloat16))
-            gather(self.send[:count])
-            received = self.received[:count].view(count, self.world, self.columns)
-            self.output_first[begin:end].view(count, self.world, self.first_width).copy_(
-                received[:, :, :self.first_width])
-            self.output_second[begin:end].view(count, self.world, self.second_width).view(torch.bfloat16).copy_(
+            send = (torch.empty((count, self.columns), dtype=torch.bfloat16, device=first.device)
+                    if local else self.send[:count])
+            send[:, :self.first_width].copy_(first[begin:end])
+            send[:, self.first_width:].copy_(second[begin:end].view(torch.bfloat16))
+            received = gather(send).view(count, self.world, self.columns)
+            output_first[begin:end].view(count, self.world, self.first_width).copy_(received[:, :, :self.first_width])
+            output_second[begin:end].view(count, self.world, self.second_width).view(torch.bfloat16).copy_(
                 received[:, :, self.first_width:])
-        return self.output_first, self.output_second
+        return output_first, output_second

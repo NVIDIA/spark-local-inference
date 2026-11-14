@@ -62,7 +62,7 @@ impl Asset {
                 {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::UnexpectedEof,
-                        "frontend asset exceeds package",
+                        "frontend asset exceeds core",
                     ));
                 }
                 let mut bytes = vec![0; size];

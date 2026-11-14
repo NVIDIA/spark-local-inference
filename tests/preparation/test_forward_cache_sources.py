@@ -12,16 +12,16 @@ from ignition.preparation import aot
 
 
 def test_presentation_edits_preserve_forward_cache_but_execution_edits_invalidate(tmp_path, monkeypatch):
-    package = tmp_path / "ignition"
-    preparation = package / "preparation"
+    core = tmp_path / "ignition"
+    preparation = core / "preparation"
     preparation.mkdir(parents=True)
     backend = preparation / "aot.py"
     backend.write_text("backend = 1\n")
-    progress = package / "progress.py"
+    progress = core / "progress.py"
     progress.write_text("splash = 'sun'\n")
-    entrypoint = package / "__main__.py"
+    entrypoint = core / "__main__.py"
     entrypoint.write_text("port = 8000\n")
-    publication = preparation / "package_file.py"
+    publication = preparation / "core_file.py"
     publication.write_text("threads = 1\n")
     kernels = tmp_path / "flashinfer"
     kernels.mkdir()

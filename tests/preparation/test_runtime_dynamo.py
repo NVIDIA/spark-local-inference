@@ -2,10 +2,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Dynamo retains input-mutation ordering checks after event-triggered restarts."""
+"""Dynamo guards retain invalidation and input-mutation ordering checks."""
 
 from types import SimpleNamespace
+import gc
 import os
+import weakref
 
 import pytest
 import torch
@@ -16,6 +18,38 @@ from torch._dynamo.symbolic_convert import SpeculationLog
 from ignition.runtime_patches import dynamo
 
 
+class GuardedForward:
+    def __init__(self):
+        self.value = torch.ones(2)
+        self.offset = 2
+
+    def __call__(self):
+        return self.value + self.offset
+
+
+def _execute_guarded(forward):
+    return forward()
+
+
+def _load_guarded_forward():
+    from torch._dynamo.aot_compile_types import GraphModuleSerializableCallable
+
+    forward = GuardedForward()
+    compiled = torch.compile(_execute_guarded,
+        backend=lambda graph, inputs: GraphModuleSerializableCallable(graph), fullgraph=True,
+        dynamic=False).aot_compile(((forward,), {}))
+    data = type(compiled).serialize(compiled).serialized_data
+    return type(compiled).deserialize(data), forward
+
+
+def _manager_ref(wrapper):
+    from torch._dynamo.guards import CheckFunctionManager
+
+    managers = [owner for owner in gc.get_referrers(wrapper) if isinstance(owner, CheckFunctionManager)]
+    assert len(managers) == 1
+    return weakref.ref(managers[0])
+
+
 @pytest.fixture
 def installed(monkeypatch):
     replacements = dynamo.replacements()
@@ -23,6 +57,77 @@ def installed(monkeypatch):
         monkeypatch.setattr(owner, name, replacement)
     yield replacements
     torch._dynamo.reset()
+
+
+def test_discarded_loaded_forward_releases_guards_and_runtime_backend(installed):
+    loaded, forward = _load_guarded_forward()
+    torch.testing.assert_close(loaded(forward), torch.full((2,), 3.0))
+    wrapper = loaded._artifacts.guard_manager
+    backend = loaded._artifacts.compiled_fn
+    wrapper_ref, backend_ref = weakref.ref(wrapper), weakref.ref(backend)
+    manager_ref = _manager_ref(wrapper)
+    assert any(value is backend for value in manager_ref().runtime_global_scope.values())
+    del loaded, wrapper, backend
+    gc.collect()
+    assert wrapper_ref() is None
+    assert manager_ref() is None
+    assert backend_ref() is None
+    assert type(forward) is GuardedForward
+
+
+def test_live_guard_wrapper_retains_manager_and_runtime_backend(installed):
+    loaded, forward = _load_guarded_forward()
+    wrapper = loaded._artifacts.guard_manager
+    wrapper_ref = weakref.ref(wrapper)
+    backend_ref = weakref.ref(loaded._artifacts.compiled_fn)
+    manager_ref = _manager_ref(wrapper)
+    del loaded
+    gc.collect()
+    assert manager_ref() is not None
+    assert backend_ref() is not None
+    assert wrapper.check({"forward": forward})
+    forward.offset = 7
+    assert not wrapper.check({"forward": forward})
+    del wrapper
+    gc.collect()
+    assert wrapper_ref() is None
+    assert manager_ref() is None
+    assert backend_ref() is None
+
+
+def test_guarded_type_death_invalidates_real_dynamo_cache_entry(installed):
+    from torch._dynamo.eval_frame import _debug_get_cache_entry_list
+    from torch._dynamo.guards import DeletedGuardManagerWrapper
+
+    def execute(value, owner):
+        return value + owner.offset
+
+    def make_owner():
+        class Owner:
+            offset = 2
+
+        return Owner(), weakref.ref(Owner)
+
+    owner, type_ref = make_owner()
+    compiled = torch.compile(execute, backend="eager", fullgraph=True)
+    torch.testing.assert_close(compiled(torch.ones(2), owner), torch.full((2,), 3.0))
+    entry, = _debug_get_cache_entry_list(execute.__code__)
+    wrapper = entry.guard_manager
+    manager_ref = _manager_ref(wrapper)
+    gc.collect()
+    assert manager_ref() is not None
+    assert wrapper.cache_entry is entry
+    del owner
+    gc.collect()
+    assert type_ref() is None
+    assert isinstance(entry.guard_manager, DeletedGuardManagerWrapper)
+    assert "got deallocated" in entry.guard_manager.invalidation_reason
+    assert wrapper.cache_entry is None
+    assert wrapper.extra_state is None
+    replacement, _ = make_owner()
+    torch.testing.assert_close(compiled(torch.ones(2), replacement), torch.full((2,), 3.0))
+    assert any(not isinstance(item.guard_manager, DeletedGuardManagerWrapper)
+               for item in _debug_get_cache_entry_list(execute.__code__))
 
 
 def test_preparing_dynamo_replacements_leaves_methods_unchanged():

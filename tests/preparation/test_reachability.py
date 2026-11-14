@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from ignition.preparation.runtime_package import Allocation
+from ignition.preparation.runtime_core import Allocation
 from ignition.preparation.tensor_metadata import NumericStorage, tensor_ranges
 
 
@@ -41,12 +41,13 @@ def test_checkpoint_role_tracks_storage_lifetime_without_retaining_weights():
 
 
 def test_sampling_indices_do_not_retain_allocations_from_unaligned_token_ids():
+    from ignition.components.sampling import DeviceRequestState
     from ignition.components.speculation import PreparedSpeculativeDistributions
 
     with NumericStorage() as numeric:
         sampling = PreparedSpeculativeDistributions(
             torch.empty((1, 2, 256)),
-            SimpleNamespace(vocab_size=256, generation=torch.zeros(1, dtype=torch.int64)),
+            DeviceRequestState.allocate("cpu", vocab_size=256, capacity=1),
             torch.zeros(1, dtype=torch.int32), torch.zeros(1, dtype=torch.int64),
             torch.ones(1, dtype=torch.int32), torch.zeros((1, 1), dtype=torch.int64))
     indices = sampling.vocab_ids
@@ -110,7 +111,7 @@ def test_repacked_weight_planes_remain_numeric_leaves(codec, kind):
     unrelated = Allocation("unrelated", 0xee9f4a000000, 10 * 1024 * 1024)
     for plane in planes:
         owner = Allocation("weight", plane.data_ptr(), plane.nbytes)
-        # The Windows-failing package had this unaligned address-shaped numeric word.
+        # The Windows-failing core had this unaligned address-shaped numeric word.
         data = b"\0" * 6 + struct.pack("<Q", unrelated.address + 0x31451f) + b"\0" * 2
         payload = plane.view(torch.uint8).reshape(-1)[:len(data)]
         payload.copy_(torch.tensor(list(data), dtype=torch.uint8, device=plane.device))

@@ -6,7 +6,7 @@
 Primitive inputs and outputs satisfy independent checkpoint arithmetic
 intervals for FP32 accumulation, BF16 rounding, and SFU instructions. Eager
 captures match separately sequenced native primitives; compiled captures
-match the retained compiled callable. Rotary intervals use canonical FP32
+match a compiled composition with explicit observation outputs. Rotary intervals use canonical FP32
 angles and trigonometric values with FP64 multiply/add bounds.
 """
 
@@ -38,11 +38,47 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_TP_CUDA_TESTS") != "1"
 
 
 class _ContextForward:
-    def __init__(self, operation, auxiliary, counts):
+    def __init__(self, operation, auxiliary, counts, metadata, config, shard):
         self.operation, self.auxiliary, self.counts = operation, auxiliary, counts
+        self.metadata, self.stages = metadata, operation.stages
+        rows, hidden, layers = auxiliary.shape[0], config.hidden, config.draft.layers
+        self.local, self.projected, self.normalized, self.kv = (
+            torch.empty((rows, width), dtype=auxiliary.dtype, device=auxiliary.device)
+            for width in (hidden // shard.world_size, hidden, hidden, layers * RECORD))
 
     def __call__(self):
-        self.operation(self.auxiliary, self.counts)
+        for target, value in zip(self.scratch_tensors(),
+                self.operation(self.auxiliary, self.counts, self.metadata), strict=True):
+            target.copy_(value)
+
+    def scratch_tensors(self):
+        return self.local, self.projected, self.normalized, self.kv
+
+
+class _DraftForward:
+    def __init__(self, operation, metadata, scratch):
+        self.operation, self.metadata = operation, metadata
+        self.hidden, self.logits = torch.empty_like(scratch.hidden), torch.empty_like(scratch.logits)
+
+    def __call__(self):
+        hidden, logits = self.operation.forward(self.metadata)
+        self.hidden.copy_(hidden)
+        self.logits.copy_(logits)
+
+    def scratch_tensors(self):
+        return self.hidden, self.logits
+
+
+class _MarkovForward:
+    def __init__(self, operation, tokens, vocabulary):
+        self.operation, self.tokens = operation, tokens
+        self.local = torch.empty((tokens.numel(), vocabulary // WORLD), dtype=torch.float32, device=tokens.device)
+        self.logits = torch.empty((tokens.numel(), vocabulary), dtype=torch.float32, device=tokens.device)
+
+    def __call__(self):
+        local, logits = self.operation.forward(self.tokens)
+        self.local.copy_(local)
+        self.logits.copy_(logits)
 
 
 class _RotaryForward:
@@ -56,88 +92,18 @@ class _RotaryForward:
         self.operation(self.query, self.key, self.positions)
 
 
-def _projected_values(projected):
-    return {name: getattr(projected, name).clone() for name in (
-        "local", "input", "query_norm", "query", "latent", "absorbed")}
+class _ObservedDraft:
+    def __init__(self, prepared, metadata, rank):
+        self.prepared, self.metadata, self.rank = prepared, metadata, rank
+        self.values = _sequence_draft(prepared, metadata, rank)
 
-
-class _ObservedInvocation:
-    def __init__(self, invocation, probe):
-        self.invocation, self.probe = invocation, probe
-
-    def run(self, reads, writes, integers=()):
-        operands = []
-        for _, mutable, index, view in self.invocation.operands:
-            value = writes[index] if mutable else reads[index]
-            if view is not None:
-                dtype, shape, stride, offset = view
-                value = value.view(dtype)
-                value = value.as_strided(shape, stride, value.storage_offset() + offset)
-            operands.append((mutable, value))
-        result = self.probe.before(self.invocation.target, operands)
-        self.invocation.run(reads, writes, integers)
-        self.probe.save(**result)
-
-
-class _DraftBoundaries:
-    def __init__(self, prepared):
-        self.prepared = prepared
-        self.attention = prepared.layers[0].self_attn
-        self.projected = self.attention.projected
-        self.values = {"layers": []}
-
-    def save(self, **values):
-        if values:
-            self.values["layers"][-1].update({name: value.clone() for name, value in values.items()})
-
-    def before(self, target, operands):
-        def writes(target):
-            return any(mutable and value.dtype == target.dtype
-                       and value.data_ptr() == target.data_ptr() and value.numel() == target.numel()
-                       for mutable, value in operands)
-
-        scratch, attention = self.prepared.scratch, self.attention
-        if writes(self.projected.local):
-            if self.values["layers"]:
-                self.save(mlp_output=scratch.output)
-            else:
-                self.values.update(local_embedding=scratch.local_embedding.clone(), embedding=scratch.embedding.clone())
-            self.values["layers"].append({})
-            source = next(value for mutable, value in operands if not mutable and value.shape == scratch.embedding.shape)
-            self.save(input_norm=source)
-            return {"local": self.projected.local}
-        if writes(attention.block):
-            self.values["layers"][-1].update(_projected_values(self.projected))
-            self.save(block_before=attention.block, slots=attention.slots)
-            return {"block": attention.block}
-        if target is torch.ops.flare.dense_mla.default:
-            if writes(attention.history):
-                self.save(gathered=attention.gathered, history_pages=attention.history_pages,
-                    current_pages=attention.current_pages, history_lengths=attention.history_lengths,
-                    current_lengths=attention.current_lengths)
-                return {"history": attention.history, "history_lse": attention.history_lse}
-            if writes(attention.current):
-                return {"current": attention.current, "current_lse": attention.current_lse}
-        if target is torch.ops.flare.pcie_lse_reduce_scatter.default:
-            self.save(merged=attention.history, merged_lse=attention.history_lse)
-        if writes(self.projected.projections["output"].output):
-            self.save(attended=self.projected.attended, expanded=self.projected.expanded)
-            return {"attention_partial": self.projected.projections["output"].output}
-        if writes(scratch.mlp.gate_up):
-            source = next(value for mutable, value in operands if not mutable and value.shape == scratch.embedding.shape)
-            self.save(post_norm=source, attention_output=scratch.output)
-            return {"gate_up": scratch.mlp.gate_up}
-        if writes(scratch.mlp.output):
-            self.save(intermediate=scratch.mlp.intermediate)
-            return {"mlp_partial": scratch.mlp.output}
-        return {}
-
-    def finish(self):
-        assert len(self.values["layers"]) == len(self.prepared.layers), "compiled draft layer boundaries"
-        self.save(mlp_output=self.prepared.scratch.output)
-        for name in ("hidden", "local_logits", "logits"):
-            self.values[name] = getattr(self.prepared.scratch, name).clone()
-        return self.values
+    def __call__(self):
+        values = _sequence_draft(self.prepared, self.metadata, self.rank)
+        for key in ("local_embedding", "embedding", "hidden", "local_logits", "logits"):
+            self.values[key].copy_(values[key])
+        for target, source in zip(self.values["layers"], values["layers"], strict=True):
+            for key, tensor in target.items():
+                tensor.copy_(source[key])
 
 
 def _gather_columns(value):
@@ -528,56 +494,78 @@ def _proposal_state(metadata, rank):
 
 def _sequence_draft(prepared, metadata, rank):
     """Sequence native primitives without calling a draft, layer, or attention forward."""
+    from b12x.norm import hyperconnection
     from ignition.recipes.kimi3.dcp import write_records
-    from ignition.recipes.kimi31.dspark import merge_attention
+    from ignition.recipes.kimi3.pointwise import rms_norm_columns
+    from ignition.recipes.kimi31.dspark import merge_attention, proposal_metadata
 
-    local = prepared.embedding.lookup()
-    hidden = prepared.embedding.gather(local).clone()
+    local = prepared.embedding.lookup(token_ids=metadata.token_ids, num_rows=metadata.live_counts[:1])
+    hidden = prepared.embedding.gather(local)
     values = dict(local_embedding=local.clone(), embedding=hidden.clone(), layers=[])
-    state, live = _proposal_state(metadata, rank), metadata.positions >= 0
+    live, tokens = metadata.positions >= 0, metadata.positions.numel()
     for module in prepared.layers:
         operation, projection = module.self_attn, module.self_attn.projected
         normalized = module.input_layernorm(hidden)
         stage = dict(input_norm=normalized.clone())
-        projection.project(normalized)
-        stage.update(_projected_values(projection))
-        for name, value in state.items():
-            getattr(operation, name).copy_(value)
-            stage[name] = value.clone()
-        stage["block_before"] = operation.block.clone()
-        write_records(projection.latent, operation.slots, operation.block)
-        stage["block"] = operation.block.clone()
-        operation.query.copy_(projection.absorbed)
-        operation.gather(operation.query.flatten(1))
-        stage["gathered"] = operation.gathered.clone()
-        operation.history_attention()
-        operation.current_attention()
-        for name in ("history", "history_lse", "current", "current_lse"):
-            stage[name] = getattr(operation, name).clone()
-        merge_attention(operation.history, operation.history_lse, operation.current, operation.current_lse,
-                        operation.history_lengths, operation.current_lengths, operation.history, operation.history_lse)
-        stage.update(merged=operation.history.clone(), merged_lse=operation.history_lse.clone())
-        operation.combine(operation.history, operation.history_lse)
-        projection.attended.copy_(torch.where(live[:, None, None], projection.attended, 0.))
-        partial = projection.finish()
-        stage.update(attended=projection.attended.clone(), expanded=projection.expanded.clone(),
-                     attention_partial=partial.clone())
+        local = projection.projections["latent_gate"](normalized)
+        width, world = projection.latent_columns, projection.latent_world
+        gathered = projection.latent_gather(local[:, :width].contiguous()).view(tokens, world, width)
+        q, kv = (projection.latent_width - RECORD) // world, RECORD // world
+        inputs = torch.cat((gathered[:, :, :q].flatten(1), gathered[:, :, q:q + kv].flatten(1)), -1)
+        query_norm = torch.empty((tokens, projection.latent_width - RECORD), dtype=hidden.dtype, device=hidden.device)
+        latent = torch.empty((tokens, RECORD), dtype=hidden.dtype, device=hidden.device)
+        rms_norm_columns(inputs[:, :-RECORD], projection.weights["query_norm"], query_norm, projection.eps)
+        rms_norm_columns(inputs[:, -RECORD:-64], projection.weights["kv_norm"], latent[:, :512], projection.eps)
+        latent[:, 512:].copy_(inputs[:, -64:])
+        query = projection.projections["q_b"](query_norm).view(tokens, projection.heads, 192)
+        projection.rotary(query[:, :, 128:], latent[:, 512:], metadata.positions)
+        absorbed = torch.cat((torch.bmm(query[:, :, :128].transpose(0, 1),
+            projection.weights["key"]).transpose(0, 1), query[:, :, 128:]), -1)
+        stage.update(local=local.clone(), input=inputs.clone(), query_norm=query_norm.clone(), query=query.clone(),
+                     latent=latent.clone(), absorbed=absorbed.clone())
+        slots, history_lengths, current_lengths = proposal_metadata(metadata, operation.shards)
+        history_pages, current_pages = metadata.token_page_table, metadata.requests[:, None].int()
+        stage.update(slots=slots.clone(), history_lengths=history_lengths.clone(), current_lengths=current_lengths.clone(),
+                     history_pages=history_pages.clone(), current_pages=current_pages.clone())
+        block = torch.zeros(operation.block_shape, dtype=latent.dtype, device=latent.device)
+        stage["block_before"] = block.clone()
+        write_records(latent, slots, block)
+        stage["block"] = block.clone()
+        gathered = operation.gather(absorbed.contiguous().flatten(1)).view(tokens, -1, RECORD)
+        history, history_lse = operation.history_attention(gathered, page_table=history_pages,
+            lengths=history_lengths, starts=operation.starts)
+        current, current_lse = operation.current_attention(gathered, page_table=current_pages,
+            lengths=current_lengths, starts=operation.starts, cache=block)
+        stage.update(gathered=gathered.clone(), history=history.clone(), history_lse=history_lse.clone(),
+                     current=current.clone(), current_lse=current_lse.clone())
+        merged, merged_lse = torch.empty_like(history), torch.empty_like(history_lse)
+        merge_attention(history, history_lse, current, current_lse, history_lengths, current_lengths, merged, merged_lse)
+        stage.update(merged=merged.clone(), merged_lse=merged_lse.clone())
+        attended = torch.where(live[:, None, None], operation.combine(merged, merged_lse), 0.)
+        expanded = torch.bmm(attended.transpose(0, 1), projection.weights["value"]).transpose(0, 1).flatten(1).contiguous()
+        partial = projection.projections["output"](expanded)
         attention_output = operation.reduce(partial)
-        stage["attention_output"] = attention_output.clone()
+        stage.update(attended=attended.clone(), expanded=expanded.clone(), attention_partial=partial.clone(),
+                     attention_output=attention_output.clone())
         hidden = hidden + attention_output
         normalized = module.post_attention_layernorm(hidden)
-        stage["post_norm"] = normalized.clone()
-        mlp_output = module.mlp(normalized)
-        stage.update(gate_up=prepared.scratch.mlp.gate_up.clone(),
-            intermediate=prepared.scratch.mlp.intermediate.clone(), mlp_partial=prepared.scratch.mlp.output.clone(),
-            mlp_output=mlp_output.clone())
+        mlp = module.mlp.mlp
+        gate_up = mlp.up_projection(normalized)
+        shape, stride, dtype = mlp._functional_layout[3:6]
+        intermediate = torch.empty_strided(shape, stride, dtype=dtype, device=hidden.device)
+        hyperconnection.run_swiglu(gate_up, limit=mlp.swiglu_limit, round_silu=mlp.round_silu,
+                                   out=intermediate, plan=mlp.activation_plan)
+        partial = mlp.down_projection(intermediate)
+        mlp_output = module.mlp.reduce(partial)
+        stage.update(post_norm=normalized.clone(), gate_up=gate_up.clone(), intermediate=intermediate.clone(),
+                     mlp_partial=partial.clone(), mlp_output=mlp_output.clone())
         hidden = hidden + mlp_output
         values["layers"].append(stage)
     normalized = prepared.norm(hidden[metadata.sample_indices])
     hidden = torch.where((metadata.lengths > 0).repeat_interleave(BLOCK)[:, None], normalized, 0.)
-    prepared.head(hidden)
-    values.update(hidden=hidden.clone(), local_logits=prepared.scratch.local_logits.clone(),
-                  logits=prepared.scratch.logits.clone())
+    local_logits = prepared.head.projection(hidden)
+    logits = prepared.head.gather(local_logits)
+    values.update(hidden=hidden.clone(), local_logits=local_logits.clone(), logits=logits.clone())
     return values
 
 
@@ -698,15 +686,9 @@ def _compose_and_check(weights, oracle, metadata, pool, *, prepared, bound=None)
     if bound is None:
         values = _sequence_draft(prepared, metadata, weights.shard.rank)
     else:
-        boundaries = _DraftBoundaries(prepared)
-        backend, original = bound.backend, bound.backend.invocations
-        backend.invocations = [_ObservedInvocation(invocation, boundaries) for invocation in original]
-        try:
-            _poison(prepared.scratch.scratch_tensors())
-            bound()
-        finally:
-            backend.invocations = original
-        values = boundaries.finish()
+        invocation, observer = bound
+        invocation()
+        values = observer.values
     return _check_draft_boundaries(weights, oracle, metadata, pool, prepared, values)
 
 
@@ -723,7 +705,7 @@ def _rank(rank, rendezvous, cache_root, compile_decoder):
     from ignition.preparation.collectives import (CollectivePreparation, create_all_gather_runtime,
         create_all_reduce_runtime, create_head_exchange)
     from ignition.preparation.execution import GraphSignature
-    from ignition.preparation.package_storage import PackageStorage
+    from ignition.preparation.core_storage import CoreStorage
     from ignition.preparation.scratch import ScratchArena
     from ignition.preparation.tuning import RecordedPreparationSession
     from ignition.recipes.kimi3.config import ModelConfig
@@ -743,7 +725,7 @@ def _rank(rank, rendezvous, cache_root, compile_decoder):
                             timeout=timedelta(minutes=20))
     runtimes, graphs, compiled = [], [], {}
     try:
-        with PackageStorage(rank=rank, world=WORLD, device=rank) as storage:
+        with CoreStorage(rank=rank, world=WORLD, device=rank) as storage:
             from ignition.recipes.kimi3.dcp import write_records
 
             records = torch.linspace(-1024, 1024, 3 * RECORD, device=device).view(3, RECORD).bfloat16()
@@ -831,14 +813,11 @@ def _rank(rank, rendezvous, cache_root, compile_decoder):
                     autotune_effort="off", compile_workers=WORLD, coordinator=coordinator) as session:
                 arena = ScratchArena(device)
                 session.register_scratch(arena)
-                buffers = {}
                 common = dict(session=session, workspace=arena, runtime=context_runtime,
-                              coordinator=coordinator, buffers=buffers, context=context)
+                              coordinator=coordinator, context=context)
                 initial_context = PreparedContext(weights, auxiliary, initial, pool, name="initial", **common)
                 commit_context = PreparedContext(weights, feedback, commit, pool, name="commit", **common)
                 single_context = PreparedContext(weights, one_feedback, single, pool, name="single", **common)
-                assert initial_context.projected.data_ptr() == commit_context.projected.data_ptr()
-                assert commit_context.kv.data_ptr() == single_context.kv.data_ptr()
                 scratch = DraftScratch.allocate(config, shard, 14, BLOCK, device)
                 short_scratch = scratch.rows(7, 7)
                 assert scratch.embedding.data_ptr() == short_scratch.embedding.data_ptr()
@@ -847,16 +826,23 @@ def _rank(rank, rendezvous, cache_root, compile_decoder):
                     workspace=arena, context=context, latents=latents)
                 propose = PreparedDraft(weights, scratch, proposal, pool, name="proposal14", **kwargs)
                 propose_short = PreparedDraft(weights, short_scratch, short, pool, name="proposal7", **kwargs)
-                assert propose.layers[0].self_attn.block.data_ptr() == propose_short.layers[0].self_attn.block.data_ptr()
-                assert propose.layers[0].self_attn.history.data_ptr() == propose_short.layers[0].self_attn.history.data_ptr()
                 markov = PreparedMarkov(weights, predecessor, runtime=markov_runtime,
                     coordinator=coordinator, session=session, name="markov512")
                 session.tune(show_progress=False)
+                initial_context = _ContextForward(initial_context, auxiliary, initial_counts, initial, config, shard)
+                commit_context = _ContextForward(commit_context, feedback, counts, commit, config, shard)
+                single_context = _ContextForward(single_context, one_feedback, one_counts, single, config, shard)
+                proposal_output = _DraftForward(propose, proposal, scratch)
+                short_output = _DraftForward(propose_short, short, short_scratch)
+                markov = _MarkovForward(markov, predecessor, config.vocabulary)
+                observed14 = _ObservedDraft(propose, proposal, rank)
+                observed7 = _ObservedDraft(propose_short, short, rank)
                 functions = dict(
-                    initial=_ContextForward(initial_context, auxiliary, initial_counts),
-                    commit=_ContextForward(commit_context, feedback, counts),
-                    single=_ContextForward(single_context, one_feedback, one_counts),
-                    proposal14=propose, proposal7=propose_short, markov512=markov, rotary=rotary_forward)
+                    initial=initial_context,
+                    commit=commit_context,
+                    single=single_context,
+                    proposal14=proposal_output, proposal7=short_output, markov512=markov, rotary=rotary_forward,
+                    observed14=observed14, observed7=observed7)
                 signatures = dict(
                     initial=GraphSignature("prefill", 2, auxiliary.shape[0]),
                     commit=GraphSignature("speculative", 2, BLOCK),
@@ -864,14 +850,16 @@ def _rank(rank, rendezvous, cache_root, compile_decoder):
                     proposal14=GraphSignature("speculative", 2, BLOCK),
                     proposal7=GraphSignature("speculative", 1, BLOCK),
                     markov512=GraphSignature("decode", 2, 1),
-                    rotary=GraphSignature("decode", len(positions), 1))
+                    rotary=GraphSignature("decode", len(positions), 1),
+                    observed14=GraphSignature("speculative", 2, BLOCK),
+                    observed7=GraphSignature("speculative", 1, BLOCK))
                 stream = torch.cuda.Stream(device=device)
                 graph_pool = storage.graph_pool.id
                 captured, compiled = capture_forwards(functions, signatures,
                     session=session, device=device, stream=stream,
                     pool=graph_pool, compile_decoder=compile_decoder, coordinator=coordinator,
                     cache_root=Path(cache_root),
-                    warmup_storage=storage, report_catalog=False)
+                    warmup_storage=storage, report_catalog=False, retain_forwards=True)
                 graphs.extend(captured.values())
                 assert set(compiled) == (set(functions) if compile_decoder else set())
                 session.freeze()
@@ -898,27 +886,28 @@ def _rank(rank, rendezvous, cache_root, compile_decoder):
                     _unchanged(pool, baseline)
 
                 for operation, metadata, output, graph, active in (
-                        (propose, proposal, scratch, graphs[3], [7, 7]),
-                        (propose_short, short, short_scratch, graphs[4], [7]),
-                        (propose, proposal, scratch, graphs[3], [7, 0]),
-                        (propose, proposal, scratch, graphs[3], [0, 7]),
-                        (propose, proposal, scratch, graphs[3], [0, 0])):
+                        (propose, proposal, proposal_output, graphs[3], [7, 7]),
+                        (propose_short, short, short_output, graphs[4], [7]),
+                        (propose, proposal, proposal_output, graphs[3], [7, 0]),
+                        (propose, proposal, proposal_output, graphs[3], [0, 7]),
+                        (propose, proposal, proposal_output, graphs[3], [0, 0])):
                     starts = [2047, 5][:len(active)]
                     mapped = [[3, -1], [5, -1]][:len(active)]
                     _metadata(metadata, starts, active, mapped, block=7, tokens=anchors[:len(active) * 7])
                     _poison(output.scratch_tensors())
                     _replay(graph, arena, device)
                     actual_hidden, actual_logits = output.hidden.clone(), output.logits.clone()
-                    bound = compiled.get("proposal14" if operation is propose else "proposal7")
+                    key = "observed14" if operation is propose else "observed7"
+                    bound = (compiled[key], functions[key]) if compile_decoder else None
                     if bound is None:
-                        operation()
+                        output()
                         _accuracy(output.hidden, actual_hidden, f"eager versus graph {active} hidden", rms=1e-5, peak=1e-4)
                         _accuracy(output.logits, actual_logits, f"eager versus graph {active} logits", rms=1e-5, peak=1e-4)
                     _unchanged(pool, baseline)
                     checked_hidden, checked_logits = _compose_and_check(weights, oracle, metadata, pool,
                         prepared=operation, bound=bound)
                     _unchanged(pool, baseline)
-                    reference = "compiled callable" if compile_decoder else "native composition"
+                    reference = "compiled primitive composition" if compile_decoder else "native composition"
                     _accuracy(actual_hidden, checked_hidden, f"graph versus {reference} {active} hidden", rms=1e-5, peak=1e-4)
                     _accuracy(actual_logits, checked_logits, f"graph versus {reference} {active} logits", rms=1e-5, peak=1e-4)
                     assert torch.isfinite(actual_logits).all()
@@ -956,12 +945,12 @@ def _rank(rank, rendezvous, cache_root, compile_decoder):
                         _unchanged(pool, committed)
                     starts = [2047 + accepted[0], 5 + accepted[1]]
                     _metadata(proposal, starts, [7, 7], pages, block=7, tokens=anchors)
-                    _poison(scratch.scratch_tensors())
+                    _poison(proposal_output.scratch_tensors())
                     _replay(graphs[3], arena, device)
                     _unchanged(pool, committed)
-                    captured_hidden, captured_logits = scratch.hidden.clone(), scratch.logits.clone()
+                    captured_hidden, captured_logits = proposal_output.hidden.clone(), proposal_output.logits.clone()
                     expected_hidden, expected_logits = _compose_and_check(weights, oracle, proposal, pool,
-                        prepared=propose, bound=compiled.get("proposal14"))
+                        prepared=propose, bound=(compiled["observed14"], observed14) if compile_decoder else None)
                     _unchanged(pool, committed)
                     _accuracy(captured_hidden, expected_hidden, f"after accepted {accepted} hidden", rms=1e-5, peak=1e-4)
                     _accuracy(captured_logits, expected_logits, f"after accepted {accepted} logits", rms=1e-5, peak=1e-4)
@@ -983,12 +972,12 @@ def _rank(rank, rendezvous, cache_root, compile_decoder):
                     compiled["single"]()
                     _unchanged(pool, resumed_cache)
                 _metadata(short, [2048], [7], pages[:1], block=7, tokens=anchors[:7])
-                _poison(short_scratch.scratch_tensors())
+                _poison(short_output.scratch_tensors())
                 _replay(graphs[4], arena, device)
                 _unchanged(pool, resumed_cache)
-                captured_hidden, captured_logits = short_scratch.hidden.clone(), short_scratch.logits.clone()
+                captured_hidden, captured_logits = short_output.hidden.clone(), short_output.logits.clone()
                 expected_hidden, expected_logits = _compose_and_check(weights, oracle, short, pool,
-                    prepared=propose_short, bound=compiled.get("proposal7"))
+                    prepared=propose_short, bound=(compiled["observed7"], observed7) if compile_decoder else None)
                 _unchanged(pool, resumed_cache)
                 _accuracy(captured_hidden, expected_hidden, "width-one resume hidden", rms=1e-5, peak=1e-4)
                 _accuracy(captured_logits, expected_logits, "width-one resume logits", rms=1e-5, peak=1e-4)

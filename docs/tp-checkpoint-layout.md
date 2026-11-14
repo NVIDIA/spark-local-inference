@@ -34,15 +34,18 @@ TP1, TP2, and TP4. The loader regroups blocks across the stacked up/gate seam.
 The TP4 down projection has ten logical scale columns. Native compute tails
 occupy reusable expansion scratch; they do not extend the stored checkpoint.
 
-The Qwen and GLM recipes use A4 expert execution. b12x expands their compressed
+The Qwen and GLM recipes use A4 expert execution by default. b12x expands their compressed
 scales directly into the native F8_128x4 layout. Its shared format also supports
-packed W4A16 and MXFP4 N64/N256 scale destinations. Ordinary MoE and GEMM kernels
+packed W4A16 and MXFP4 N64/N256 scale destinations; Qwen3.8 Flash prepared with
+`--force-moe-decode-a16` uses packed W4A16 experts for decode and verification.
+Ordinary MoE and GEMM kernels
 consume native scales without inline compressed-scale decoding.
 
 ## Preparation and replay
 
 `PreparedRoutedExperts` declares a scale-expansion plan for each route capacity
-and makes the consuming MoE request depend on it. Both sweeps time CUDA graph
+and makes the consuming MoE request depend on it. The scale-expansion and MoE
+execution tuning sweeps both time CUDA graph
 replay with live activation and routing producers; graph timing has separate
 selection keys. Small calls expand routed experts, and large calls expand all
 experts. The selected MoE binding retains expansion programs and expert-presence

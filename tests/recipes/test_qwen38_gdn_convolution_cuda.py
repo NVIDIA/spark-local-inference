@@ -20,8 +20,9 @@ def test_fused_convolution_records_follow_mutable_captured_metadata(width, world
     from ignition.components.recurrent import DeltaMetadata, _commit_convolution
     from ignition.components.state import StateLayout, StateStorage
     from ignition.preparation.triton import prepare_triton
+    from tests.tensor_examples import TensorExamples
 
-    device = torch.device("cuda")
+    device = torch.device("cuda:0")
     torch.manual_seed(241)
     key_heads, value_heads = 16 // world_size, 48 // world_size
     channels, tokens = (2 * key_heads + value_heads) * 128, 2 * width
@@ -49,6 +50,7 @@ def test_fused_convolution_records_follow_mutable_captured_metadata(width, world
     initial = stores[0].backing.clone()
     conv_offset = torch.tensor([layout.region("convolution").offset // 2], device=device, dtype=torch.int64)
     paths = []
+    recovery_buffers = TensorExamples(device)
     for storage in stores:
         mixed = torch.empty((tokens, channels), device=device, dtype=torch.bfloat16)
         output = torch.empty((tokens, value_channels), device=device, dtype=torch.bfloat16)
@@ -61,7 +63,8 @@ def test_fused_convolution_records_follow_mutable_captured_metadata(width, world
             conv_state=storage.region("convolution"), out=mixed)
         verify = PreparedRecoveredRecurrence(mixed_qkv=mixed, a=projected[:, gate_offset + value_heads:], b=projected[:, gate_offset:gate_offset + value_heads],
             A_log=a_log, dt_bias=bias, state=storage.region("recurrent"), metadata=metadata, output=output,
-            records=records[0], key_heads=key_heads, value_heads=value_heads, convolution=None if not paths else operands)
+            records=records[0], key_heads=key_heads, value_heads=value_heads,
+            convolution=None if not paths else operands, buffers=recovery_buffers)
         norm = PreparedGatedRMSNorm(output.view(tokens, value_heads, 128), projected[:, channels:gate_offset].view(tokens, value_heads, 128),
             norm_weight, gated.view(tokens, value_heads, 128), metadata.num_tokens, eps=1e-6, round_normalized=True)
         commit = PreparedGDNCommit(storage.backing, {0: storage.region("recurrent")}, records, metadata, counts,
@@ -71,6 +74,8 @@ def test_fused_convolution_records_follow_mutable_captured_metadata(width, world
             (1, 2, channels // 128), STRIDE=layout.row_bytes // 2, CHANNELS=channels, COLUMNS=18, BLOCK=128)
         paths.append(dict(mixed=mixed, output=output, gated=gated, records=records, operands=operands,
                           verify=verify, norm=norm, commit=commit, commit_conv=commit_conv))
+    for index in (8, 11):
+        assert paths[0]["verify"].prepare_args[index].data_ptr() == paths[1]["verify"].prepare_args[index].data_ptr()
     caps = short_conv.Caps(device=device, mode="decode", channels=channels, kernel_size=4,
         max_tokens=tokens, max_seqs=2, max_state_slots=3, max_speculative_tokens=15)
     plan = short_conv.plan(caps, invocation=short_conv.invocation_from_tensors(**paths[0]["operands"]))

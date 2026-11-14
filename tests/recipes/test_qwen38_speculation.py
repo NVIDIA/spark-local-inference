@@ -275,7 +275,7 @@ def test_sixteen_token_commit_preserves_records_histogram_rng_history_and_surviv
 @pytest.mark.parametrize("capacity", [1, 8, 13, 16, 32])
 @pytest.mark.parametrize("short", [False, True])
 @pytest.mark.parametrize("clipping", ["none", "budget", "eos", "inactive"])
-def test_package_capacity_bounds_publication_without_truncating_verified_prefix(capacity, short, clipping):
+def test_core_capacity_bounds_publication_without_truncating_verified_prefix(capacity, short, clipping):
     width = min(capacity, 4) if short else capacity
     state, acceptance, commit, records = example(width=width, vocab=64, budget=80, completion_capacity=capacity)
     acceptance.token_ids.copy_(commit.inputs + 1)
@@ -308,3 +308,23 @@ def test_package_capacity_bounds_publication_without_truncating_verified_prefix(
         assert commit.survival[1, [0, 1, 3]].eq(-1).all()
     else:
         assert commit.survival is None
+
+
+def test_functional_commit_uses_runtime_rows_and_token_limit():
+    state, acceptance, commit, records = example(width=4)
+    inputs = commit.inputs.clone()
+    class NoLogprobs:
+        def functional(self, **kwargs):
+            pass
+
+        def __call__(self):
+            pass
+
+    commit.logprobs = NoLogprobs()
+    commit.functional(dynamic_inputs=True)
+    result = commit(acceptance=acceptance, inputs=inputs,
+        slots=torch.tensor([2], dtype=torch.int32), generations=torch.tensor([7], dtype=torch.int64),
+        live_rows=torch.tensor([1], dtype=torch.int32), token_limits=torch.tensor([2], dtype=torch.int32))
+    assert result.emitted_count.tolist() == [2]
+    assert state.consumed_tokens[2] == 4
+    assert records[1, 2, 8] == 2

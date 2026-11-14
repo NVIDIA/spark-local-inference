@@ -11,7 +11,7 @@ from ignition.recipes.declaration import Checkpoint, RankCosts, RankUsage, Recip
 
 
 def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_graphs=False,
-            package_storage=None, ranks=None):
+            core_storage=None, ranks=None):
     from ignition.preparation.rank_group import prepare_group
     from .bootstrap import PreparationConfig, prepare_rank
 
@@ -24,7 +24,8 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         "draft_head_quantization": speculation.draft_head_quantization,
         "markov_head_quantization": speculation.markov_head_quantization,
         "vocabulary_parallel_sampling": speculation.vocabulary_parallel_sampling}
-    config = PreparationConfig(collective_tuning=plan.collective_tuning,
+    config = PreparationConfig(mtp_only=plan.speculation is not None and plan.speculation.mtp_only,
+        collective_tuning=plan.collective_tuning,
         collective_ladder=plan.collective_ladder, prompt_logprobs=plan.prompt_logprobs,
         compile_workers=plan.compile_workers, autotune_effort=plan.autotune_effort, tuning_replica=plan.tuning_replica,
         native_dense_activations=plan.native_dense_activations,
@@ -40,7 +41,7 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         dspark=speculation is not None,
         stream_overlap=plan.stream_overlap, expert_scale_compression=plan.expert_scale_compression,
         mla_compute_mode=plan.mla_compute_mode, **drafting)
-    return prepare_group(snapshot, config, prepare_rank, progress=progress, package_storage=package_storage,
+    return prepare_group(snapshot, config, prepare_rank, progress=progress, core_storage=core_storage,
                          ranks=ranks, checkpoint=plan.checkpoint)
 
 
@@ -67,6 +68,6 @@ RECIPE = Recipe(
     max_draft_tokens=7, max_images=4, image_bytes=32 << 20,
     # Single-row decode runs the shared expert on an auxiliary stream.
     stream_overlap=True,
-    ranks=MappingProxyType({world: RankCosts(3_043_840, 113_920, 8 << 30) for world in (3, 4)}),
-    plain_ranks=MappingProxyType({world: RankCosts(2_841_088, 113_920, 8 << 30) for world in (3, 4)}),
+    ranks=MappingProxyType({world: RankCosts(3_043_840, 113_920, 8 << 30) for world in (3, 4, 6)}),
+    plain_ranks=MappingProxyType({world: RankCosts(2_841_088, 113_920, 8 << 30) for world in (3, 4, 6)}),
 )

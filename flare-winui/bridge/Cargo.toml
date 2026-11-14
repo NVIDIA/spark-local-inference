@@ -1,0 +1,20 @@
+[package]
+name = "flare-winui-bridge"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+name = "flare_winui_bridge"
+crate-type = ["staticlib"]
+
+[dependencies]
+flare = { path = "../../flare" }
+
+[profile.release]
+strip = "symbols"
+
+[dev-dependencies]
+tempfile = "3"

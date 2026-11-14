@@ -34,6 +34,7 @@ from b12x._lib.program_cache import program_cache
 from b12x.preparation import PreparedCall
 from b12x.preparation.types import plan_from_handle, require_prepared
 
+from ignition.preparation.persistent import persistent_empty, persistent_zeros
 from ignition.preparation.scratch import ScratchArena, planned_scratch, prime_owners
 from ignition.preparation.tensor_metadata import record_numeric_tensor
 from ignition.preparation.tuning import benchmark_resource, declare, register_finalizer
@@ -162,7 +163,7 @@ def _interleaved_scales(scales, permutation):
     from flashinfer.fp4_quantization import block_scale_interleave
 
     experts, rows, columns = scales.shape
-    output = torch.empty((experts, rows, columns), dtype=torch.uint8, device=scales.device)
+    output = persistent_empty((experts, rows, columns), dtype=torch.uint8, device=scales.device)
     flat = output.view(experts, -1)
     for start in range(0, experts, _CHUNK):
         part = scales[start:start + _CHUNK].view(torch.uint8)
@@ -209,15 +210,17 @@ def prepare_trtllm_nvfp4_experts(w13, s13, w2, s2, scale_vectors, *, swiglu_limi
     scales2 = _interleaved_scales(s2, s2_rows.to(w13.device)).view(torch.float8_e4m3fn)
     gate = w13_global / a1
     device = w13.device
-    as_device = partial(torch.as_tensor, dtype=torch.float32, device=device)
+    def as_device(values):
+        values = torch.as_tensor(values, dtype=torch.float32)
+        return persistent_empty(values.shape, dtype=values.dtype, device=device).copy_(values)
     return TrtllmNvfp4Experts(
         w13=w13, w13_scale=scales13, w2=w2, w2_scale=scales2,
         input_global_scale=as_device(a1[:1] if shared_input_scale else a1),
         output1_scale=as_device(a2 * gate),
         output1_gate_scale=as_device(gate),
         output2_scale=as_device(w2_global / a2),
-        gate_alpha=torch.ones(experts, dtype=torch.float32, device=device),
-        gate_beta=None if swiglu_limit is None else torch.zeros(experts, dtype=torch.float32, device=device),
+        gate_alpha=persistent_empty((experts,), dtype=torch.float32, device=device).fill_(1),
+        gate_beta=None if swiglu_limit is None else persistent_zeros((experts,), dtype=torch.float32, device=device),
         # trtllm-gen clamps raw FC1 accumulators, before the gate dequantization scale.
         clamp_limit=None if swiglu_limit is None else as_device(float(swiglu_limit) / gate),
     )
@@ -236,7 +239,8 @@ def prepare_cute_w4a16_experts(w13, s13, w2, s2, w13_global, w2_global, *, swigl
     storage13 = _interleaved_scales(s13, rows)
     storage2 = _interleaved_scales(s2, None)
     device = w13.device
-    alphas = tuple(torch.as_tensor(_vector(v, experts, device, name), dtype=torch.float32, device=device)
+    alphas = tuple(persistent_empty((experts,), dtype=torch.float32, device=device).copy_(
+                       _vector(v, experts, device, name).to(torch.float32))
                    for v, name in ((w13_global, "FC1 weight global scales"),
                                    (w2_global, "FC2 weight global scales")))
     return CuteW4A16Experts(
@@ -404,12 +408,11 @@ def _route_reduction_job(query, ordinal):
 class _TrtllmNvfp4State:
     """One trtllm-gen tactic over NVFP4 activations quantized into caller scratch.
 
-    ``run`` finalizes inside trtllm-gen. ``stage_rows`` leaves FC2's
-    permuted rows unreduced, in trtllm-gen's graph-local pool, until the next
-    ``reduce`` folds the routed sum into the shared expert's output with one
-    kernel, in trtllm-gen's summation order. Flare's compiled-forward storage
-    calls return no values, so the rows pass through the state; both custom
-    ops mutate the routed scratch, which orders them.
+    ``run`` finalizes inside trtllm-gen. ``stage_rows`` leaves FC2's permuted
+    rows in caller-owned body buffers. ``reduce`` consumes those rows and their
+    permutation to fold the routed sum into the shared expert's output in
+    trtllm-gen's summation order. Bound calls retain the staged buffers until
+    reduction; functional calls carry them explicitly between operations.
     """
 
     implementation = "trtllm_nvfp4"
@@ -426,7 +429,7 @@ class _TrtllmNvfp4State:
         # Load the compiled reduction while preparing; serving freezes kernel resolution.
         self.reduction = load_programs(compile_route_reduction(query.num_tokens, query.hidden_size,
                                                                query.top_k, ordinal))
-        self.routed_quantize = self.routed_reduction = self.unit_weights = None
+        self.routed_quantize = self.routed_reduction = None
         tokens = query.num_tokens
         if query.routed_inputs:
             tokens *= query.top_k
@@ -434,15 +437,50 @@ class _TrtllmNvfp4State:
                 query.num_tokens, query.hidden_size, query.top_k, ordinal))
             self.routed_reduction = load_programs(compile_route_reduction(
                 query.num_tokens, query.hidden_size, query.top_k, ordinal, False))
-            self.unit_weights = torch.ones((tokens, 1), dtype=torch.float32, device=experts.device)
-        # trtllm-gen takes a zero-width output when it leaves FC2 rows unfinalized.
-        self.unfinalized = torch.empty((tokens, 0), dtype=torch.bfloat16, device=experts.device)
         self.staged = None
+        self._prepare_buffer_layout(tokens)
+
+    def _native(self, values, scales, ids, weights, output, finalize, metadata=(), body=(), prepare=False):
+        e, q = self.experts, self.query
+        routing, method, activation = self.enums
+        return self.moe(routing, None, ids, weights, None, values, scales,
+            e.w13, e.w13_scale, None, None, e.gate_alpha, e.gate_beta, e.clamp_limit,
+            e.w2, e.w2_scale, None, e.output1_scale, e.output1_gate_scale, e.output2_scale,
+            None, q.num_experts, 1 if q.routed_inputs else q.top_k, 0, None, None, q.intermediate_size, 0,
+            q.num_experts, None, method, finalize, True, activation, output, self.tactic,
+            True, None, list(metadata), list(body), prepare, None, None)
+
+    def _prepare_buffer_layout(self, tokens):
+        from flashinfer.fused_moe.core import trtllm_moe_allocate_routing_metadata
+        from flashinfer.tllm_enums import RoutingInputMode
+
+        q, device = self.query, self.experts.device
+        top_k = 1 if q.routed_inputs else q.top_k
+        ids = torch.empty((tokens, top_k), dtype=torch.int32, device=device)
+        weights = torch.ones((tokens, top_k), dtype=torch.float32, device=device)
+        metadata = trtllm_moe_allocate_routing_metadata(ids, num_experts=q.num_experts, top_k=top_k,
+            local_expert_offset=0, num_local_experts=q.num_experts, tile_n=self.tactic[0],
+            routing_input_mode=RoutingInputMode.UnpackedPrecomputed, topk_weights=weights)
+        values = torch.empty((tokens, q.hidden_size // 2), dtype=torch.uint8, device=device)
+        scales = torch.empty((tokens, q.hidden_size // 16), dtype=torch.float8_e4m3fn, device=device)
+        unfinalized = torch.empty((tokens, 0), dtype=torch.bfloat16, device=device)
+        body = self._native(values, scales, ids, weights, unfinalized, False, metadata.tensors(), prepare=True)
+        body = [item if isinstance(item, torch.Tensor) else torch.from_dlpack(item) for item in body]
+        layouts = [(tuple(t.shape), t.dtype) for t in (*metadata.tensors(), *body,
+            weights if q.routed_inputs else weights[:0], unfinalized)]
+        layouts[3] = ((0,), torch.float32)
+        self.buffer_layouts = tuple(layouts)
+
+    def allocate_buffers(self, device):
+        buffers = [torch.empty(shape, dtype=dtype, device=device) for shape, dtype in self.buffer_layouts]
+        if self.query.routed_inputs:
+            buffers[16].fill_(1)
+        return buffers
 
     def scratch_bytes(self):
         return _scratch_bytes(self.query)
 
-    def _launch(self, a, topk_ids, topk_weights, output, scratch, finalize):
+    def _launch(self, a, topk_ids, topk_weights, output, scratch, finalize, buffers):
         e, q = self.experts, self.query
         tokens, hidden = a.shape
         if q.routed_inputs:
@@ -453,44 +491,48 @@ class _TrtllmNvfp4State:
         if q.routed_inputs:
             self.routed_quantize[(triton.cdiv(tokens, 4), triton.cdiv(hidden, 1024), 1)](
                 a, topk_ids, e.input_global_scale, values, scales, tokens, hidden, q.top_k)
-            topk_ids, topk_weights = topk_ids.view(tokens, 1), self.unit_weights
+            topk_ids, topk_weights = topk_ids.view(tokens, 1), buffers[16]
         else:
             self.quantize(a, e.input_global_scale, values, scales, 16, False, False, False, False, True, 0)
         scales = scales[:tokens * hidden // 16].view(torch.float8_e4m3fn).view(tokens, hidden // 16)
-        routing, method, activation = self.enums
-        return self.moe(routing, None, topk_ids, topk_weights, None, values, scales,
-                        e.w13, e.w13_scale, None, None, e.gate_alpha, e.gate_beta, e.clamp_limit,
-                        e.w2, e.w2_scale, None, e.output1_scale, e.output1_gate_scale, e.output2_scale,
-                        None, q.num_experts, 1 if q.routed_inputs else q.top_k, 0, None, None, q.intermediate_size, 0,
-                        q.num_experts, None, method, finalize, True, activation, output, self.tactic,
-                        True, None, [], [], False, None, None)
+        metadata = list(buffers[:9])
+        metadata[3] = topk_weights
+        _trtllm().trtllm_moe_populate_routing_metadata_multi_tile(topk_ids, q.num_experts,
+            1 if q.routed_inputs else q.top_k, 0, q.num_experts, [self.tactic[0]], metadata,
+            self.enums[0], topk_weights)
+        return self._native(values, scales, topk_ids, topk_weights, output, finalize, metadata, buffers[9:16])
 
-    def run(self, a, topk_ids, topk_weights, output, scratch):
+    def run(self, a, topk_ids, topk_weights, output, scratch, buffers=None):
+        buffers = self.allocate_buffers(a.device) if buffers is None else buffers
         if not self.query.routed_inputs:
-            self._launch(a, topk_ids, topk_weights, output, scratch, True)
+            self._launch(a, topk_ids, topk_weights, output, scratch, True, buffers)
             return
-        self.stage_rows(a, topk_ids, topk_weights, scratch)
-        (rows, permuted), self.staged = self.staged, None
+        rows, permuted = self.stage_rows(a, topk_ids, topk_weights, scratch, buffers)
         tokens, hidden = output.shape
         self.routed_reduction[(tokens, hidden // _REDUCE_BLOCK, 1)](
             rows, permuted, topk_weights, output, output, hidden, self.query.top_k, _REDUCE_BLOCK, False)
 
-    def stage_rows(self, a, topk_ids, topk_weights, scratch):
+    def stage_rows(self, a, topk_ids, topk_weights, scratch, buffers=None):
         """Run quantization, routing, FC1 and FC2, keeping the unreduced FC2 rows for ``reduce``."""
-        if self.staged is not None:
+        bound = buffers is None
+        if bound and self.staged is not None:
             raise RuntimeError("SM103 routed rows were staged twice without a reduction")
-        result = self._launch(a, topk_ids, topk_weights, self.unfinalized, scratch, False)
+        buffers = self.allocate_buffers(a.device) if buffers is None else buffers
+        result = self._launch(a, topk_ids, topk_weights, buffers[17], scratch, False, buffers)
         rows, permuted = (t if isinstance(t, torch.Tensor) else torch.from_dlpack(t)
                           for t in (result[0], result[2]))
         if (rows.ndim != 2 or rows.shape[1] != self.query.hidden_size or not rows.is_contiguous()
                 or permuted.numel() != topk_ids.numel()):
             raise RuntimeError("trtllm-gen FC2 rows differ from their planned geometry")
-        self.staged = rows, permuted.view(-1)
+        if bound:
+            self.staged = rows, permuted.view(-1), buffers
+        return rows, permuted.view(-1)
 
-    def reduce(self, topk_weights, shared, output):
-        if self.staged is None:
-            raise RuntimeError("SM103 routed reduction requires staged FC2 rows")
-        (rows, permuted), self.staged = self.staged, None
+    def reduce(self, topk_weights, shared, output, *, rows=None, permuted=None):
+        if rows is None:
+            if self.staged is None:
+                raise RuntimeError("SM103 routed reduction requires staged FC2 rows")
+            (rows, permuted, _), self.staged = self.staged, None
         tokens, hidden = output.shape
         self.reduction[(tokens, hidden // _REDUCE_BLOCK, 1)](
             rows, permuted, topk_weights, shared, output, hidden, self.query.top_k, _REDUCE_BLOCK, True)
@@ -511,16 +553,29 @@ class _CuteW4A16State:
 
         self.experts, self.query, self.tactic = experts, query, tuple(tactic)
         self.launch = partial(launch_w4a16_moe, activation_type=ActivationType.Swiglu)
+        from flashinfer.fused_moe.cute_dsl.blackwell.moe_w4a16 import _get_workspace
+
+        example = torch.empty((query.num_tokens, query.hidden_size), dtype=torch.bfloat16, device=experts.device)
+        workspace = _get_workspace(example, query.top_k, query.num_experts, query.num_experts,
+                                    query.intermediate_size, self.tactic[0][0][1])
+        self.sort_names = tuple(workspace.moe_sort_buffers)
+        self.buffer_layouts = tuple((tuple(t.shape), t.dtype) for t in
+            (*workspace.moe_sort_buffers.values(), workspace.hidden_workspace, workspace.intermediate))
 
     def scratch_bytes(self):
         return _scratch_bytes(self.query)
 
-    def run(self, a, topk_ids, topk_weights, output, scratch):
+    def run(self, a, topk_ids, topk_weights, output, scratch, buffers=None):
         e, q = self.experts, self.query
         clamp = {} if e.swiglu_limit is None else {"swiglu_limit": e.swiglu_limit}
+        options = {}
+        if buffers is not None:
+            from flashinfer.fused_moe.cute_dsl.blackwell.moe_w4a16 import _W4A16Workspace
+            options["workspace"] = _W4A16Workspace(dict(zip(self.sort_names, buffers[:-2], strict=True)),
+                                                  buffers[-2], buffers[-1])
         self.launch(a, topk_ids, topk_weights, e.w13, e.w13_scale, e.w13_alpha,
                     e.w2, e.w2_scale, e.w2_alpha, q.num_experts, q.num_experts, 0, output,
-                    use_fused_finalize=False, enable_pdl=True, tactic=self.tactic, **clamp)
+                    use_fused_finalize=False, enable_pdl=True, tactic=self.tactic, **clamp, **options)
 
 
 def _state_type(experts):
@@ -585,6 +640,52 @@ def _sm103_reduce_routes(topk_weights: torch.Tensor, shared: torch.Tensor, outpu
 @_sm103_reduce_routes.register_fake
 def _fake_sm103_reduce_routes(topk_weights, shared, output, scratch, plan_handle) -> None:
     pass
+
+
+@torch.library.custom_op("flare::sm103_experts_out", mutates_args=("output", "scratch", "buffers"))
+def _experts_out(a: torch.Tensor, ids: torch.Tensor, weights: torch.Tensor, output: torch.Tensor,
+                 scratch: torch.Tensor, buffers: list[torch.Tensor], plan_handle: int, stage: bool) -> None:
+    plan = plan_from_handle(plan_handle)
+    state = require_prepared(plan, plan.component_id, a.device)
+    if stage:
+        state.stage_rows(a, ids, weights, scratch, buffers)
+    else:
+        state.run(a, ids, weights, output, scratch, buffers)
+
+
+@_experts_out.register_fake
+def _fake_experts_out(a, ids, weights, output, scratch, buffers, plan_handle, stage):
+    pass
+
+
+@torch.library.custom_op("flare::sm103_reduce_rows", mutates_args=("output",))
+def _reduce_rows(rows: torch.Tensor, permutation: torch.Tensor, weights: torch.Tensor,
+                 shared: torch.Tensor, output: torch.Tensor, plan_handle: int) -> None:
+    plan = plan_from_handle(plan_handle)
+    require_prepared(plan, plan.component_id, output.device).reduce(
+        weights, shared, output, rows=rows, permuted=permutation)
+
+
+@_reduce_rows.register_fake
+def _fake_reduce_rows(rows, permutation, weights, shared, output, plan_handle):
+    pass
+
+
+@dataclass(frozen=True)
+class StagedRoutedExperts:
+    source: torch.Tensor
+    ids: torch.Tensor
+    weights: torch.Tensor
+    scratch: torch.Tensor
+    buffers: list[torch.Tensor]
+
+    @property
+    def rows(self):
+        return self.buffers[13]
+
+    @property
+    def permutation(self):
+        return self.buffers[1]
 
 
 @dataclass(frozen=True, eq=False)
@@ -696,6 +797,7 @@ class Sm103RoutedExperts:
             if tensor is not None:
                 record_numeric_tensor(tensor)
         self.router = router
+        self.preparation_arena = workspace
         self.source, self.output, self.scratch = source, output, None
         self.output_source = output
         self.plan = plan_routed_experts(experts, tokens=source.shape[0], top_k=ids.shape[1])
@@ -719,20 +821,67 @@ class Sm103RoutedExperts:
 
         register_finalizer(session, finalize, workspace=workspace)
 
+    def functional(self, *, session):
+        """Allocate native body buffers and expose staged rows in the forward."""
+        if self.output is not None:
+            self.output_layout = (tuple(self.output.shape), self.output.stride(), self.output.dtype)
+            self.output = self.output_source = self.source = None
+            if self.router is not None:
+                self.router.functional(session=session)
+            register_finalizer(session, self._finalize_functional, workspace=self.preparation_arena)
+        return self
+
+    def _finalize_functional(self):
+        self.buffer_layouts = self.binding.state.buffer_layouts
+        self.workspace_nbytes = self.binding.state.scratch_bytes()
+        self.binding = self.scratch = None
+        self.preparation_arena = None
+
+    def _local_buffers(self, source):
+        buffers = [torch.empty(shape, dtype=dtype, device=source.device) for shape, dtype in self.buffer_layouts]
+        if self.plan.query.routed_inputs:
+            buffers[16].fill_(1)
+        return buffers
+
     @property
     def reduces_into_shared(self) -> bool:
         """Whether ``stage_rows``/``reduce`` can replace the finalized output plus a shared add."""
         return self.plan.contract is TRTLLM_CONTRACT
 
-    def route(self, logits: torch.Tensor) -> None:
-        self.router(logits)
+    def route(self, logits: torch.Tensor, *, image_mask=None, num_valid_tokens=None):
+        return self.router(logits, image_mask=image_mask, num_valid_tokens=num_valid_tokens)
 
-    def __call__(self) -> torch.Tensor:
+    def __call__(self, source=None, ids=None, weights=None, *, router_logits=None, selected_logits=None,
+                 image_mask=None, num_valid_tokens=None):
+        if self.output is None:
+            if source is None or ids is None or weights is None:
+                raise ValueError("functional SM103 experts require source, expert IDs, and route weights")
+            shape, stride, dtype = self.output_layout
+            output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
+            scratch = torch.empty(self.workspace_nbytes, dtype=torch.uint8, device=source.device)
+            _experts_out(source, ids, weights, output, scratch, self._local_buffers(source), self.plan.handle, False)
+            return output
         return self.binding.run()
 
-    def stage_rows(self) -> torch.Tensor:
+    def stage_rows(self, source=None, ids=None, weights=None):
         """Run the routed experts up to unreduced FC2 rows; returns the scratch that orders ``reduce``."""
+        if self.output is None:
+            if not self.reduces_into_shared:
+                raise ValueError("staged routed rows require the trtllm NVFP4 implementation")
+            if source is None or ids is None or weights is None:
+                raise ValueError("functional staged experts require source, expert IDs, and route weights")
+            scratch = torch.empty(self.workspace_nbytes, dtype=torch.uint8, device=source.device)
+            buffers = self._local_buffers(source)
+            _experts_out(source, ids, weights, buffers[17], scratch, buffers, self.plan.handle, True)
+            return StagedRoutedExperts(source, ids, weights, scratch, buffers)
         return self.binding.stage_rows()
 
-    def reduce(self, shared: torch.Tensor, output: torch.Tensor) -> torch.Tensor:
+    def reduce(self, shared, output=None, *, staged=None):
+        if self.output is None:
+            if staged is None:
+                raise ValueError("functional reduction requires explicit staged routed rows")
+            if output is None:
+                output = torch.empty_like(shared)
+            _reduce_rows(staged.rows, staged.permutation, staged.weights, shared, output, self.plan.handle)
+            return output
         return self.binding.reduce(shared, output)

@@ -32,7 +32,7 @@ def test_completion_buffers_derive_all_output_axes_from_records(tokens):
         assert "completion_speculative_survival" not in outputs.buffers()
     else:
         assert outputs.speculative_survival.shape == (2, 4, tokens - 1)
-    private = outputs.private(outputs.private_storage.cursor())
+    private = outputs.private()
     assert private.token_capacity == tokens
     assert private.records.shape == outputs.records.shape
     assert private.logprobs.shape == outputs.logprobs.shape
@@ -62,7 +62,7 @@ def test_record_geometry_rejects_empty_tokens_and_capacity_overflow_before_alloc
 
 @pytest.mark.parametrize("tokens", [1, 8, 13, 16, 32])
 def test_prepared_execution_exports_explicit_capacity_and_protobuf_roundtrips(tokens, monkeypatch):
-    from ignition.preparation import runtime_package_pb2 as p
+    from ignition.preparation import runtime_core_pb2 as p
 
     buffers = dict(_execution().buffers)
     buffers["completion_records"] = _tensor("int64", (2, 4, 16 + tokens))

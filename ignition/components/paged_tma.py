@@ -69,6 +69,7 @@ class PreparedTma:
         geometry = Query(q.shape[0], q.shape[1], key.shape[2], q.shape[2], key.shape[1],
                          output_gate is not None, q.dtype == torch.float8_e4m3fn)
         self.arguments = q, key, value, pages, lengths, cu, output
+        device = q.device
         scratch_bytes = (0 if geometry.fp8_input else q.numel()) + 4 * lengths.numel()
 
         def materialize(tile):
@@ -78,16 +79,16 @@ class PreparedTma:
                 in_dtype=torch.float8_e4m3fn, out_dtype=torch.bfloat16,
                 num_qo_heads=geometry.heads, num_kv_heads=geometry.kv_heads,
                 head_dim=geometry.dim, is_causal=True, kv_tile=128, q_tile=tile,
-                num_tokens_per_page=geometry.page, device=q.device,
+                num_tokens_per_page=geometry.page, device=device,
                 balanced_scheduler=True, kv_layout="NHD", with_output_gate=geometry.gated)
             return State(geometry, kernel)
 
-        self.plan = native_plan(contract=CONTRACT, query=geometry, device=q.device,
+        self.plan = native_plan(contract=CONTRACT, query=geometry, device=device,
             scratch_bytes=lambda tile: scratch_bytes, materialize=materialize)
 
         def call(state):
             scratch = planned_scratch((scratch_buffer_spec(CONTRACT.component_id,
-                nbytes=scratch_bytes, device=q.device),), workspace)
+                nbytes=scratch_bytes, device=device),), workspace)
             return PreparedCall(run=lambda: state.run(*self.arguments, scratch, output_gate),
                 owners=prime_owners(workspace, scratch, self.arguments, output_gate))
 

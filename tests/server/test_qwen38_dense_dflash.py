@@ -1,10 +1,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""DFlash2 acceptance and complete prefix restore through an exported Qwen package.
+"""DFlash2 acceptance and complete prefix restore through an exported Qwen core.
 
 Set FLARE_RUN_CUDA_TESTS=1, FLARE_QWEN_DFLASH_TEST_URL, and
-FLARE_QWEN_DFLASH_SNAPSHOT. Serve a Qwen3.8-27B package through flare run
+FLARE_QWEN_DFLASH_SNAPSHOT. Serve a Qwen3.8-27B core through flare run
 with fixed verification (--no-mtp-adaptive-verification). Set
 FLARE_QWEN_DFLASH_VERIFY_WIDTH to the prepared verification width, including
 the pending token: 8 by default, or 16 for fifteen drafts.
@@ -22,7 +22,7 @@ from tests.server.test_muse_spark_dflash import rounds, test_dflash_full_prompt_
 
 pytestmark = pytest.mark.skipif(
     os.environ.get("FLARE_RUN_CUDA_TESTS") != "1" or not os.environ.get("FLARE_QWEN_DFLASH_TEST_URL"),
-    reason="requires an exported Qwen3.8-27B DFlash2 package running through flare run",
+    reason="requires an exported Qwen3.8-27B DFlash2 core running through flare run",
 )
 
 

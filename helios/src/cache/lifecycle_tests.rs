@@ -75,6 +75,7 @@ impl Fixture {
                                 direct_pins: node.direct_pins,
                                 pins: node.pins,
                                 accessed: node.accessed,
+                                role: node.role,
                             },
                         )
                     })
@@ -488,9 +489,9 @@ impl Fixture {
 
     fn key(&self) -> Vec<u64> {
         let mut key = self.projection();
-        // Relative access order preserves eviction choices without an unbounded clock.
+        // Relative retention order preserves eviction choices without an unbounded clock.
         let mut ordered: Vec<_> = self.cache.nodes.values().collect();
-        ordered.sort_by_key(|node| (node.accessed, node.id));
+        ordered.sort_by_key(|node| (node.retention_rank(), node.id));
         key.extend(ordered.iter().map(|node| self.semantic(node.id) as u64));
         key
     }

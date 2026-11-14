@@ -3,7 +3,7 @@
 
 """DFlash width transitions and complete prefix restores through native HTTP.
 
-Use the exported-package configuration documented in test_muse_spark.py, with
+Use the exported-core configuration documented in test_muse_spark.py, with
 seven drafts and fixed verification (--no-mtp-adaptive-verification). Run these
 metric-delta checks without unrelated requests to the same server.
 """

@@ -26,7 +26,7 @@ def _rank(rank, world, rendezvous, snapshot):
         create_all_reduce_runtime,
     )
     from ignition.preparation.compilation import compile_forward
-    from ignition.preparation.package_storage import PackageStorage
+    from ignition.preparation.core_storage import CoreStorage
     from ignition.preparation.scratch import ScratchArena
     from ignition.preparation.tuning import RecordedPreparationSession
     from ignition.recipes.step5.attention import PreparedAttention
@@ -46,7 +46,7 @@ def _rank(rank, world, rendezvous, snapshot):
     dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=world,
                             timeout=timedelta(minutes=5))
     try:
-        with PackageStorage(rank=rank, world=world, device=rank) as storage:
+        with CoreStorage(rank=rank, world=world, device=rank) as storage:
             coordinator = CollectivePreparation(dist.group.WORLD)
             runtime = create_all_reduce_runtime(dist.group.WORLD, device, max_tokens=49,
                 hidden_size=config.hidden, element_bytes=4, ipc=storage.peer_storage)

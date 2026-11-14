@@ -16,14 +16,18 @@ def fields(rows, rank, variation):
     return first.view(torch.bfloat16), second.view(torch.float32)
 
 
+@pytest.mark.parametrize("functional", [False, True])
 @pytest.mark.parametrize("rows", [16, 128, 1025, 4096])
-def test_paired_columns_preserve_bits_and_partial_chunks(monkeypatch, rows):
+def test_paired_columns_preserve_bits_and_partial_chunks(monkeypatch, rows, functional):
     runtime = SimpleNamespace(world_size=16, heads_per_rank=1, query_head_dim=336, max_batch_size=1024,
                               offset=0, variation=0)
 
     class Gather:
         def __init__(self, source, output, **kwargs):
             self.output = output
+
+        def functional(self, *, session):
+            self.output = None
 
         def __call__(self, source):
             count = source.shape[0]
@@ -32,8 +36,12 @@ def test_paired_columns_preserve_bits_and_partial_chunks(monkeypatch, rows):
                 first, second = fields(rows, rank, runtime.variation)
                 parts.append(torch.cat((first, second.view(torch.bfloat16)), dim=1)[runtime.offset:runtime.offset + count])
             assert torch.equal(source.view(torch.int16), parts[0].view(torch.int16))
-            self.output.copy_(torch.cat(parts, dim=1))
+            result = torch.cat(parts, dim=1)
+            if self.output is not None:
+                self.output.copy_(result)
+                result = self.output
             runtime.offset += count
+            return result
 
     monkeypatch.setattr(column_pair_gather, 'PreparedAllGather', Gather)
     first, second = fields(rows, 0, 0)
@@ -44,14 +52,17 @@ def test_paired_columns_preserve_bits_and_partial_chunks(monkeypatch, rows):
         runtime=runtime, session=None, coordinator=None, name='columns', buffers=buffers)
     assert operation.send.shape == (min(rows, 1024), 336)
     assert operation.received.shape == (min(rows, 1024), 5376)
+    if functional:
+        operation.functional(session=None)
     for variation in range(3):
         runtime.variation, runtime.offset = variation, 0
         left, right = fields(rows, 0, variation)
         first.copy_(left)
         second.copy_(right)
-        operation.send.fill_(torch.nan)
-        operation.received.fill_(torch.nan)
-        operation()
+        if not functional:
+            operation.send.fill_(torch.nan)
+            operation.received.fill_(torch.nan)
+        output_first, output_second = operation(first, second) if functional else operation()
         expected_first = torch.cat([fields(rows, rank, variation)[0] for rank in range(16)], dim=1)
         expected_second = torch.cat([fields(rows, rank, variation)[1] for rank in range(16)], dim=1)
         assert torch.equal(output_first.view(torch.int16), expected_first.view(torch.int16))
