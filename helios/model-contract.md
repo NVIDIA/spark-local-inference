@@ -2,7 +2,9 @@
 
 Helios serves captured programs through one `ModelRuntime` and one `Server`.
 Ignition recipes declare their inputs, storage, frontend syntax, and capacities
-in `ModelIndex.contract`, a typed Protobuf `ServingContract`. Its versioned
+in a typed Protobuf `ServingContract`: `DeploymentBody.contract` in
+payload-format cores and `ModelIndex.contract` in logical-resource cores
+([core carriers](manifest.md#native-runtime-core)). Its versioned
 `ModelContract` is decoded as `model::PreparedContract`; there is no per-model
 native implementation or model-name dispatch.
 
@@ -25,7 +27,8 @@ capacities, loads each rank's resources, and backs declared cache storage.
 `NativeModel::manifests` exposes the resulting execution geometry.
 `Bootstrap::load` validates the prepared contract and loads the tokenizer, chat
 template, and typed frontend settings. `Server::start` starts the native model
-workers and listener. Tensor-parallel peers use `RankPeers::Threads`.
+workers and listener. Tensor-parallel peers on the serving host use
+`RankPeers::Threads`; ranks on other hosts connect as `RankPeers::Processes`.
 
 The native owner retains graphs, CUDA contexts, weights, cache storage, mapped
 allocations, and workspaces through confirmed execution drain. Serving performs
@@ -41,9 +44,10 @@ version domains. Execution ABI labels do not gate loading; the runtime validates
 the declared layouts and operations. Engine upgrades must preserve support for
 previously supported models without re-export.
 
-Payload format 2 and signed format 6 encode each executable resource as one
-mandatory zstd level-3 frame. Signed format 4 retains its authenticated AES-GCM
-chunk reader. In payload cores, the signed `ExecutableResource` binds its
+Payload format 2 and logical-resource cores with `ProtectedIndex.version` 6
+encode each executable resource as one mandatory zstd level-3 frame.
+Logical-resource cores with `ProtectedIndex.version` 4 are read through the
+authenticated AES-GCM chunk reader. In payload cores, the signed `ExecutableResource` binds its
 stored frame, signed decoded length,
 resource id and kind. `chunk_nbytes` is 4 MiB and `chunk_sha256` covers
 compressed bytes with count `ceil(stored.nbytes / 4 MiB)`. The decoder window is
@@ -93,8 +97,8 @@ registered transport destination and an enum-selected source:
 
 | Sources | Values supplied by shared packing |
 |---|---|
-| Request identity and lane geometry | Slot, generation, live-row count, query length, sampling decision, and mixed prefill row |
-| Tokens and positions | Prompt tokens, completed pending token, prompt positions, and image feature/context indices |
+| Request identity and lane geometry | Slot, generation, live-row count, query length, speculative prefix ceiling, sampling decision, and mixed prefill row |
+| Tokens and positions | Prompt tokens, scored-prefill target tokens, completed pending token, prompt positions, image feature/context indices, and image feature slot |
 | Cache bindings | Page tables, live state rows, restore source, snapshot destination, and consumed-token endpoints |
 | Admission sampling | Seed bits, sampling parameters, output limit, EOS IDs, full prompt histogram, and grammar mask |
 | Copied proposals | Candidate IDs, count, generation, consumed endpoint, and per-position grammar masks |
@@ -223,6 +227,7 @@ Tool parsers, reasoning parsers, image preparation, and image layouts each have
 an independent enum selector. Implementations are reusable syntax or image
 algorithms, not model identities. Qwen Coder function tags, GLM argument tags,
 and DSML tool syntax may be paired independently with think-tag reasoning.
+XTML think reasoning requires the XTML tool parser.
 Wrapping newlines, tag separators, assistant boundaries, and reasoning terminal
 markers are explicit syntax data. A reasoning terminal marker must be the
 declared tool syntax's opener. Reasoning delimiters that the frontend tokenizer

@@ -12,6 +12,7 @@ from threading import Event, Thread
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from ignition.preparation.execution import GraphSignature
 from ignition.preparation.model import PreparedModel
@@ -36,7 +37,7 @@ def model_fixture(monkeypatch, *, synchronize=None, server=None):
         device=0,
         graphs={"decode": Resource("graph", events)},
         buffers={"frame_index": object(), "submission_sequence": object(),
-                 "completion_records": SimpleNamespace(shape=(2, 4, 32))},
+                 "completion_records": torch.empty((2, 4, 32), dtype=torch.int64)},
         signatures={"decode": GraphSignature("decode", 1, 1)},
         resources=(weights,),
         server_config={},
@@ -321,3 +322,24 @@ def test_moe_decode_a16_requires_separate_graph_roles_and_aligned_experts():
         PreparationConfig(force_moe_decode_a16=True, mixed_prefill=True)
     with pytest.raises(ValueError, match="intermediate width divisible by 64"):
         PreparationConfig(devices=(0, 1, 2, 3), force_moe_decode_a16=True)
+
+
+def test_prepared_model_retains_persistent_storage_until_confirmed_drain(monkeypatch):
+    from ignition.preparation.persistent import _ACTIVE_STORAGE
+
+    storage = Resource("persistent storage", [])
+    token = _ACTIVE_STORAGE.set(storage)
+    try:
+        model, events, _ = model_fixture(monkeypatch)
+    finally:
+        _ACTIVE_STORAGE.reset(token)
+    storage.events = events
+    model._startup_undrained = True
+    with pytest.raises(RuntimeError, match="resources remain retained"):
+        model.close()
+    assert not events
+    model._startup_undrained = False
+    model.close()
+    assert events == ["synchronize", "graph", "session", "table", "persistent storage"]
+    model.close()
+    assert events.count("persistent storage") == 1

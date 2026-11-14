@@ -63,8 +63,7 @@ Recurrent state, compressor accumulators, and hidden activations retain their
 model-specific precision. Cache writers and attention readers use matching
 scales where required, and memory planning includes each cache's declared page
 precision and partial-page snapshots.
-Export a core to use these cache layouts; existing cores retain the
-layouts captured when they were prepared.
+A core's cache layouts are fixed when it is prepared.
 
 ## Environment setup
 
@@ -86,6 +85,8 @@ installations are also accepted.
 The fixes preserve cooperative CUDA launch attributes in serialized kernels,
 match Triton's 150-character cache filenames, retain dependencies on mutated
 inputs when replacing kernel templates, and reduce compiler bookkeeping costs.
+Inductor retains zeroed graph workspaces through the final graph operation, so
+its memory planner cannot reuse their storage while the graph still needs it.
 Triton's helper cache key uses machine, operating system, and interpreter pointer
 width without invoking `file`, avoiding subprocess probing under profiler injection.
 Compiled-forward and Torch graph cache identities include the runtime patches.
@@ -130,14 +131,16 @@ in `helios/Cargo.toml`. Its `flare` branch exposes normalized-message byte
 boundaries, advisory checkpoint hints, and numeric V4.1 reasoning effort.
 To update these crates, integrate upstream changes
 on that branch, validate the encoder, and update all three dependency revisions
-together. Refresh and commit `helios/Cargo.lock`, `flare/Cargo.lock`, and
-`heliopause/Cargo.lock`; run the Helios frontend/protocol tests and build Flare
-and Heliopause against the pinned revision. Compare rendered prompts and token
+together. Refresh and commit every lockfile that records the crates:
+`helios/Cargo.lock`, `flare/Cargo.lock`, `flare-cli/Cargo.lock`,
+`heliopause/Cargo.lock`, and `flare-winui/bridge/Cargo.lock`. Run the Helios
+frontend/protocol tests and build Flare and Heliopause against the pinned
+revision. Compare rendered prompts and token
 IDs with upstream when changing encoder behavior.
 
 The preparation dependency pins a revision of `local-inference-lab/flashinfer`
 in `pyproject.toml`; `uv.lock` records the same commit. To update FlashInfer,
-change that revision and run `uv lock --upgrade-core flashinfer-python`,
+change that revision and run `uv lock --upgrade-package flashinfer-python`,
 then sync the environment.
 For local FlashInfer development, install the sibling
 checkout explicitly with `uv pip install --python .venv/bin/python --no-deps -e ../flashinfer`;
@@ -156,8 +159,8 @@ Inspect GPU occupancy with `nvidia-smi` before preparation or loading. Select
 available GPUs explicitly on shared hosts. `--gpus 2` means one rank on GPU 2;
 `--gpus 0,1` means two ranks on GPUs 0 and 1. With `CUDA_VISIBLE_DEVICES` set,
 indices refer to the exposed device list. Each tensor-parallel size requires a
-separately prepared core; a TP2 core cannot be loaded as TP1. Qwen TP1 and TP2 and
-GLM TP4 have been exercised end to end; Qwen TP4 still requires model validation.
+separately prepared core; a TP2 core cannot be loaded as TP1. Qualified end to
+end: Qwen at TP1 and TP2, and GLM at TP4. Not qualified: Qwen at TP4.
 
 ## Preparation resources
 
@@ -199,8 +202,8 @@ SM120 GPUs with out-of-place BF16 reductions from 16 bytes through 8 MiB:
 Startup races in one preparation share fixture and timing storage. Cold races
 read an existing checkpoint allocation on the same GPU when it is at least
 twice the L2 cache size or 64 MiB, whichever is larger. If no allocation is large
-enough, the races use one shared eviction buffer. Re-export a core to reduce
-its resident startup storage with this preparation path.
+enough, the races use one shared eviction buffer. A core's resident startup
+storage is fixed at export.
 
 `--lock-gpu-clocks` locks each participating GPU to its maximum supported
 graphics frequency for the b12x tuning batch and actual Inductor autotuning
@@ -216,7 +219,7 @@ are not restored. Memory clocks and tuning caches are unchanged.
 Without extra tuning replicas, tensor-parallel ranks on identical GPUs divide
 each kernel race's candidates and adopt the fastest measured configuration.
 This applies within one host as well as across hosts. Fixed collective kernels
-still prepare on every participating rank.
+prepare on every participating rank.
 
 Set `[preparation] autotune_effort = "audit"` for a persistent setting; an
 explicit flag wins. The plan carries the setting to every preparation rank
@@ -235,7 +238,7 @@ Partial checkpoints require the same candidate program identities, effort,
 tuning shard count, and measurement settings. A kernel or predicate change
 invalidates the affected race's checkpoint. Completed selection caches remain
 usable independently of the tuning shard count. Resource-dependent cooperative
-launch rejections are retried after restart; fatal CUDA errors still require
+launch rejections are retried after restart; fatal CUDA errors require
 restarting preparation in fresh processes.
 
 `--compile-workers N` sets a positive CPU compiler process budget per host for
@@ -247,8 +250,8 @@ shared-memory limits on DGX Spark.
 
 Forward compilation allocates workers across each host after checking cached
 forwards. Ranks without a worker lend missing forwards to other
-ranks on that host; every serving rank still binds and captures its full catalog.
-Concurrency uses a 16 GiB host-RAM estimate per worker, plus device storage on
+ranks on that host; every serving rank binds and captures its full catalog.
+Concurrency uses a 32 GiB host-RAM estimate per worker, plus device storage on
 integrated GPUs. When that estimate admits no worker, one worker per host may
 start under the 2 GiB minimum host allowance plus integrated device storage.
 These allowances estimate compiler demand; actual peaks depend on the forward.
@@ -269,8 +272,8 @@ devices stay fixed. Serving ranks then compile and capture their forwards.
 Both GPU lists use `CUDA_VISIBLE_DEVICES` ordinals. Kernel compilation runs in
 CPU workers, independently of the number of tuning GPUs.
 
-Multi-host `--ranks` preparation retains its existing sharding and transport;
-`--tuning-gpus` is local-only and cannot be combined with it. An explicit
+`--tuning-gpus` is local-only and cannot be combined with multi-host `--ranks`
+preparation, whose ranks divide tuning candidates as described above. An explicit
 `--compile-workers` budget applies separately on each host.
 
 ## Exporting runtime cores
@@ -421,7 +424,7 @@ batches 1, 2, and 4, verification width eight, and consumed contexts 512, 2,048,
 cache and speculative state before each sample, outside CUDA event timing.
 The [benchmark CLI](cli-design.md#gpu-graph-latency-benchmark) defines workload
 selection, repetitions, seeds, and the equal-weight latency score. Native
-serving measurements still use an exported core with `flare run`.
+serving measurements use an exported core with `flare run`.
 
 To time a complete Inductor-compiled prefill graph at one exact chunk size:
 
@@ -454,14 +457,13 @@ Export Qwen with up to five MTP draft tokens per round:
 Qwen defaults to 32 concurrent requests, five MTP draft tokens, and 128 target-token
 rows, with explicit flags and configuration taking precedence. Verification is
 rectangular: the default catalog covers five drafts per request through batch 16
-and three drafts at batch 32. Already exported cores retain their captured
-capacities.
+and three drafts at batch 32. A core's capacities are fixed at export.
 
 `ignition export qwen3.8-flash --speculative-method dflash2` selects
 [`incoai/Qwen3.8-Flash-Next-DFlash2`](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2)
 at revision `a22a1744e85c17364dcc54a6a420af7135d4c7f6` instead of the checkpoint's
 MTP module. Draft proposals use an eight-token block and up to seven verified
-drafts; the default remains five drafts and 128 target-token rows. The target
+drafts; the default is five drafts and 128 target-token rows. The target
 captures completed zero-based layers 5, 15, 25, 35, and 45 after averaging its four
 hyperconnection streams. Five independent draft attention layers retain the last
 2,048 accepted target positions. These rings are included in continuation
@@ -562,7 +564,7 @@ and each rank selects its head columns for the partial projection before reducti
 Exports use the native DeepSeek V4.1 prompt encoder and include only the tokenizer
 asset. Vision exports bind the atomic `<｜deepseek_image｜>` token as ID 129264,
 which must agree with checkpoint `image_token_id`. Cores without explicit
-prompt-encoder metadata continue to use their tokenizer and Jinja template.
+prompt-encoder metadata use their tokenizer and Jinja template.
 Sampling defaults are temperature 1.0 and top-p 1.0, following the
 [model card](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017#minimal-inference).
 Target vocabulary projections keep the checkpoint's BF16 weights and produce
@@ -779,9 +781,8 @@ For a TP4, single-request configuration with seven drafts, run:
 ```
 
 Use a fresh weight export when first enabling this option: the Markov head's
-stored vocabulary partition changes. Complete-model serving has been exercised
-at TP4 with one concurrent request; wider serving configurations still need
-model validation.
+stored vocabulary partition changes. Qualified: complete-model serving at TP4
+with one concurrent request. Not qualified: higher concurrency.
 
 ## DeepSeek V4 Flash
 
@@ -799,8 +800,8 @@ effort. DeepSeek V4.1 also accepts integer scores from 1 through 100 in
 hints rather than token budgets. See [reasoning controls](api.md#reasoning-sampling-and-usage)
 for request examples and named-level mappings. System-prefix caching
 derives reusable token prefixes from the official encoder's rendered conversations.
-Previously exported Jinja cores retain their
-prepared rendering behavior and require both tokenizer and template assets.
+Cores that carry a Jinja template instead of prompt-encoder metadata render
+with that template and require both tokenizer and template assets.
 Use two or four available GPUs for preparation and serving:
 
 ```sh
@@ -811,6 +812,34 @@ Use two or four available GPUs for preparation and serving:
   /data/flare-runtime/deepseek4-tp4.safetensors \
   --gpus 0,1,2,3
 ```
+
+The 160 GB checkpoint exceeds one DGX Spark's memory, so Spark serving runs
+tensor-parallel across two or four hosts, one rank per host, reducing through
+RoCEnante over their ConnectX-7 ports. One runtime carries the hidden and
+prefill reductions, the vocabulary gathers, the DSpark Markov gather, and the
+sampling broadcasts. Multi-host export requires the checkpoint in rank zero's
+hub cache at the declared revision; it does not download. On rank zero, whose
+preparation address is `10.200.0.12`:
+
+```sh
+.venv/bin/ignition export deepseek-v4-flash --ranks 2 \
+  --rendezvous 10.200.0.12:29630 --gpus 0 --max-concurrency 16
+.venv/bin/ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/deepseek4-spark-tp2.safetensors
+```
+
+On the peer:
+
+```sh
+.venv/bin/ignition join 10.200.0.12:29630 --rank 1 --ranks 2
+```
+
+Four Sparks use `--ranks 4` and join peer ranks 1 through 3. Serve through
+`flare orbit run spark1:/data/flare-runtime/deepseek4-spark-tp2.safetensors --cluster sparks`,
+following the [multi-host guide](multi-host.md) for preparation authentication
+and rank placement. On GB10, a TP2 core with sixteen concurrent requests
+and 8192-token chunks allocates 85.3 GiB per rank and, at the default 4 GiB
+reserve, 14.4 GiB of KV cache. Image requests and four-Spark TP4 have not
+been run on GB10.
 
 V4 uses 256-token logical pages containing 64 C4 latent records with an FP8
 retrieval index, or two C128 latent records with dense history attention. Each latent page
@@ -828,7 +857,7 @@ MiMo V2.6 Pro MOPD uses `XiaomiMiMo/MiMo-V2.6-Pro-MOPD` with checkpoint
 MXFP4 experts, block-FP8 dense projections, and BF16 draft and vision weights.
 The `mimo-v2.6-pro-mopd` alias prepares text, images,
 and seven DFlash draft tokens with adaptive verification. Audio is not prepared.
-Select eight available GPUs:
+The recipe supports two, four, or eight GPUs. This example selects eight:
 
 ```sh
 .venv/bin/ignition export mimo-v2.6-pro-mopd --gpus 0-7
@@ -846,12 +875,76 @@ token and seven proposals. Helios uses the shared speculative execution contract
 draft modeling and state updates are captured by Ignition. The vision encoder
 publishes compact image features for causal text prefill. Loading with
 `--mtp-draft-tokens 0` selects ordinary execution without draft-state updates.
+Image resize bounds and normalization come from the checkpoint's
+`preprocessor_config.json` and are packaged for the native frontend.
+
+## MiMo V2.6 Flash RL
+
+MiMo V2.6 Flash RL uses `XiaomiMiMo/MiMo-V2.6-Flash-RL` at revision
+`f657ba2f7d24c9adc5730675baaa2d34de878a49`, a 48-layer, 256-expert sibling of
+MiMo V2.6 Pro MOPD with the same checkpoint formats, chat template, tokenizer,
+and DFlash draft structure. Its global-attention layers store four KV heads and
+its sliding-window layers eight, and its fused-QKV projections are stored as four
+checkpoint shards, so the `mimo-v2.6-flash-rl` alias prepares two or four ranks.
+The alias prepares text, images, and seven DFlash draft tokens with adaptive
+verification; audio is not prepared. The API advertises the model as
+`MiMo-V2.6-Flash-RL`.
+
+The 173 GB checkpoint exceeds one DGX Spark's memory, so Spark serving runs
+tensor-parallel across two hosts, one rank per host, reducing through RoCEnante
+over their ConnectX-7 ports. Multi-host export requires the checkpoint, including
+its `dflash/` directory, in rank zero's hub cache at the declared revision; it
+does not download. The example prepares sixteen concurrent requests with
+8192-token prefill chunks on two Sparks, following the
+[multi-host guide](multi-host.md) for preparation authentication and rank
+placement. `--lock-gpu-clocks` needs root or passwordless `sudo` for
+`nvidia-smi` on both hosts; omit it otherwise. On rank zero, whose preparation
+address is `10.200.0.12`:
+
+```sh
+.venv/bin/ignition export mimo-v2.6-flash-rl --ranks 2 \
+  --rendezvous 10.200.0.12:29630 --gpus 0 --max-concurrency 16 \
+  --prefill-chunk-size 8192 --native-dense-activations \
+  --autotune-effort audit --lock-gpu-clocks
+.venv/bin/ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/mimo-v26-flash-rl-spark-tp2.safetensors
+```
+
+On the peer:
+
+```sh
+.venv/bin/ignition join 10.200.0.12:29630 --rank 1 --ranks 2
+```
+
+A `[models."mimo-v2.6-flash-rl"]` section with `max_concurrency = 16` in the
+[configuration file](cli-design.md#33-configuration-file) makes that capacity the
+host's default; the chunk size and tuning options are command-line flags.
+
+Serve the core through `flare orbit run` with a two-node cluster whose
+first node holds the core, or from both hosts directly:
+
+```sh
+flare orbit run spark1:/data/flare-runtime/mimo-v26-flash-rl-spark-tp2.safetensors \
+  --cluster sparks --name mimo --host 0.0.0.0
+
+./flare/target/release/flare run /data/flare-runtime/mimo-v26-flash-rl-spark-tp2.safetensors \
+  --rank 0 --rendezvous maxwell:29800
+./flare/target/release/flare run --rank 1 --rendezvous maxwell:29800
+```
+
+Orbit sends the peer its rank's data once over the ConnectX-7 link, about
+88 GB, before loading starts.
+
+On one host with two or four GPUs, select them with `--gpus` as for the Pro
+checkpoint. On GB10, a TP2 core with sixteen concurrent requests and
+8192-token chunks loads 93.9 GiB per rank and, at the default 4 GiB reserve,
+9.9 GiB of KV cache. Image requests have not been qualified on GB10.
 
 ## Step-5 Preview
 
 Step-5 Preview uses `stepfun-ai/Step-5-Preview-NVFP4`. The
 `step5-preview-nvfp4` alias prepares text, images,
-and three causal MTP draft tokens with adaptive verification. Checkpoint NVFP4
+and three causal MTP draft tokens with adaptive verification on four, eight, or
+sixteen GPUs. Checkpoint NVFP4
 routed experts use W4A4. Routed experts declared BF16 in checkpoint metadata
 are converted to NVFP4 during loading and use b12x W4A16 with BF16 activations;
 the converted weights are retained in captured graphs and exported cores.
@@ -936,6 +1029,9 @@ residuals, and latent SiTU experts. Red Hat DSpark uses
 cache (or `[paths].hub_cache`), and defaults to seven draft tokens per round.
 A target checkpoint may instead carry that draft in its `dspark/` directory;
 `kimi-k3-dspark` selects this layout at `/data/kimi-k3-dspark`.
+The `kimi-k3` alias selects `moonshotai/Kimi-K3` at revision
+`2496450e92e425c886db095102a52a6682ca3970` from the Hugging Face hub; its
+native MXFP4 block scales are compressed while loading.
 
 For Kimi K3, `--online-mxfp8` converts KDA input, forget-gate, and output
 projections; MLA latent/gate, query, and output projections; shared
@@ -1005,9 +1101,11 @@ The checkpoint's native MXFP4 expert weights use losslessly compressed block
 scales during preparation. The sparse indexer retains its BF16 checkpoint
 projections and LayerNorm weights, including with `--online-mxfp8`.
 `--online-mxfp8` converts only the fused target KDA inputs (`q_proj`, `k_proj`,
-`v_proj`, `f_a_proj`, `g_proj`, and `b_proj`). Other target projections and
-DSpark and DFlash2 draft weights retain checkpoint precision. Omit the flag to retain
-checkpoint precision for every projection.
+`v_proj`, `f_a_proj`, `g_proj`, and `b_proj`) by default. Other target projections and
+DSpark and DFlash2 draft weights retain checkpoint precision. With DFlash2,
+`--online-mxfp8-scope all` converts every eligible target and draft projection, including
+attention output/latent projections, shared experts, and MoE latent projections. Omit the
+flag to retain checkpoint precision for every projection.
 Index queries and keys use neither RoPE nor Hadamard rotation. Head-gate
 projection and normalization round in BF16. Query scales round upward to powers
 of two; key scales use `max(absmax, 1e-4) / 448` in FP32.
@@ -1022,34 +1120,41 @@ sends each query's candidates to one owner, selects there, and broadcasts only
 the selected IDs. Both preserve FP32 score words, cutoff ties and ID order.
 The measurement includes packing, transport, selection and replication, and
 binds one implementation per row capacity before model capture. The choice is
-recorded under `candidate_compositions` in preparation measurements. Prefill,
-multiple-request graphs, runtime collective tuning and disabled autotuning
-retain the replicated exchange. No serving flag or runtime graph change is
-required.
+recorded under `candidate_compositions` in preparation measurements. Prefill
+graphs below 4096 rows, multiple-request graphs, runtime collective tuning and
+disabled autotuning retain the replicated exchange. Prefill graphs of 4096 rows
+or more use neither exchange; they distribute index queries as described below.
+No serving flag or runtime graph change is required.
 
 With the default `--prefill-chunk-size 4096`, the 4096-token prefill graph
 stages owner-encoded latent and index history locally, distributes index-query
 rows across context ranks, and gathers final selected IDs once per layer.
 Stored FP8 records and FP32 index scales are copied byte-for-byte, including
 records written by the current chunk. Projection shapes, normalization and
-weight formats are unchanged. Smaller captured prefill capacities retain direct
-peer reads; they still require peer KV mappings at startup.
+weight formats are unchanged. Smaller captured prefill capacities use direct
+peer reads and require peer KV mappings at startup.
 
-At a 1,048,576-token context limit and 4096-token prefill capacity, latent and
-index history share 576 MiB per rank. Index scoring and selected-ID exchange
-finish before latent history overwrites the shared bytes. Independent history
-allocations would require 708 MiB; sharing removes the 132 MiB index allocation
-without changing the persistent KV or index caches. Latent peer staging reserves
-36 MiB, while index staging, selected IDs and their transport channel reserve
-another 106.535 MiB, before query buffers and score scratch. Serial layers reuse
-these allocations, which reduce the remaining KV-page budget. Keep the default
-4096-token capacity for this prefill path; `--prefill-chunk-size 2048` omits it
-and its fixed history storage. The compiled history-copy regression in
+At a 1,048,576-token context limit, latent history contains 576 MiB per rank
+and index history contains 132 MiB. These histories are invocation-local tensors.
+Index scoring and selected-ID exchange finish before latent history is produced,
+so Inductor can reuse their storage when their declared dependencies allow it.
+Peer-visible staging and transport buffers remain persistent. The graph-pool
+size depends on the compiled schedule and the complete captured graph catalog.
+The 4096-token prefill path uses these histories; `--prefill-chunk-size 2048`
+uses direct peer reads instead. The compiled history-copy regression in
 `tests/recipes/test_kimi_prefill_histories.py` checks byte preservation across
 page remapping, partial prefixes, empty rows, and repeated graph replay.
-`qualify/kimi_history_alias.py` compares independent and aliased storage through
-one complete checkpoint attention layer on sixteen GPUs, including exact cache
-bytes, cutoff ties, and attention in the emitted selection order.
+
+Target, draft, and vision forwards allocate activations, verification records,
+and operator workspaces inside compilation. Inductor plans their lifetimes, and
+serialized graph variants share one CUDA graph pool. Preparation releases
+declaration examples and tuning workspace before compilation. Weights, request
+state, recurrent and attention caches, completion frames, and image features
+retain explicit storage across graph boundaries.
+
+MoonViT attention rotates Q and K in the packed QKV projection and passes its
+strided Q/K/V views directly to attention. Tuning fixtures preserve those views
+in one private backing allocation, with a shared host seed for restoration.
 
 Kimi K3.1 Pro uses the
 [`Inferact/Kimi-K3.1-Pro-DSpark-preview`](https://huggingface.co/Inferact/Kimi-K3.1-Pro-DSpark-preview)
@@ -1140,16 +1245,25 @@ taps and full-context BF16 cache; the two draft formats are not interchangeable.
 With seven drafts, each continuation row uses 35,450,112 bytes, including five
 1024-token latent rings. Target cache pages retain their 2,174,976-byte size.
 
-The body and shared target vocabulary head remain BF16 with the KDA-input-only
-online conversion. An explicit `--draft-head-quantization mxfp8` or `nvfp4`
-prepares a separate proposal-head copy; it does not convert the target head.
-Its additional weight storage and effect on acceptance must be evaluated for
-the workload. The example keeps the BF16 head.
+The body and shared target vocabulary head remain BF16 with the default
+KDA-input-only online conversion. `--draft-body-quantization mxfp8` converts
+eligible DFlash2 body context, attention latent/query/output, and MLP projections
+independently of target conversion; it does not require `--online-mxfp8`.
+`--online-mxfp8-scope all` also converts these body projections together with the
+broader target conversion described above. Normalization, convolution,
+candidate-selector, and absorbed key/value weights retain their precision.
+An explicit `--draft-head-quantization mxfp8` or `nvfp4` prepares a separate
+proposal-head copy; it does not convert the target head. Preparation rejects
+body or head conversion for the Inferact DSpark draft. Quantized draft weight
+storage and the effect on acceptance must be evaluated for the workload. The
+example keeps the BF16 body and head.
 
-Checkpoint-backed numerical tests cover MLA attention and accepted-context
-projection. The TP16 graph probe in `tools/kimi31_draft_probe.py` covers the draft
-body, vocabulary projection, and selector hidden projection. Complete speculative
-rounds, acceptance quality, and native core serving require separate validation.
+Qualified by checkpoint-backed numerical tests: MLA attention and
+accepted-context projection. To validate TP16 graph replay of the draft body and
+vocabulary projection against eager execution, run `tools/kimi31_draft_probe.py`;
+it executes the selector hidden projection without checking its values or
+forming selector shortlists. Not qualified: complete speculative rounds,
+acceptance quality, and native core serving.
 
 Serving defaults follow the
 [model card](https://huggingface.co/moonshotai/Kimi-K3.1-Pro#3-evaluation-results):
@@ -1224,29 +1338,6 @@ recommended inference default. Reasoning effort accepts `low`, `medium`,
 `reasoning_effort` or `chat_template_kwargs.reasoning_effort` explicitly to
 override it.
 
-Muse Spark preparation requires FlashInfer/b12x operators for unweighted NVFP4
-routed-expert outputs, independent FC1 half gains, and head-dimension-64 paged
-decode with BF16 queries and FP8 E4M3 caches, including quantized sliding-cache
-verification and rollback. The FlashInfer Git dependency pinned in
-`pyproject.toml` lacks these operators. Complete the standard environment setup and install the local
-checkout's build and runtime requirements into `.venv` first. Build requirements
-include `setuptools>=77`, `packaging>=24`, and `apache-tvm-ffi>=0.1.11,<0.2`;
-the CUDA 13 checkout's NCCL-EP dependency requires `nvidia-nccl-cu13>=2.30.7`.
-Install the checkout containing the required operators with:
-
-```sh
-FLASHINFER_BUILD_NO_PIP=1 uv pip install --python .venv/bin/python \
-  --no-deps --no-build-isolation -e /path/to/flashinfer
-```
-
-`FLASHINFER_BUILD_NO_PIP=1` disables nested dependency installation and NCCL
-upgrades in the FlashInfer build hook. `--no-build-isolation` uses the build
-requirements already installed in `.venv`.
-
-Running `uv sync --locked --extra prepare --extra test` restores the pinned Git
-dependency, so repeat the editable installation afterward when preparing Muse
-Spark. The local checkout must provide both the `flashinfer` and `b12x` imports.
-
 Ignition applies `ignition/recipes/muse_spark/assets/chat_template.patch.json`
 to the downloaded checkpoint template. The annotated result preserves the canonical checkpoint bytes when message marks are removed.
 Native recipient headers route `self` messages to reasoning, `commentary` and
@@ -1262,6 +1353,36 @@ the canonical control-sequence escaping.
 flare-cli/target/release/flare run /data/flare-runtime/muse-spark-tp8.safetensors --gpus 0,1,2,3,4,5,6,7
 ```
 
+## Gemma 4
+
+The Gemma 4 recipe prepares text generation on one, two, or four GPUs with a
+262144-token context, four concurrent requests, and 4096-token prefill chunks.
+The recipe declares no image input. Its aliases select these pinned checkpoints:
+
+| Alias | Checkpoint repository |
+|---|---|
+| `gemma-4-e2b` | `google/gemma-4-E2B-it` |
+| `gemma-4-e4b` | `google/gemma-4-E4B-it` |
+| `gemma-4-12b` | `google/gemma-4-12B-it` |
+| `gemma-4-26b-a4b` | `google/gemma-4-26B-A4B-it` |
+| `gemma-4-31b` | `google/gemma-4-31B-it` |
+| `gemma-4-e4b-nvfp4` | `unsloth/gemma-4-E4B-it-NVFP4` |
+| `gemma-4-12b-nvfp4` | `unsloth/gemma-4-12b-it-NVFP4` |
+| `gemma-4-26b-a4b-nvfp4` | `nvidia/Gemma-4-26B-A4B-NVFP4` |
+| `gemma-4-31b-nvfp4` | `nvidia/Gemma-4-31B-IT-NVFP4` |
+
+Speculation defaults to five draft tokens with adaptive rectangular
+verification; `--mtp-draft-tokens N` selects zero through seven. The draft is
+Google's matching `google/gemma-4-*-it-assistant` checkpoint at a revision pinned
+in `ignition/recipes/gemma4/config.py`, downloaded into the Hugging Face hub
+cache. A target checkpoint may instead carry the draft in its `assistant/`
+directory. `--no-mtp` omits the draft. Sampling defaults are temperature 1.0,
+top-p 0.95, and top-k 64.
+
+```sh
+.venv/bin/ignition export gemma-4-12b --gpus 0
+```
+
 ## Storage and graph capacities
 
 Gemma 4 and Muse Spark default to four concurrent requests. Gemma 4's speculative
@@ -1270,16 +1391,16 @@ one, giving six rows at its default settings. Muse Spark declares 32 packed
 target-token rows for seven DFlash2 drafts at concurrency four. Other recipes
 default to 32 concurrent requests, with speculative recipes declaring 128 target-token rows independently
 of concurrency.
-Explicit flags and configuration override these defaults; existing cores retain their
-captured capacities. Memory planning rejects capacities that do not fit the
+Explicit flags and configuration override these defaults; a core's capacities
+are fixed at export. Memory planning rejects capacities that do not fit the
 selected GPUs.
 
 | Recipe | Draft tokens | Verification layout | Speculative graphs at default concurrency | Maximum drafts at batch 32 |
 |---|---:|---|---:|---:|
-| Qwen3.8 Flash, Qwen3.8 27B, GLM 5.3 | 5 | Rectangular | 34 | 3 |
+| Qwen3.8 Flash, GLM 5.3 | 5 | Rectangular | 34 | 3 |
 | Step-5 | 3 | Rectangular | 24 | 3 |
 | DeepSeek V4, MiniMax M3.1 | 5 | Packed | 64 packed + 6 width-one | Up to 5, sharing 128 rows across requests |
-| DeepSeek V4.1, MiMo V2.6 Pro, Kimi K3, Nemotron Bolt | 7 | Packed | 64 packed + 6 width-one | Up to 7, sharing 128 rows across requests |
+| DeepSeek V4.1, MiMo V2.6 Pro, Kimi K3, Kimi K3.1 Pro, Nemotron Bolt, Qwen3.8 27B | 7 | Packed | 64 packed + 6 width-one | Up to 7, sharing 128 rows across requests |
 | Gemma 4 | 5 | Rectangular | 10 at concurrency 4 | Not prepared at default concurrency |
 | Muse Spark | 7 | Packed | 49 packed + 3 width-one at concurrency 4 | Not prepared above concurrency 4 |
 
@@ -1295,10 +1416,10 @@ independently by `--speculative-graph-budget`.
 Every model export prints a VRAM inventory for each rank after final publication,
 including exports without `--verbose`. Heliopause measures device usage and core
 allocator mappings; Ignition attributes retained ranges to checkpoint tensors,
-scratch pools, graph temporaries, I/O and persistent state, communication buffers,
+graph temporaries, I/O and persistent state, communication buffers,
 kernel globals, and allocator slack. Owner fields and defining source locations
 identify the largest consumers in each category. Aliased ranges count once;
-shared scratch displays representative tensor owners.
+shared storage displays representative tensor owners.
 
 Preparation-only storage is separate from fixed core storage. Cache figures
 count physically backed pages, not their virtual serving capacity. Mapped host
@@ -1334,8 +1455,8 @@ fraction of total device memory (`0.8`). It replaces the exported serving
 reserve and includes model resources as well as caches. Both flags apply at
 core load time without another export. See
 [runtime memory limits](cli-design.md#runtime-memory-limits) for rounding,
-minimum capacities, and integrated-memory accounting. Preparation retains its
-own existing memory policy.
+minimum capacities, and integrated-memory accounting. These flags do not
+affect preparation's memory policy.
 
 Before compilation and capture, preparation prints a persistent graph catalog
 with counts, batch and prefill capacities, logical widths, physical target rows,
@@ -1345,10 +1466,9 @@ batch capacities through the concurrency limit
 and width one at every bucket. Rectangular speculative and verification shapes
 require `batch * width <= speculative_token_capacity`; the preparation flag
 `--speculative-token-capacity` defaults to 128 physical target rows except for
-Gemma 4's derived capacity. Packed recipes use the shared capacity selection
+Gemma 4's derived capacity and Muse Spark's 32 rows. Packed recipes use the
+shared capacity selection
 described under DeepSeek V4.1 rather than rectangular `batch * width` shapes.
-Previously exported separate-proposal
-catalogs cover every bucket and load-time draft depth independently of that limit.
 Flare can reduce concurrency at load time. Rectangular catalogs permit smaller
 positive draft limits; packed catalogs require their captured positive depth or
 zero. Prefill capacity stays prepared.
@@ -1430,7 +1550,7 @@ memory types despite sharing DRAM; do not dereference a device allocation on
 the CPU or replace system-scope synchronization with volatile accesses. See
 [NVIDIA's Spark CUDA guidance](https://docs.nvidia.com/dgx/dgx-spark-porting-guide/porting/cuda.html).
 
-A model too large for one Spark runs tensor-parallel across two or four Sparks,
+A model too large for one Spark runs tensor-parallel across two, three, or four Sparks,
 one rank per host, reducing through b12x RoCEnante over their ConnectX-7 ports:
 `ignition export --ranks N --rendezvous ADDR:PORT` on rank zero with
 `ignition join` on each peer writes one core on rank zero, and
@@ -1451,7 +1571,8 @@ flare-cli/target/release/flare run qwen.safetensors --gpus 0,1
 
 To test a serving-only Rust change, rebuild Flare and load an existing compatible
 core. Re-export when changing prepared kernels, capacities, or the core
-format. Export destinations must not already exist.
+format. Export publishes a cache entry and takes no destination;
+`ignition convert --output` destinations must not already exist.
 
 Use `.venv/bin/ignition export --help` for preparation flags and
 `flare-cli/target/release/flare run --help` for serving flags. See [the runtime core design](runtime-core-design.md)

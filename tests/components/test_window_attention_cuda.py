@@ -17,11 +17,12 @@ from ignition.preparation.tuning import RecordedPreparationSession
 pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1", reason="requires an assigned GPU")
 
 
+@pytest.mark.parametrize("functional", [False, True])
 @pytest.mark.parametrize("batch,width,first,step", [(1, 4096, 0, None), (1, 640, 0, None), (1, 4, 0, None), (4, 7, 3, None),
                                                  (4, 4, 3, None), (4, 1, 3, 2)])
 @pytest.mark.parametrize("gated", [False, True])
 @pytest.mark.parametrize("kv_dtype", [torch.bfloat16, torch.float8_e4m3fn])
-def test_window_attention(batch, width, first, step, gated, kv_dtype):
+def test_window_attention(batch, width, first, step, gated, kv_dtype, functional):
     torch.manual_seed(721)
     device = torch.device("cuda:0")
     window, heads, groups, dim = 512, 8, 1, 192
@@ -57,7 +58,14 @@ def test_window_attention(batch, width, first, step, gated, kv_dtype):
         session.register_scratch(arena)
         operation = PreparedWindowAttention(q, k, v, hk, hv, m, out,
             first_position=first, proposal=proposal, output_gate=gate, session=session, workspace=arena, name="window")
+        if functional:
+            operation.functional(session=session)
         session.tune()
+        if functional:
+            arena.release_preparation()
+            attention = operation
+            def operation():
+                return out.copy_(attention(q, k, v, m, output_gate=gate, proposal=proposal))
         compiled = compile_forward(operation)
         compiled()
         graph = torch.cuda.CUDAGraph()

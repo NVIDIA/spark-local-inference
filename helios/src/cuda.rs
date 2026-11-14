@@ -165,6 +165,7 @@ struct Driver {
     event_destroy: StreamOperation,
     stream_wait: StreamWait,
     wait_value: WaitValue,
+    write_value: WaitValue,
     host_pointer: HostPointer,
     pointer_attribute: PointerAttribute,
     stream_create_priority: StreamCreatePriority,
@@ -229,6 +230,7 @@ impl Driver {
                 event_destroy: symbol!("cuEventDestroy_v2"),
                 stream_wait: symbol!("cuStreamWaitEvent"),
                 wait_value: symbol!("cuStreamWaitValue32_v2"),
+                write_value: symbol!("cuStreamWriteValue32_v2"),
                 host_pointer: symbol!("cuMemHostGetDevicePointer_v2"),
                 pointer_attribute: symbol!("cuPointerGetAttribute"),
                 stream_create_priority: symbol!("cuStreamCreateWithPriority"),
@@ -772,6 +774,15 @@ impl Stream {
     pub(crate) unsafe fn wait_value(&self, flag: usize, generation: u32) -> Result<()> {
         self.driver.check("cuStreamWaitValue32_v2", unsafe {
             (self.driver.wait_value)(self.handle as Handle, flag as u64, generation, 1)
+        })
+    }
+
+    /// Write `value` to a mapped host word once all prior work on this stream completed.
+    /// The default flags order the stream's earlier memory operations before the write.
+    /// The mapped word remains allocated until this stream drains.
+    pub(crate) unsafe fn write_value(&self, word: usize, value: u32) -> Result<()> {
+        self.driver.check("cuStreamWriteValue32_v2", unsafe {
+            (self.driver.write_value)(self.handle as Handle, word as u64, value, 0)
         })
     }
 

@@ -131,7 +131,7 @@ def _replace_gpu_preparation():
 
     inductor_tuning.InductorSelections = Selections
     compile_pool.compiler_resources = lambda *args, **kwargs: compile_pool.CompilerResources(
-        1, 128 << 30, 16, 16 << 30, 8 << 30)
+        1, 128 << 30, 16, 32 << 30, 8 << 30)
     torch.cuda.current_stream = lambda device: SimpleNamespace(synchronize=lambda: None)
 
 
@@ -218,7 +218,7 @@ def _lending_rank(rank, world, store, root, outcome, lifecycle=None, fail_shutdo
             if scenario == "no_capacity":
                 capacity = False
             compile_pool.compiler_resources = lambda *args, **kwargs: compile_pool.CompilerResources(
-                int(capacity), 24 << 30, 16, 16 << 30, 8 << 30)
+                int(capacity), 40 << 30, 16, 32 << 30, 8 << 30)
         aot.ForwardCache._load = lambda self, forward, path, required=False, before_run=None: aot.BoundForward(
             _Artifact(lambda owner: None), forward, True)
         dist.init_process_group("gloo", init_method=f"file://{store}", rank=rank, world_size=world)

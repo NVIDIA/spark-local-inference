@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from functools import cached_property
 
 import torch
 import triton
@@ -21,6 +22,7 @@ from .completion import CompletionOutputs, completion_record_capacity
 from .logprobs import PreparedLogprobs
 from .capacity import BATCH_CAPACITIES
 from .flashinfer_sampling import filter_probabilities_out, probability_filter_workspace, sample_probabilities
+from ignition.preparation.persistent import persistent_copy, persistent_empty
 from ignition.preparation.scratch import bind_scratch
 
 EOS_CAPACITY = 8
@@ -119,6 +121,10 @@ class DeviceRequestState:
     @property
     def vocab_size(self) -> int:
         return self.histogram.shape[1]
+
+    @cached_property
+    def vocab_ids(self) -> torch.Tensor:
+        return persistent_copy(torch.arange(self.vocab_size, dtype=torch.int64, device=self.histogram.device))
 
     def admit(self, slot: int, admission: RequestAdmission, prompt_ids, *, consumed_tokens: int = 0) -> None:
         """Bootstrap a slot outside replay; Rust admission uploads the same fields.
@@ -487,7 +493,9 @@ class PreparedSampling:
                 (frame_index, (1,), torch.int32, "frame_index"), (submission_sequence, (1,), torch.int64, "submission_sequence")):
             _check_tensor(tensor, shape, dtype, device, name)
         self.state, self.logits, self.slots = state, logits, row_slot_ids
-        self.sample_enabled = torch.ones(rows, dtype=torch.int32, device=device) if sample_enabled is None else sample_enabled
+        self.generations, self.live_rows = row_generations, live_rows
+        self.sample_enabled = (persistent_empty((rows,), dtype=torch.int32, device=device).fill_(1)
+                               if sample_enabled is None else sample_enabled)
         _check_tensor(self.sample_enabled, (rows,), torch.int32, device, "sample_enabled")
         self.scratch_tensors = bind_scratch(self.scratch_layout(rows, vocab), device=device, workspace=workspace)
         for name, tensor in self.scratch_tensors.items():
@@ -539,58 +547,156 @@ class PreparedSampling:
             (self.probabilities, self.probabilities, self.probability_maximum,
              self.packed_min_p, self.state.vocab_size, 1024), self._grid,
             num_warps=4, enable_fp_fusion=False)
-        # FlashInfer's public operators share these buffers on the model stream.
-        self.scratch_tensors["flashinfer_top_k_row_states"] = self._flashinfer._get_cache_buf(
-            f"top_k_mask_logits_row_states_{self.logits.device}", 1024 * 1024,
-            self.logits.device, zero_init=True)
-        self.scratch_tensors["flashinfer_softmax_workspace"] = self._flashinfer._get_cache_buf(
-            "softmax_workspace", 1024 * 1024, self.logits.device)
+        self.scratch_tensors["flashinfer_top_k_row_states"] = torch.zeros(
+            1024 * 1024, dtype=torch.uint8, device=self.logits.device)
+        self.scratch_tensors["flashinfer_softmax_workspace"] = torch.empty(
+            1024 * 1024, dtype=torch.uint8, device=self.logits.device)
         self.scratch_tensors["flashinfer_top_p_workspace"] = probability_filter_workspace(
             self._rows, self.state.vocab_size, self.logits.device)
         self._scores()
-        self._filter_scores()
+        self._filter_scores(self.scratch_tensors)
         self._prepared = True
 
-    def _filter_scores(self):
-        torch.amax(self.scores, dim=-1, out=self.maximum)
-        self._metadata()
-        self._sanitize()
-        filter_probabilities_out(self.scores, self.packed_top_k, self.packed_top_p,
-            self.scratch_tensors["flashinfer_top_k_row_states"],
-            self.scratch_tensors["flashinfer_softmax_workspace"], self.probabilities,
-            self.scratch_tensors["flashinfer_top_p_workspace"])
-        probabilities = self.probabilities
-        torch.amax(probabilities, dim=-1, out=self.probability_maximum)
+    def _filter_scores(self, scratch, *, local=False, row_inputs=None):
         from ignition.preparation.triton import launch_triton
 
+        def launch(operation):
+            if not local:
+                operation()
+                return
+            args = list(operation.args)
+            for index, name in operation.scratch_slots:
+                args[index] = scratch[name]
+            for index, name in getattr(operation, "row_slots", ()):
+                args[index] = row_inputs[name]
+            launch_triton(operation.kernel, operation.compiled, tuple(args), operation.grid, **operation.options)
+
+        scores, maximum = scratch["scores"], scratch["maximum"]
+        probabilities = scratch["probabilities"]
+        torch.amax(scores, dim=-1, out=maximum)
+        launch(self._metadata)
+        launch(self._sanitize)
+        filter_probabilities_out(scores, scratch["packed_top_k"], scratch["packed_top_p"],
+            scratch["flashinfer_top_k_row_states"], scratch["flashinfer_softmax_workspace"], probabilities,
+            scratch["flashinfer_top_p_workspace"])
+        torch.amax(probabilities, dim=-1, out=scratch["probability_maximum"])
         launch_triton(_mask_min_p, self._min_p_kernel,
-            (probabilities, self.probabilities, self.probability_maximum,
-             self.packed_min_p, self.state.vocab_size, 1024), self._grid,
+            (probabilities, probabilities, scratch["probability_maximum"],
+             scratch["packed_min_p"], self.state.vocab_size, 1024), self._grid,
             num_warps=4, enable_fp_fusion=False)
-        torch.sum(self.probabilities, dim=-1, keepdim=True, out=self.probability_mass)
-        self._normalize()
+        torch.sum(probabilities, dim=-1, keepdim=True, out=scratch["probability_mass"])
+        launch(self._normalize)
         for row in range(self._rows):
-            sampled, valid = sample_probabilities(self.probabilities[row:row + 1],
-                seed=self.packed_seed[row:row + 1], offset=self.packed_offset[row:row + 1],
+            sampled, valid = sample_probabilities(probabilities[row:row + 1],
+                seed=scratch["packed_seed"][row:row + 1], offset=scratch["packed_offset"][row:row + 1],
                 return_valid=True)
-            self.sampled_tokens[row:row + 1].copy_(sampled)
-            self.sample_valid[row:row + 1].copy_(valid)
+            scratch["sampled_tokens"][row:row + 1].copy_(sampled)
+            scratch["sample_valid"][row:row + 1].copy_(valid)
 
     def __call__(self) -> None:
         if not self._prepared:
             raise RuntimeError("sampling prepare() must complete before capture")
         self._scores()
-        self._filter_scores()
+        self._filter_scores(self.scratch_tensors)
         if self.broadcast is not None:
             self.broadcast()
         self._complete()
         self.logprobs()
 
-    def record_completion(self) -> None:
+    def functional(self, *, session, dynamic_inputs=False):
+        self.local_layout = self.scratch_layout(self._rows, self.state.vocab_size)
+        for name in ("flashinfer_top_k_row_states", "flashinfer_softmax_workspace", "flashinfer_top_p_workspace"):
+            workspace = self.scratch_tensors[name]
+            self.local_layout[name] = (tuple(workspace.shape), workspace.dtype)
+        names = {id(self.scratch_tensors[name]): name for name in self.local_layout}
+        for operation in (self._scores, self._metadata, self._sanitize, self._normalize,
+                          self._complete, self._record):
+            operation.scratch_slots = tuple((index, names[id(value)]) for index, value in enumerate(operation.args)
+                                            if id(value) in names)
+            slots = {index for index, _ in operation.scratch_slots}
+            operation.args = tuple(None if index in slots else value for index, value in enumerate(operation.args))
+        self._scores.args = (None, *self._scores.args[1:])
+        for operation, indices in ((self._scores, (2, 3, 4)), (self._metadata, (0, 1, 2)),
+                                   (self._complete, (4, 5, 6, 7)), (self._record, (4, 5, 6, 7))):
+            operation.row_slots = tuple(zip(indices, ("slots", "generations", "live_rows", "sample_enabled"), strict=False))
+            if dynamic_inputs:
+                args = list(operation.args)
+                for index in indices:
+                    args[index] = None
+                operation.args = tuple(args)
+        self._score_args = self._metadata_args = self._sanitize_args = self._normalize_args = self._complete_args = ()
+        if self.broadcast is not None:
+            self.broadcast.functional(session=session)
+        self.logits = None
+        self._logprob_args = ()
+        self.logprobs.functional(session=session, dynamic_inputs=dynamic_inputs)
+        if dynamic_inputs:
+            self.slots = self.generations = self.live_rows = self.sample_enabled = None
+        for name in self.local_layout:
+            setattr(self, name, None)
+            del self.scratch_tensors[name]
+        return self
+
+    def _runtime_rows(self, slots, generations, live_rows, sample_enabled):
+        values = {"slots": self.slots if slots is None else slots,
+                  "generations": self.generations if generations is None else generations,
+                  "live_rows": self.live_rows if live_rows is None else live_rows,
+                  "sample_enabled": self.sample_enabled if sample_enabled is None else sample_enabled}
+        if any(value is None for value in values.values()):
+            raise ValueError("functional sampling requires runtime row operands")
+        for name, shape, dtype in (("slots", (self._rows,), torch.int32),
+                ("generations", (self._rows,), torch.int64), ("live_rows", (1,), torch.int32),
+                ("sample_enabled", (self._rows,), torch.int32)):
+            _check_tensor(values[name], shape, dtype, self.state.generation.device, name)
+        return values
+
+    def run(self, logits, *, slots=None, generations=None, live_rows=None, sample_enabled=None):
+        from ignition.preparation.triton import launch_triton
+
+        if not self._prepared:
+            raise RuntimeError("sampling prepare() must complete before capture")
+        row_inputs = self._runtime_rows(slots, generations, live_rows, sample_enabled)
+        scratch = {name: (torch.zeros(shape, dtype=dtype, device=logits.device)
+                          if name == "flashinfer_top_k_row_states" else torch.empty(shape, dtype=dtype, device=logits.device))
+                   for name, (shape, dtype) in self.local_layout.items()}
+        scratch.update(self.scratch_tensors)
+        args = list(self._scores.args)
+        args[0] = logits
+        for index, name in self._scores.scratch_slots:
+            args[index] = scratch[name]
+        for index, name in self._scores.row_slots:
+            args[index] = row_inputs[name]
+        launch_triton(self._scores.kernel, self._scores.compiled, tuple(args),
+                      self._scores.grid, **self._scores.options)
+        self._filter_scores(scratch, local=True, row_inputs=row_inputs)
+        if self.broadcast is not None:
+            self.broadcast((scratch["sampled_tokens"], scratch["sample_valid"],
+                            scratch["maximum"], scratch["probability_mass"]))
+        self._launch_with_scratch(self._complete, scratch, row_inputs)
+        self.logprobs.run(logits, slots=row_inputs["slots"], generations=row_inputs["generations"],
+                          live_rows=row_inputs["live_rows"])
+
+    def _launch_with_scratch(self, operation, scratch, row_inputs):
+        from ignition.preparation.triton import launch_triton
+
+        args = list(operation.args)
+        for index, name in operation.scratch_slots:
+            args[index] = scratch[name]
+        for index, name in operation.row_slots:
+            args[index] = row_inputs[name]
+        launch_triton(operation.kernel, operation.compiled, tuple(args), operation.grid, **operation.options)
+
+    def record_completion(self, *, slots=None, generations=None, live_rows=None, sample_enabled=None) -> None:
         """Record a consumption-only prefill without a vocabulary projection."""
         if not self._prepared:
             raise RuntimeError("sampling prepare() must complete before capture")
-        self._record()
+        if hasattr(self, "local_layout"):
+            scratch = {name: torch.empty(shape, dtype=dtype, device=self.state.generation.device)
+                       for name, (shape, dtype) in self.local_layout.items()}
+            self._launch_with_scratch(self._record, scratch,
+                self._runtime_rows(slots, generations, live_rows, sample_enabled))
+        else:
+            self._record()
 
 
 @triton.jit
@@ -728,6 +834,7 @@ class PreparedAdmission:
             records, frame_index, submission_sequence, capacity, state.consumed_tokens.stride(0), record_fields, slots)
         self._grid = (capacity, triton.cdiv(vocab, 1024), 1)
         self._prepared = False
+        self.local_errors = False
 
     def prepare(self) -> None:
         self._validate = _compile(_admission_validate, self._validate_args, self._grid)
@@ -736,17 +843,43 @@ class PreparedAdmission:
         self._prepared = True
 
     def __call__(self) -> None:
-        self.validate()
-        self.apply()
+        errors = self.validate()
+        self.apply(errors)
 
-    def validate(self) -> None:
+    def functional(self):
+        if not self._prepared:
+            raise RuntimeError("admission prepare() must complete before functional conversion")
+        for operation, index in ((self._validate, 11), (self._copy, 2), (self._finish, 10)):
+            operation.error_index = index
+            operation.args = tuple(None if i == index else value for i, value in enumerate(operation.args))
+        self._validate_args = self._copy_args = self._finish_args = ()
+        self.errors = None
+        self.local_errors = True
+        return self
+
+    def _launch(self, operation, errors):
+        from ignition.preparation.triton import launch_triton
+
+        args = list(operation.args)
+        args[operation.error_index] = errors
+        launch_triton(operation.kernel, operation.compiled, tuple(args), operation.grid, **operation.options)
+
+    def validate(self, errors=None):
         """Validate staging before a composed hybrid-state reset/restore."""
         if not self._prepared:
             raise RuntimeError("admission prepare() must complete before capture")
-        self.errors.zero_()
-        self._validate()
+        if self.local_errors:
+            if errors is None:
+                errors = torch.empty(self.state.capacity, dtype=torch.int32, device=self.state.generation.device)
+            errors.zero_()
+            self._launch(self._validate, errors)
+        else:
+            errors = self.errors
+            errors.zero_()
+            self._validate()
+        return errors
 
-    def apply(self) -> None:
+    def apply(self, errors=None) -> None:
         """Apply validated rows; composed maintenance may add transfer errors.
 
         Bits8.. encode state-transfer errors. Nonzero error rows never modify
@@ -754,5 +887,11 @@ class PreparedAdmission:
         """
         if not self._prepared:
             raise RuntimeError("admission prepare() must complete before capture")
-        self._copy()
-        self._finish()
+        if self.local_errors:
+            if errors is None:
+                raise ValueError("functional admission requires validation errors")
+            self._launch(self._copy, errors)
+            self._launch(self._finish, errors)
+        else:
+            self._copy()
+            self._finish()

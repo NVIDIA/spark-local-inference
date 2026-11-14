@@ -1,10 +1,10 @@
 # Direct execution: reproducing model faults without Helios
 
-`ignition debug-serve --direct` is a diagnostic and qualification path, requested by
-project owner Luke Alonso, for reproducing and bisecting model-level faults. It
-is not for actual serving or apples-to-apples performance comparisons against
-other runtimes. Those workflows use `ignition export` and `flare run CORE`.
-Production serving loads an
+`ignition debug-serve --direct` is the one Python execution path: a diagnostic
+and qualification tool, authorized by the project owner, for reproducing and
+bisecting model-level faults. It is not for actual serving or apples-to-apples
+performance comparisons against other runtimes. Those workflows use
+`ignition export` and `flare run CORE`. Production serving loads an
 exported core in Helios, which owns scheduling, input packing, graph replay
 and output without Python ([AGENTS.md](../AGENTS.md), "Python prepares; Helios
 serves"). Direct execution prepares the model in the Ignition process, then
@@ -12,7 +12,8 @@ drives the prepared graphs from Python: a small fixed scheduler decides each
 step, packs the same graph inputs Helios packs, and replays the captured graph
 on every rank. With `--eager` it calls the forward each graph captured instead.
 Nothing selects either implicitly: `--direct`, and `--eager` with it, must be
-given, and neither `run`, `export` nor Flare accepts them.
+given, and only `ignition debug-serve` accepts them; `ignition export`,
+`ignition bench` and `flare run` do not.
 
 A fault that reproduces through direct graph replay does not depend on Helios's
 scheduler, transport frames or native replay. A fault that reproduces under
@@ -40,7 +41,7 @@ CUDA_VISIBLE_DEVICES=1 .venv/bin/ignition debug-serve glm-5.3-flash --gpus 0 \
 
 Across DGX Sparks, this example prepares 16 concurrent requests. Rank zero
 adds `--ranks N --rendezvous ADDR:PORT` and each
-peer runs `ignition join` exactly as for in-process serving
+peer runs `ignition join` exactly as for native `ignition debug-serve`
 ([multi-host.md](multi-host.md)); peers learn the execution mode from rank zero:
 
 ```sh
@@ -53,11 +54,13 @@ Every host needs the same Flare, Ignition and FlashInfer sources, as for any
 multi-host preparation. Preparation flags (`--max-concurrency`,
 `--prefill-chunk-size`, `--mtp-draft-tokens`, `--no-mtp-adaptive-verification`,
 `--no-mtp`, `--no-context-parallel`, `--no-stream-overlap`, `--no-compile`)
-apply as they do to `ignition debug-serve`; direct execution runs what they prepared.
+apply as they do without `--direct`; direct execution runs what they prepared.
+`--history-drafts` is rejected with `--direct`, and `--eager` and `--graph-times`
+are rejected without it.
 `--verbose` also prints every step's graph, row count and GPU time.
 `--graph-times PATH` makes graph replay save its estimate of every graph's time
-to `PATH` every 10 s and when it stops; `--eager` with the same file chooses
-decode rounds from those times (see "Eager forwards"):
+to `PATH` every 10 s and when it stops; `--eager` with the same file, which must
+already exist, chooses decode rounds from those times (see "Eager forwards"):
 
 ```sh
 CUDA_VISIBLE_DEVICES=1 .venv/bin/ignition debug-serve glm-5.3-flash --gpus 0 \
@@ -163,9 +166,7 @@ where preparation compiled it, on the same buffers after the same uploads.
 Scheduling, packing and completion handling do not change. The forwards are
 built for capture and make no per-step host decisions, so they launch the
 kernels the graph recorded, with the same arguments except for the addresses
-of temporaries. Eager steps are bound by the host: on a GB300, GLM-5.3 Flash's
-compiled forwards took 0.26 to 0.34 s per prefill chunk or speculative round
-at every capacity exercised. What graph replay does and eager execution does
+of temporaries. What graph replay does and eager execution does
 not reproduce:
 
 - Replay runs the recorded launches from fixed addresses in the graph pool;
@@ -178,13 +179,14 @@ not reproduce:
 - A collective that orders itself across streams or checks transport health
   per call does so in eager execution; under replay its stream order is the
   graph's and health is checked after the step.
-- An eager step's time is Python's launch time, 0.3 s where its graph takes a
-  few milliseconds, and says nothing about the graph's cost. Eager execution
-  therefore never schedules from it. With `--graph-times`, each eager step
+- An eager step's time is Python's launch time and says nothing about the
+  graph's cost: on a GB300, GLM-5.3 Flash's compiled forwards take about 0.3 s
+  per prefill chunk or speculative round where the graph takes a few
+  milliseconds. Eager execution therefore never schedules from it. With `--graph-times`, each eager step
   counts as the time graph replay saved for its graph, both as the observation
   Helios's estimates take and on the scheduling clock, so eager execution
   explores, expires and chooses graphs as graph replay did with those times.
-  Choices still diverge when acceptance does, and graph replay's times follow
+  Choices diverge when acceptance does, and graph replay's times follow
   its context lengths while saved ones are fixed. Without `--graph-times` no
   graph is ever measured, and every decode round carries every decoding request
   at the widest verification, which is Helios's choice among unmeasured graphs.
@@ -197,7 +199,7 @@ steps in the same order with the same inputs and the same execution mode, and
 the collectives inside each graph or forward join their GPU work. Rank zero
 alone reads completion records. Stopping rank zero (SIGINT or SIGTERM) takes
 effect between steps; it ends every peer's loop, then the group closes as after
-in-process serving.
+native `ignition debug-serve`.
 
 ## Limits
 
@@ -213,5 +215,8 @@ in-process serving.
 - Eager forwards allocate their temporaries from the caching allocator after
   the graphs release their pool; preparation leaves only its headroom free
   beyond that, so `[memory] reserve` may need raising for large prefill chunks.
-- GLM-5.3 Flash retains its forwards for `--eager`; other recipes support graph
-  replay only, and `--eager` with them fails once preparation has finished.
+- `--eager` requires a recipe that retains its forwards in the prepared model:
+  GLM-5.3 Flash (`glm53`) and MiniMax M3.1 Flash (`minimax_m3`) do. Other
+  recipes support graph replay only; `--eager` with them fails once preparation
+  has finished, reporting
+  `this recipe retains no prepared forwards; --eager requires them`.

@@ -39,7 +39,7 @@ def _rotary_reference(source, positions):
     return torch.cat((result, source[..., 78:]), -1)
 
 
-def _reference(weights, encoder, pixels, positions):
+def _reference(weights, encoder, scratch, pixels, positions):
     f = torch.nn.functional
 
     def norm(x, w):
@@ -72,7 +72,7 @@ def _reference(weights, encoder, pixels, positions):
         attended = attended.flatten(1)
         output = reduce(
             f.linear(attended, w["output"][0]),
-            encoder.scratch.projected,
+            scratch.projected,
             block.self_attn.reduce,
             w["output"][1],
         )
@@ -81,7 +81,7 @@ def _reference(weights, encoder, pixels, positions):
             f.gelu(f.linear(norm(hidden, w["norm2"]), *w["up"])), w["down"][0]
         )
         output = reduce(
-            output, encoder.scratch.projected, block.mlp.reduce, w["down"][1]
+            output, scratch.projected, block.mlp.reduce, w["down"][1]
         )
         hidden = hidden + output
     values = f.linear(
@@ -89,7 +89,7 @@ def _reference(weights, encoder, pixels, positions):
     )
     values = reduce(
         values,
-        encoder.scratch.projector_output,
+        scratch.projector_output,
         encoder.projector.reduce,
         weights.projector[1][1],
     )
@@ -99,7 +99,7 @@ def _reference(weights, encoder, pixels, positions):
     )
     values = reduce(
         values,
-        encoder.scratch.merger_output,
+        scratch.merger_output,
         encoder.merger.reduce,
         weights.merger[1][1],
     )
@@ -179,8 +179,14 @@ def _rank(rank, rendezvous, snapshot):
             canonical = MiniMaxM3VLVisionRotaryEmbedding(MiniMaxM3VLVisionConfig())
             assert torch.equal(encoder.inverse, canonical.inv_freq.to(device))
             session.tune()
-            compiled = compile_forward(encoder)
-            encoder.cu.copy_(
+            work = encoder.allocate_inputs()
+            for value in work.values():
+                value.zero_()
+            output = torch.empty_like(scratch.output)
+            encoder.release_outputs()
+            arena.release_preparation()
+            compiled = compile_forward(lambda: output.copy_(encoder(work)))
+            work["cu"].copy_(
                 torch.tensor([0, capacity], device=device, dtype=torch.int32)
             )
             compiled()
@@ -213,11 +219,11 @@ def _rank(rank, rendezvous, snapshot):
                     ],
                     device=device,
                 )
-                scratch.patches.zero_()
-                scratch.patches[:count].copy_(pixels)
-                encoder.positions.zero_()
-                encoder.positions[:count].copy_(positions)
-                encoder.cu[1] = count
+                work["patches"].zero_()
+                work["patches"][:count].copy_(pixels)
+                work["positions"].zero_()
+                work["positions"][:count].copy_(positions)
+                work["cu"][1] = count
                 arena.tensor.fill_(197)
                 dist.barrier()
                 before = torch.cuda.memory_stats(device)["allocation.all.allocated"]
@@ -225,10 +231,10 @@ def _rank(rank, rendezvous, snapshot):
                 torch.cuda.synchronize(device)
                 after = torch.cuda.memory_stats(device)["allocation.all.allocated"]
                 assert after == before
-                actual = scratch.output[: count // 4].clone()
-                eager = encoder()[: count // 4].clone()
+                actual = output[: count // 4].clone()
+                eager = encoder(work)[: count // 4].clone()
                 torch.testing.assert_close(actual, eager, rtol=0, atol=0)
-                expected = _reference(weights, encoder, pixels, positions)
+                expected = _reference(weights, encoder, scratch, pixels, positions)
                 a, b = actual.float(), expected.float()
                 error = (a - b).abs()
                 metrics = dict(

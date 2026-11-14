@@ -415,16 +415,19 @@ fn short_prefill_does_not_explore_padding_after_the_smallest_shape_is_measured()
     let mut s = cold_engine(1, false);
     s.prefill_graphs(&[64, 128, 512]).unwrap();
     let h = add(&mut s, 1, 130, 32);
-    s.request_mut(h).unwrap().message_boundaries = vec![17, 82];
+    s.request_mut(h).unwrap().message_boundaries = vec![17];
     assert_eq!(measured_step(&mut s, MS / 10, 0).kind, GraphKind::Init);
     let first = measured_step(&mut s, MS, 0);
     assert_eq!((first.token_capacity, first.lanes[0].tokens), (64, 17));
     assert_eq!(measured_step(&mut s, MS / 10, 0).kind, GraphKind::Snapshot);
     let second = measured_step(&mut s, 2 * MS, 0);
-    assert_eq!((second.token_capacity, second.lanes[0].tokens), (128, 65));
-    assert_eq!(measured_step(&mut s, MS / 10, 0).kind, GraphKind::Snapshot);
+    assert_eq!((second.token_capacity, second.lanes[0].tokens), (128, 113));
+    s.cancel(h).unwrap();
+    let h = add(&mut s, 2, 48, 32);
+    assert_eq!(measured_step(&mut s, MS / 10, 0).kind, GraphKind::Init);
     let tail = s.plan().unwrap();
     assert_eq!((tail.token_capacity, tail.lanes[0].tokens), (64, 48));
+    s.cancel(h).unwrap();
 }
 
 #[test]
@@ -1178,7 +1181,7 @@ fn set_cost(s: &mut RequestScheduler, kind: GraphKind, batch: usize, capacity: u
 }
 
 #[test]
-fn long_conversations_budget_checkpoints_and_cross_unselected_messages() {
+fn long_conversations_use_work_budget_and_cross_unselected_messages() {
     let mut s = interactive_engine(32, false);
     let mut handles = Vec::new();
     for id in 1..=4 {
@@ -1206,8 +1209,8 @@ fn long_conversations_budget_checkpoints_and_cross_unselected_messages() {
         }
     }
     assert!(handles.iter().all(|&h| s.request(h).is_err()));
-    assert!(s.stats().snapshot_publications <= 4 * 8);
-    assert_eq!(s.stats().message_checkpoints, 4 * 6);
+    assert!(s.stats().message_checkpoints >= 4);
+    assert!(s.stats().checkpoint_extra_work_ns <= 4 * (8 * 66 + 15) * MS / 20);
     assert!(full_chunks >= 4 * 6);
     assert!(prefill_calls <= 4 * 24, "{prefill_calls} prefill calls, {full_chunks} full chunks");
     assert_eq!(s.stats().snapshot_evictions, 0);
@@ -1714,6 +1717,11 @@ fn prerequisite_cohort_accounts_for_ready_batch_mates() {
 
 #[test]
 fn invalid_utility_configuration_is_rejected_before_admission() {
+    for fraction in [-0.1, 1.1, f64::INFINITY, f64::NAN] {
+        assert!(engine(1, false).configure_policy(PolicyConfig {
+            checkpoint_extra_work_fraction: fraction, ..Default::default()
+        }).is_err());
+    }
     for policy in [
         PolicyConfig {
             output_token_value: f64::INFINITY,

@@ -9,7 +9,8 @@ from functools import partial
 import torch
 
 from ignition.components.dflash2 import (
-    DraftAttention, DraftScratch, PreparedContext, PreparedDraft as _PreparedDraft,
+    DraftAttention, PooledDraftScratch as DraftScratch, PooledPreparedContext as PreparedContext,
+    PooledPreparedDraft as _PreparedDraft,
 )
 from ignition.components.speculation import SpeculativeRngState
 

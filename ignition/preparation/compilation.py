@@ -24,6 +24,7 @@ from ignition import runtime_patches
 
 _INVOCATIONS = ContextVar('flare_storage_invocations')
 _OPTIONS = {'max_autotune': True, 'emulate_precision_casts': True,
+            'memory_planning': True, 'memory_pool': 'combined',
             'triton.cudagraphs': False, 'triton.autotune_at_compile_time': False,
             'triton.cooperative_reductions': True,
             'compile_threads': min(16, os.cpu_count() or 1)}
@@ -127,16 +128,6 @@ def _sigmoid(source: torch.Tensor) -> torch.Tensor:
 @_sigmoid.register_fake
 def _fake_sigmoid(source):
     return torch.sigmoid(source)
-
-
-@torch.library.custom_op('flare::gelu', mutates_args=())
-def _gelu(source: torch.Tensor, approximate: str = 'none') -> torch.Tensor:
-    return torch.nn.functional.gelu(source, approximate=approximate)
-
-
-@_gelu.register_fake
-def _fake_gelu(source, approximate='none'):
-    return torch.empty_like(source)
 
 
 @torch.library.custom_op('flare::native_layer_norm', mutates_args=())
@@ -380,7 +371,7 @@ def _lower_storage(module):
     register_lowering(torch.ops.flare.snapshot.default)(_snapshot_lowering)
     graph = module.graph
     # FP32 rounding differences can cross a BF16 rounding boundary.
-    for node in graph.nodes:
+    for node in list(graph.nodes):
         if node.op == 'call_function' and node.target is torch.ops.aten.mean.dim:
             node.target = torch.ops.flare.mean.default
         elif (node.op == 'call_function' and node.target is torch.ops.aten.sigmoid.default
@@ -388,7 +379,11 @@ def _lower_storage(module):
             node.target = torch.ops.flare.sigmoid.default
         elif (node.op == 'call_function' and node.target is torch.ops.aten.gelu.default
                 and node.kwargs.get('approximate', 'none') == 'none'):
-            node.target = torch.ops.flare.gelu.default
+            with graph.inserting_before(node):
+                destination = graph.call_function(torch.ops.aten.empty_like.default, (node.args[0],))
+                destination.meta = node.meta.copy()
+            node.target = torch.ops.aten.gelu.out
+            node.kwargs = {**node.kwargs, 'out': destination}
         elif node.op == 'call_function' and node.target is torch.ops.aten.native_layer_norm.default:
             node.target = torch.ops.flare.native_layer_norm.default
         elif node.op == 'call_function' and node.target is torch.ops.aten._fused_rms_norm.default:

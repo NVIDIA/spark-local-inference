@@ -66,18 +66,42 @@ class PreparedGroupedConvolution:
                 session=session, coordinator=coordinator, name=name + ".gather")
         self.project = UnquantizedProjection(source, weights["projection"], local,
                                              session=session, name=name + ".coefficients")
+        self._functional_layout = None
 
-    def convolve(self, source, side, output):
+    def functional(self, *, session):
+        """Return convolution outputs as local values while retaining weights and its prepared plan."""
+        if self._functional_layout is None:
+            self._functional_layout = (tuple(self.coefficients.shape), self.coefficients.stride(),
+                                       self.coefficients.dtype, tuple(self.before.shape), self.before.stride(),
+                                       self.before.dtype)
+            self.project.functional(session=session)
+            if self.gather is not None:
+                self.gather.functional(session=session)
+            self.coefficients = self.before = self.after = None
+        return self
+
+    def convolve(self, source, side, output=None, coefficients=None):
+        functional = self._functional_layout is not None
+        coefficients = self.coefficients if coefficients is None else coefficients
+        if output is None:
+            if functional:
+                _, _, _, shape, stride, dtype = self._functional_layout
+                output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
+            else:
+                output = self.before if side == 0 else self.after
+        tokens = source.shape[0]
         torch.library.wrap_triton(_convolve)[(triton.cdiv(source.numel(), 256),)](
-            source, self.coefficients, self.base, output, self.tokens, self.hidden, self.group_size,
-            self.block_size, self.taps, self.coefficients.stride(0), side, 256)
+            source, coefficients, self.base, output, tokens, self.hidden, self.group_size,
+            self.block_size, self.taps, coefficients.stride(0), side, 256)
         return output
 
     def prepare(self, source):
         local = self.project(source)
-        if self.gather is not None:
-            self.gather(local)
-        return self.convolve(source, 0, self.before)
+        coefficients = local if self.gather is None else self.gather(local)
+        before = self.convolve(source, 0, coefficients=coefficients)
+        return (before, coefficients) if self._functional_layout is not None else before
 
-    def finish(self, source):
-        return self.convolve(source, 1, self.after)
+    def finish(self, source, coefficients=None):
+        if self._functional_layout is None:
+            return self.convolve(source, 1, self.after)
+        return self.convolve(source, 1, coefficients=coefficients)

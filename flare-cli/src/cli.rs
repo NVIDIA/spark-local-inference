@@ -482,6 +482,7 @@ impl OrbitPush {
             scheduler_policy: "balanced".into(),
             scheduler_terminal_value: None,
             scheduler_terminal_age_price: None,
+            scheduler_checkpoint_extra_work_fraction: None,
             serving: self.serving.clone(),
         }
     }
@@ -583,6 +584,11 @@ pub struct OrbitRun {
     #[arg(long, value_name = "PRICE", value_parser = scheduler_coefficient, help_heading = "Serving options")]
     pub scheduler_terminal_age_price: Option<f64>,
 
+    /// Extra checkpoint work as a fraction of prefill work [default: 0.05; 0 disables extras].
+    /// Terminal checkpoints also earn allowance from completed decode work.
+    #[arg(long, value_name = "FRACTION", value_parser = checkpoint_extra_work_fraction, help_heading = "Serving options")]
+    pub scheduler_checkpoint_extra_work_fraction: Option<f64>,
+
     /// File on rank zero's node containing the serving API key; overrides its [server].api_key.
     #[arg(long, value_name = "PATH", help_heading = "Serving options")]
     pub api_key_file: Option<PathBuf>,
@@ -628,6 +634,9 @@ impl OrbitRun {
         if let Some(price) = self.scheduler_terminal_age_price {
             options.extend(["--scheduler-terminal-age-price".into(), price.to_string()]);
         }
+        if let Some(fraction) = self.scheduler_checkpoint_extra_work_fraction {
+            options.extend(["--scheduler-checkpoint-extra-work-fraction".into(), fraction.to_string()]);
+        }
         if let Some(path) = &self.api_key_file {
             options.extend(["--api-key-file".into(), path.display().to_string()]);
         }
@@ -657,6 +666,7 @@ impl OrbitRun {
                 .unwrap_or_else(|| "balanced".into()),
             scheduler_terminal_value: self.scheduler_terminal_value,
             scheduler_terminal_age_price: self.scheduler_terminal_age_price,
+            scheduler_checkpoint_extra_work_fraction: self.scheduler_checkpoint_extra_work_fraction,
             serving: self.serving.clone(),
         }
     }
@@ -777,6 +787,11 @@ pub struct Run {
     /// Terminal waiting cost in value/ms², independent of output cadence [default: 1].
     #[arg(long, value_name = "PRICE", value_parser = scheduler_coefficient, help_heading = "Serving options")]
     pub scheduler_terminal_age_price: Option<f64>,
+
+    /// Extra checkpoint work as a fraction of prefill work [default: 0.05; 0 disables extras].
+    /// Terminal checkpoints also earn allowance from completed decode work.
+    #[arg(long, value_name = "FRACTION", value_parser = checkpoint_extra_work_fraction, help_heading = "Serving options")]
+    pub scheduler_checkpoint_extra_work_fraction: Option<f64>,
 
     #[command(flatten)]
     pub serving: ServingOptions,
@@ -993,6 +1008,12 @@ fn scheduler_coefficient(value: &str) -> Result<f64, String> {
         .ok()
         .filter(|value| value.is_finite() && *value >= 0.0)
         .ok_or_else(|| "scheduler coefficient must be finite and nonnegative".into())
+}
+
+fn checkpoint_extra_work_fraction(value: &str) -> Result<f64, String> {
+    value.parse::<f64>().ok()
+        .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
+        .ok_or_else(|| "checkpoint extra work fraction must be finite and between zero and one".into())
 }
 
 fn verification_alpha(value: &str) -> Result<f64, String> {
@@ -1233,6 +1254,17 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_extra_work_fraction_rejects_invalid_ranges() {
+        for value in ["-1", "1.01", "NaN", "inf", "-inf"] {
+            assert!(Cli::try_parse_from(["flare", "run", "model", "--scheduler-checkpoint-extra-work-fraction", value]).is_err());
+            assert!(Cli::try_parse_from(["flare", "orbit", "run", "model", "--scheduler-checkpoint-extra-work-fraction", value]).is_err());
+        }
+        for value in ["0", "0.05", "1"] {
+            assert!(Cli::try_parse_from(["flare", "run", "model", "--scheduler-checkpoint-extra-work-fraction", value]).is_ok());
+        }
+    }
+
+    #[test]
     fn persistent_orbit_options_preserve_saved_values_and_allow_explicit_defaults() {
         use clap::{CommandFactory, FromArgMatches};
         assert!(Cli::try_parse_from(["flare", "orbit", "run", "model", "--persistent"]).is_err());
@@ -1249,6 +1281,8 @@ mod tests {
                     "--scheduler-terminal-value",
                     "256",
                     "--scheduler-terminal-age-price",
+                    "0",
+                    "--scheduler-checkpoint-extra-work-fraction",
                     "0",
                     "--mtp-adaptive-verification-alpha",
                     "1.0",
@@ -1287,6 +1321,8 @@ mod tests {
                 "512".into(),
                 "--scheduler-terminal-age-price".into(),
                 "2".into(),
+                "--scheduler-checkpoint-extra-work-fraction".into(),
+                "0.25".into(),
                 "--mtp-adaptive-verification-alpha".into(),
                 "0.5".into(),
                 "--kv-cache-limit".into(),
@@ -1300,6 +1336,8 @@ mod tests {
                 panic!()
             };
             assert_eq!(effective.port, if explicit { 8000 } else { 8001 });
+            assert_eq!(effective.scheduler_checkpoint_extra_work_fraction, Some(if explicit { 0.0 } else { 0.25 }));
+            assert_eq!(orbit.run_args().scheduler_checkpoint_extra_work_fraction, orbit.scheduler_checkpoint_extra_work_fraction);
             assert_eq!(
                 effective.scheduler_terminal_value,
                 Some(if explicit { 256.0 } else { 512.0 })

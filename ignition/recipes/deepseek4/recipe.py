@@ -17,8 +17,13 @@ from ignition.recipes.declaration import (
 )
 
 def prepare(
-    snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_graphs=False, core_storage=None
+    snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_graphs=False, core_storage=None,
+    ranks=None,
 ):
+    """Prepare the plan's catalog on process-local GPUs 0 through N-1.
+
+    With `ranks`, rank zero's multi-host rendezvous, each rank uses its own host's GPU 0.
+    """
     from ignition.preparation.rank_group import prepare_group
 
     from .bootstrap import PreparationConfig, prepare_rank
@@ -37,7 +42,8 @@ def prepare(
         compile_workers=plan.compile_workers, autotune_effort=plan.autotune_effort, tuning_replica=plan.tuning_replica,
         native_dense_activations=plan.native_dense_activations,
         lock_gpu_clocks=plan.lock_gpu_clocks and plan.autotune_effort != "off",
-        devices=tuple(range(plan.world_size)),
+        devices=tuple(range(plan.world_size)) if ranks is None else (0,) * plan.world_size,
+        hosts=None if ranks is None else ranks.hosts, roce_ring=plan.roce_ring, roce_chain=plan.roce_chain,
         compile_decoder=compile_forwards,
         retain_graphs=retain_graphs,
         max_active=plan.concurrency, image_concurrency=plan.image_concurrency,
@@ -50,7 +56,8 @@ def prepare(
         stream_overlap=plan.stream_overlap,
         **drafting,
     )
-    return prepare_group(snapshot, config, prepare_rank, progress=progress, core_storage=core_storage)
+    return prepare_group(snapshot, config, prepare_rank, progress=progress, core_storage=core_storage,
+                         ranks=ranks, checkpoint=plan.checkpoint)
 
 
 def usage(prepared):

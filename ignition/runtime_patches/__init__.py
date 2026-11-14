@@ -103,10 +103,10 @@ def apply() -> None:
             if torch.__version__ != _TORCH_VERSION:
                 raise PreparationError(f"Ignition runtime patches require torch=={_TORCH_VERSION}; "
                                        f"found {torch.__version__}")
-            from . import dynamo, functionalization, scheduler, static_triton, workers
+            from . import dynamo, functionalization, memory_planning, scheduler, static_triton, workers
 
             replacements = (*dynamo.replacements(), *functionalization.replacements(), *scheduler.replacements(),
-                            *static_triton.replacements(), *workers.replacements())
+                            *memory_planning.replacements(), *static_triton.replacements(), *workers.replacements())
             originals = [(owner, name, vars(owner).get(name, _MISSING)) for owner, name, _ in replacements]
             # Build and check every replacement before publishing any of them.
             for owner, name, replacement in replacements:

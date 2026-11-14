@@ -101,7 +101,7 @@ class PreparedAllReduce:
 
             def prepare(state):
                 return PreparedCall(run=lambda: state.all_reduce(source, out=output), output=output,
-                                    owners=(runtime, source, output))
+                                    owners=(runtime,))
         elif isinstance(runtime, pcie.DmaAllReduce):
             # Copy-engine ring for prefill-sized activations.
             from b12x.comm.pcie._dma_preparation import query_from_metadata
@@ -112,7 +112,7 @@ class PreparedAllReduce:
 
             def prepare(state):
                 return PreparedCall(run=lambda: state.run(source, out=output), output=output,
-                                    owners=(runtime, source, output))
+                                    owners=(runtime,))
         elif runtime.algorithm == "hierarchical":
             from b12x.comm.pcie._owner_preparation import prepared_call
 
@@ -162,7 +162,7 @@ class PreparedAllReduce:
                     return prepared_call(state, payload=source, out=output)
                 state.bind_input(source)
                 return PreparedCall(run=lambda: state.run_plain(source, output),
-                                    output=output, owners=(runtime, source, output))
+                                    output=output, owners=(runtime,))
 
         ranks = tuple(dist.get_process_group_ranks(group))
         request = self.plan.request(name=name, prepare_call=prepare,
@@ -174,12 +174,24 @@ class PreparedAllReduce:
         self.handle = next(_HANDLES)
         _OWNERS[self.handle] = self
 
-    def __call__(self, source):
+    def functional(self, *, session):
+        """Allocate the reduction destination inside the traced forward."""
+        if self.output is not None:
+            self.output_layout = (tuple(self.output.shape), self.output.stride(), self.output.dtype)
+            self.output = None
+        return self
+
+    def __call__(self, source, output=None):
+        if output is None:
+            output = self.output
+        if output is None:
+            shape, stride, dtype = self.output_layout
+            output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
         if self.single:
-            self.output.copy_(source)
-            return self.output
-        _all_reduce(source, self.output, self.handle)
-        return self.output
+            output.copy_(source)
+        else:
+            _all_reduce(source, output, self.handle)
+        return output
 
 
 class PreparedChunkedAllGather:
@@ -198,16 +210,33 @@ class PreparedChunkedAllGather:
                       for index, (begin, end) in enumerate(self.bounds)]
         self.output = output
 
+    def functional(self, *, session):
+        """Allocate one destination shared by the ordered row chunks."""
+        if self.output is not None:
+            self.output_layout = (tuple(self.output.shape), self.output.stride(), self.output.dtype)
+            self.output = None
+            for part in self.parts:
+                part.functional(session=session)
+        return self
+
     def __call__(self, source):
+        output = self.output
+        if output is None:
+            shape, stride, dtype = self.output_layout
+            output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
         for (begin, end), part in zip(self.bounds, self.parts, strict=True):
-            part(source[begin:end])
-        return self.output
+            part(source[begin:end], output[begin:end])
+        return output
 
     def run_eager(self, source):
         """Gather on the current stream from inside another eager operation."""
+        output = self.output
+        if output is None:
+            shape, stride, dtype = self.output_layout
+            output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
         for (begin, end), part in zip(self.bounds, self.parts, strict=True):
-            part.run_eager(source[begin:end])
-        return self.output
+            part.run_eager(source[begin:end], output[begin:end])
+        return output
 
 
 class PreparedChunkedAllReduce:
@@ -240,10 +269,23 @@ class PreparedChunkedAllReduce:
                       for index, (begin, end) in enumerate(self.bounds)]
         self.output = output
 
+    def functional(self, *, session):
+        """Allocate one destination shared by the ordered row chunks."""
+        if self.output is not None:
+            self.output_layout = (tuple(self.output.shape), self.output.stride(), self.output.dtype)
+            self.output = None
+            for part in self.parts:
+                part.functional(session=session)
+        return self
+
     def __call__(self, source):
+        output = self.output
+        if output is None:
+            shape, stride, dtype = self.output_layout
+            output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
         for (begin, end), part in zip(self.bounds, self.parts, strict=True):
-            part(source[begin:end])
-        return self.output
+            part(source[begin:end], output[begin:end])
+        return output
 
 
 @dataclass(frozen=True)
@@ -336,10 +378,20 @@ class PreparedAllReduceRMSNorm:
         self.handle = next(_HANDLES)
         _OWNERS[self.handle] = self
 
-    def __call__(self, source, residual):
-        _all_reduce_rmsnorm(source, residual, self.weight, self.output, self.handle, self.input_addend,
-                           self.group_weights, self.group_ids)
-        return self.output
+    def functional(self, *, session):
+        self.output_layout = tuple(self.output.shape), tuple(self.output.stride()), self.output.dtype
+        self.output = self.residual = self.input_addend = self.group_weights = self.group_ids = None
+        return self
+
+    def __call__(self, source, residual, *, input_addend=None, group_weights=None, group_ids=None):
+        output = self.output
+        if output is None:
+            output = torch.empty_strided(self.output_layout[0], self.output_layout[1], dtype=self.output_layout[2], device=source.device)
+        else:
+            input_addend, group_weights, group_ids = self.input_addend, self.group_weights, self.group_ids
+        _all_reduce_rmsnorm(source, residual, self.weight, output, self.handle, input_addend,
+                           group_weights, group_ids)
+        return output
 
 
 @torch.library.custom_op("flare::pcie_all_reduce_add", mutates_args=("residual",))
@@ -389,8 +441,16 @@ class PreparedAllReduceAdd:
         self.handle = next(_HANDLES)
         _OWNERS[self.handle] = self
 
-    def __call__(self, source, residual):
-        _all_reduce_add(source, residual, self.handle, self.input_addend, self.group_weights, self.group_ids)
+    def functional(self, *, session):
+        self.input_addend = self.group_weights = self.group_ids = None
+        return self
+
+    def __call__(self, source, residual, *, input_addend=None, group_weights=None, group_ids=None):
+        _all_reduce_add(source, residual, self.handle,
+                        self.input_addend if input_addend is None else input_addend,
+                        self.group_weights if group_weights is None else group_weights,
+                        self.group_ids if group_ids is None else group_ids)
+        return residual
 
 
 def _gather_transport_view(tensor):
@@ -438,13 +498,21 @@ def _fake_start_all_gather(source, output, dependencies, handle, stream):
 
 
 @torch.library.custom_op("flare::join_all_gather", mutates_args=("output",))
-def _join_all_gather(source: torch.Tensor, output: torch.Tensor, dependency: torch.Tensor, stream: int) -> None:
+def _join_all_gather(source: torch.Tensor, output: torch.Tensor, dependencies: list[torch.Tensor],
+                     dependency: torch.Tensor, stream: int) -> None:
     torch.cuda.current_stream(source.device).wait_stream(torch.cuda.ExternalStream(stream, device=source.device))
 
 
 @_join_all_gather.register_fake
-def _fake_join_all_gather(source, output, dependency, stream):
+def _fake_join_all_gather(source, output, dependencies, dependency, stream):
     pass
+
+
+@dataclass(frozen=True)
+class PendingAllGather:
+    source: torch.Tensor
+    output: torch.Tensor
+    dependencies: list[torch.Tensor]
 
 
 class ConcurrentAllGather:
@@ -475,13 +543,22 @@ class ConcurrentAllGather:
         if self.gather.plan.memory_requirements().scratch_nbytes:
             raise ValueError("concurrent column gather requires a plan without caller scratch")
 
-    def start(self, source):
-        _start_all_gather(source, self.gather.output, self.gather.dependencies,
-                          self.gather.handle, self.stream_handle)
+    def functional(self, *, session):
+        self.gather.functional(session=session)
+        return self
 
-    def finish(self, source, dependency):
-        _join_all_gather(source, self.gather.output, dependency, self.stream_handle)
-        return self.gather.output
+    def start(self, source, *, dependencies=()):
+        output = self.gather.output
+        if output is None:
+            shape, stride, dtype = self.gather.output_layout
+            output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
+        dependencies = [*self.gather.dependencies, *dependencies]
+        _start_all_gather(source, output, dependencies, self.gather.handle, self.stream_handle)
+        return PendingAllGather(source, output, dependencies)
+
+    def finish(self, pending, dependency):
+        _join_all_gather(pending.source, pending.output, pending.dependencies, dependency, self.stream_handle)
+        return pending.output
 
 
 @triton.jit
@@ -591,6 +668,8 @@ class PreparedBroadcast:
     def prepare(self):
         from ignition.preparation.triton import prepare_triton
 
+        if self._byte_views is None:
+            return
         options = dict(OFFSETS=self._offsets, SIZES=self._sizes, BOOLS=self._bools, BLOCK=256, num_warps=4)
         grid = (triton.cdiv(max(self._sizes), 256), 1, 1)
         self._pack = prepare_triton(_broadcast_pack, (self._byte_views, self.send), grid, **options)
@@ -603,15 +682,33 @@ class PreparedBroadcast:
             ROW_BYTES=self._row_bytes, WORLD=self._world, BLOCK=256, num_warps=4)
             for group in self._unpack_groups)
 
-    def __call__(self):
+    def functional(self, *, session):
+        """Accept runtime payloads and allocate transport scratch in the forward."""
+        if not self.single and not hasattr(self, "send_shape"):
+            self.send_shape = tuple(self.send.shape)
+            self.gather.functional(session=session)
+            register_finalizer(session, self._release_buffers)
+        return self
+
+    def _release_buffers(self):
+        self.send = self.received = self._tensors = self._byte_views = None
+        self._pack.args = ()
+        for operation in self._unpacks:
+            operation.args = ()
+
+    def __call__(self, tensors=None):
         if self.single:
             return
-        _broadcast_pack_call(list(self._tensors), self.send, self.handle)
-        self.gather(self.send.view(torch.bfloat16))
+        tensors = self._tensors if tensors is None else tuple(tensors)
+        send = self.send
+        if send is None:
+            send = torch.zeros(self.send_shape, dtype=torch.uint8, device=tensors[0].device)
+        _broadcast_pack_call(list(tensors), send, self.handle)
+        received = self.gather(send.view(torch.bfloat16)).view(torch.uint8)
         # Aliased destinations keep their field order across separate stream-ordered launches.
         # Disjoint fields share one launch, including the ordinary sampling payload.
         for index, group in enumerate(self._unpack_groups):
-            _broadcast_unpack_call(self.received, [self._tensors[field] for field in group], self.handle, index)
+            _broadcast_unpack_call(received, [tensors[field] for field in group], self.handle, index)
 
 
 class PreparedAllGather:
@@ -653,7 +750,7 @@ class PreparedAllGather:
             declare(session, (self.plan.request(name=name,
                 prepare_call=lambda state: PreparedCall(
                     run=lambda: runtime._run_prepared_all_gather(transport_source, prepared=state, dim=-1, out=transport_output),
-                    output=output, owners=(runtime, source, output)),
+                    output=output, owners=(runtime,)),
                 collective=CollectiveRequirement(key=name, ranks=ranks)),), coordinator=coordinator)
             self.handle = next(_HANDLES)
             _OWNERS[self.handle] = self
@@ -694,7 +791,7 @@ class PreparedAllGather:
         ranks = tuple(dist.get_process_group_ranks(runtime.exchange_group))
         declare(session, (self.plan.request(name=name,
             prepare_call=lambda state: PreparedCall(run=lambda: state.run(**call), output=output,
-                                                    owners=(runtime, source, output)),
+                                                    owners=(runtime,)),
             collective=CollectiveRequirement(key=name, ranks=ranks)),), coordinator=coordinator)
         if startup:
             from ignition.preparation.startup_tuning import register_collective
@@ -702,30 +799,48 @@ class PreparedAllGather:
         self.handle = next(_HANDLES)
         _OWNERS[self.handle] = self
 
-    def __call__(self, source):
-        if self.single:
-            self.output.copy_(source)
-            return self.output
-        _all_gather(source, self.output, self.dependencies, self.handle)
-        return self.output
+    def functional(self, *, session):
+        """Allocate the gathered destination inside the traced forward."""
+        if self.output is not None:
+            self.output_layout = (tuple(self.output.shape), self.output.stride(), self.output.dtype)
+            self.output = None
+        self.dependencies = []
+        return self
 
-    def run_eager(self, source):
-        """Gather on the current stream from inside another eager operation."""
+    def __call__(self, source, output=None, *, dependencies=()):
+        if output is None:
+            output = self.output
+        if output is None:
+            shape, stride, dtype = self.output_layout
+            output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
         if self.single:
-            self.output.copy_(source)
-            return self.output
-        _gather_columns(source, self.output, self.handle)
-        return self.output
+            output.copy_(source)
+        else:
+            _all_gather(source, output, [*self.dependencies, *dependencies], self.handle)
+        return output
+
+    def run_eager(self, source, output=None):
+        """Gather on the current stream from inside another eager operation."""
+        if output is None:
+            output = self.output
+        if output is None:
+            shape, stride, dtype = self.output_layout
+            output = torch.empty_strided(shape, stride, dtype=dtype, device=source.device)
+        if self.single:
+            output.copy_(source)
+        else:
+            _gather_columns(source, output, self.handle)
+        return output
 
 
 @torch.library.custom_op("flare::roce_all_gather_varlen", mutates_args=("output",))
-def _all_gather_varlen(counts: torch.Tensor, output: torch.Tensor, handle: int) -> None:
+def _all_gather_varlen(source: torch.Tensor, counts: torch.Tensor, output: torch.Tensor, handle: int) -> None:
     owner = _OWNERS[handle]
-    owner.runtime.all_gather_varlen(owner.source, counts, out=output, plan=owner.plan)
+    owner.runtime.all_gather_varlen(source, counts, out=output, plan=owner.plan)
 
 
 @_all_gather_varlen.register_fake
-def _fake_all_gather_varlen(counts, output, handle):
+def _fake_all_gather_varlen(source, counts, output, handle):
     pass
 
 
@@ -749,7 +864,8 @@ class PreparedVarlenGather:
             raise ValueError("variable-length gathers require one contiguous 16-byte-multiple row per rank")
         self.runtime, self.output, self.counts = runtime, output, counts
         # A rank's own row is its source, so the gather leaves it in place.
-        self.source = output[ranks.index(dist.get_rank())]
+        self.local_rank = ranks.index(dist.get_rank())
+        self.source = output[self.local_rank]
         self.plan = _roce_plan(runtime, coordinator, "AllReduce.all_gather_varlen")
         declare(session, (self.plan.request(name=name,
             prepare_call=lambda state: PreparedCall(
@@ -759,9 +875,18 @@ class PreparedVarlenGather:
         self.handle = next(_HANDLES)
         _OWNERS[self.handle] = self
 
-    def __call__(self):
-        _all_gather_varlen(self.counts, self.output, self.handle)
-        return self.output
+    def functional(self, *, session):
+        register_finalizer(session, self._release_examples)
+        return self
+
+    def _release_examples(self):
+        self.source = self.counts = self.output = None
+
+    def __call__(self, output=None, counts=None):
+        output = self.output if output is None else output
+        counts = self.counts if counts is None else counts
+        _all_gather_varlen(output[self.local_rank], counts, output, self.handle)
+        return output
 
 
 @torch.library.custom_op("flare::pcie_lse_reduce_scatter", mutates_args=("output",))
@@ -831,13 +956,28 @@ class PreparedLseReduceScatter:
         self.handle = next(_HANDLES)
         _OWNERS[self.handle] = self
 
+    def functional(self, *, session):
+        self.output_layout = tuple(self.output.shape), tuple(self.output.stride()), self.output.dtype
+        self.output = None
+        if self.roce:
+            self.send_layout = tuple(self.send.shape), self.send.dtype
+            self.send = self.received = None
+            self.gather.functional(session=session)
+        return self
+
     def __call__(self, partial, lse):
+        output = self.output
+        if output is None:
+            output = torch.empty_strided(self.output_layout[0], self.output_layout[1], dtype=self.output_layout[2], device=partial.device).zero_()
         if self.roce:
             from .head_exchange import merge, pack
 
-            pack(partial, lse, self.send, self.rank, self.world)
-            self.gather(self.send)
-            merge(self.received, partial, lse, self.output, self.rank, self.world)
-            return self.output
-        _lse_reduce_scatter(partial, lse, self.output, self.handle)
-        return self.output
+            send = self.send
+            if send is None:
+                send = torch.zeros(self.send_layout[0], dtype=self.send_layout[1], device=partial.device)
+            pack(partial, lse, send, self.rank, self.world)
+            received = self.gather(send)
+            merge(received, partial, lse, output, self.rank, self.world)
+            return output
+        _lse_reduce_scatter(partial, lse, output, self.handle)
+        return output

@@ -203,8 +203,8 @@ class HostRendezvous:
 
     def __init__(self, address, world, *, identity, topology, checkpoint_token_file="~/.config/flare/agent.token",
                  checkpoint_fabric=None):
-        if world not in (2, 3, 4):
-            raise ValueError("multi-host tensor parallelism requires two, three, or four ranks")
+        if world not in (2, 3, 4, 6):
+            raise ValueError("multi-host tensor parallelism requires two, three, four, or six ranks")
         self.address, self.world = parse_address(address), world
         self.identity, self.topology = identity, topology
         self.checkpoint_token_file = checkpoint_token_file

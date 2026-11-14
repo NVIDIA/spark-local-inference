@@ -64,7 +64,7 @@ from .vision_state import FEATURES, PATCH_CAPACITIES, PreparedVisionGeneration, 
 from ignition.components.vision_state import PrefillVisionInputs, VisionState
 
 
-_COMPILED_KINDS = ("prefill", "scored_prefill", "decode", "resume", "speculative", "vision")
+_COMPILED_KINDS = ("prefill", "scored_prefill", "decode", "resume", "speculative", "vision", "init", "restore", "snapshot")
 # Prefill chunks of at least this many tokens all-reduce through the copy-engine ring.
 _DMA_PREFILL_TOKENS = 1024
 # Allocator granularity and fragmentation slack beyond the headroom kept after the final KV allocation.
@@ -420,23 +420,14 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
                         max_rows=min(config.token_capacity, SLICE_ROWS), columns=2048 * shard.world_size, ipc=ipc),
                     coordinator=coordinator)
         shards = None if context is None else context.shards
-        # Prefill chunks overlay their layer intermediates; decode rows keep small separate scratch.
         remote = context is not None and context.remote
         prefill_storage = DecoderScratch.allocate(config.prefill_chunk_size, blocks, "prefill", device,
-            shard=shard, sample_rows=1, context_ranks=context_ranks, overlay_layers=True, remote=remote)
+            shard=shard, sample_rows=1, context_ranks=context_ranks, remote=remote)
         decode_rows = max(config.request_capacity,
                           max((b * w for b, w in config.speculative_shapes), default=1) if config.mtp else 1)
         decoder_storage = DecoderScratch.allocate(decode_rows, blocks, "decode", device,
             shard=shard, sample_rows=sample_rows, context_ranks=context_ranks, remote=remote)
 
-        if vision_storage is not None:
-            from ignition.components.moe import RouterScratch
-            from ignition.preparation.scratch import overlay
-            from .indexer import IndexScratch
-
-            # Vision and text graphs replay serially; index and router constants retain their storage.
-            prefill_storage, vision_storage = overlay((prefill_storage, vision_storage),
-                                                      keep=(IndexScratch, RouterScratch))
         speculation = None
         if config.mtp:
             from .speculative import SpeculativePreparation
@@ -479,9 +470,12 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
                 module.eval().requires_grad_(False)
                 encoder = PreparedVision(module, storage, vision_metadata, weights.vision,
                     session=session, name=name, projection_workspace=arena, attention_workspace=arena)
+                encoder.functional(session=session)
                 forward = PreparedVisionGeneration(encoder, vision_inputs, vision_state, completion, frame, sequence)
                 add(name, forward, "vision", 1, capacity, (*vision_inputs.buffers(), "vision_feature_slot"))
                 vision_owners.extend((vision_metadata, encoder, forward))
+        prefill_feedback = (torch.empty((config.prefill_chunk_size, 4096), dtype=torch.bfloat16, device=device)
+                            if config.mtp else None)
         for enabled in graph_modes:
             suffix = "-no-mtp" if config.mtp and not enabled else ""
             mode_inputs = tuple(field for field in forward_inputs if enabled or field != "draft_page_tables")
@@ -493,7 +487,7 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
                     metadata[name] = DecoderMetadata.allocate(capacity, rows, blocks, device)
                     storage = prefill_storage if mode == "prefill" else decoder_storage
                     scratch[name] = storage.rows(capacity, mode, sample_rows=rows)
-                    feedback = (torch.empty((capacity, 4096), dtype=torch.bfloat16, device=device)
+                    feedback = (prefill_feedback[:capacity]
                                 if enabled and kind != "scored_prefill" else None)
                     decoders[name] = PreparedDecoder(weights, scratch[name], pool.decoder, metadata[name], mode=mode,
                         scoring=scoring if kind == "scored_prefill" else None,
@@ -509,8 +503,10 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
                     if enabled:
                         from .speculative import PreparedPrefill
 
-                        forward = PreparedPrefill(speculation, forward, decoders[name].feedback, name)
+                        forward = PreparedPrefill(speculation, forward, name)
                     fields = (*mode_inputs, "vision_token_indices", "vision_feature_slot") if mode == "prefill" and vision_state is not None else mode_inputs
+                    if mode == "decode":
+                        fields = tuple(field for field in fields if field not in ("token_ids", "query_lengths"))
                     add(name, forward, kind, rows, capacity if mode == "prefill" else 1, fields, enabled=enabled)
         if speculation is not None:
             from .speculative import PreparedRound
@@ -528,7 +524,7 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
                 name = f"resume{capacity}" + suffix
                 resume = PreparedResume(weights, requests, pool, inputs, completion, frame, sequence,
                     rows=capacity, runtime=collective, vocabulary_runtime=vocabulary_collective,
-                    coordinator=coordinator, session=session, name=name)
+                    coordinator=coordinator, session=session, name=name, workspace=arena)
                 add(name, resume, "resume", capacity, 1, (*row_inputs, "sampling_grammar_mask"), enabled=enabled)
                 for mode in ("init", "restore", "snapshot"):
                     name = f"{mode}{capacity}" + suffix
@@ -539,6 +535,12 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
                         page_tokens=config.page_tokens)
                     fields = row_inputs if mode == "snapshot" else ("request_state_rows", *admission.__dataclass_fields__)
                     add(name, operation, mode, capacity, 1, (*fields, "page_tables", *(("draft_page_tables",) if enabled else ()), *commands.buffers()), enabled=enabled)
+    scratch.clear()
+    metadata.clear()
+    decoder_storage = prefill_storage = vision_storage = None
+    storage = vision_metadata = feedback = prefill_feedback = None
+    if speculation is not None:
+        speculation.release_examples()
     memory(f"after graph catalog (operator scratch {arena.nbytes >> 20} MiB)")
     with phase(progress, "Prepare and tune kernels") as stage, transient:
         tuning = session.tune(show_progress=progress is not None and rank == 0, console=stage.console)
@@ -547,6 +549,7 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
            f"allocated={torch.cuda.memory_allocated(device) >> 20} MiB, reserved={torch.cuda.memory_reserved(device) >> 20} MiB, "
            f"weights={weights.allocated_bytes >> 20} MiB, continuation={pool.backing.nbytes >> 20} MiB, "
            f"operator scratch={arena.nbytes >> 20} MiB")
+    arena.release_preparation()
     stream = torch.cuda.Stream(device=device)
     graph_pool = torch.cuda.graph_pool_handle() if core_storage is None else core_storage.graph_pool.id
     trials, _ = capture_forwards(forwards, signatures, session=session, device=device,
@@ -682,8 +685,6 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
         decoder_storage, prefill_storage, scratch, metadata, compiled, stream, graph_pool, session, collective,
         prefill_collective, vocabulary_collective, coordinator, speculation, context,
         vision_state, vision_inputs, vision_prefill, vision_storage, vision_owners)
-    from .export import disposable_ranges
-
     return PreparedModel(rebuild_weights=declare_weights(weights, components={
         'tree.model.language_model.embed_tokens': 'embedding',
         'tree.model.language_model.norm': 'norm',
@@ -694,9 +695,7 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
     }), device=config.devices[rank], graphs=graphs, buffers=buffers, signatures=signatures,
         max_active=config.max_active, resources=resources, session=session,
         forwards={name: compiled.get(name, forward) for name, forward in forwards.items()},
-        export_zero_ranges=(*(() if scoring is None else scoring.zero_ranges()),
-                            *disposable_ranges((decoder_storage, prefill_storage, vision_storage,
-                                None if vision_state is None else vision_state.arena), arena, forwards), *completion.zero_ranges()),
+        export_zero_ranges=(*(() if scoring is None else scoring.zero_ranges()), *completion.zero_ranges()),
         close_resources=(*((scoring,) if scoring is not None else ()),
                          *(() if context is None else (context.heads, context.candidates)), *shared_pages,
                          *(() if virtual_pages is None else (virtual_pages,)),

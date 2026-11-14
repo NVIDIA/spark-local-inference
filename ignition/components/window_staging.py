@@ -134,6 +134,7 @@ class PreparedWindowStaging:
                 or type(first_position) is not int):
             raise ValueError("window staging requires matching positive BF16 candidates, BF16/FP8 history and FP8 output geometry")
         capacity = output_key.shape[0] * output_key.shape[1] // rows
+        self.page_shapes = tuple(output_key.shape), tuple(output_value.shape)
         outputs = tuple(t.view(rows, capacity, *key.shape[1:]) for t in (output_key, output_value))
         counts = m.lengths if counts is None else counts
         self.arguments = (history_key, history_value, key, value, *outputs,
@@ -153,9 +154,11 @@ class PreparedWindowStaging:
         q = Query(key.shape[1], key.shape[2], capacity, history_key.shape[1],
                   str(history_key.dtype).removeprefix("torch."), first_position)
         payload = CONTRACT.encode_query(q)
+        arguments = self.arguments
+        device_index = key.device.index
 
         def materialize(tactic):
-            program = compile_staging(payload, key.device.index)
+            program = compile_staging(payload, device_index)
             load_programs({"stage": program})
             return attach_programs(State(q, program), program)
 
@@ -163,7 +166,61 @@ class PreparedWindowStaging:
             materialize=materialize, compile_jobs=lambda t, d: (CompileJob.create(
                 "ignition.components.window_staging:compile_staging", payload, d.ordinal),))
         declare(session, (self.plan.request(name=name,
-            prepare_call=lambda state: PreparedCall(run=lambda: _run(self.arguments, state))),))
+            prepare_call=lambda state: PreparedCall(run=lambda: _run(arguments, state))),))
+        self._functional_layout = None
 
-    def __call__(self):
-        _execute(*self.arguments, self.plan.handle)
+    def functional(self, *, session):
+        """Allocate staged cache windows inside the compiled forward."""
+        del session
+        if self._functional_layout is None:
+            a = self.arguments
+            output_key, output_value = a[4], a[5]
+            self._functional_layout = (
+                tuple(a[0].shape), tuple(a[1].shape), tuple(a[2].shape), tuple(a[3].shape),
+                tuple(output_key.shape), output_key.dtype, tuple(output_value.shape), output_value.dtype,
+                tuple(a[6].shape), tuple(a[7].shape), tuple(a[8].shape), tuple(a[9].shape),
+            )
+            self.history_key, self.history_value = a[:2]
+            self.key_shape, self.key_dtype = tuple(a[2].shape), a[2].dtype
+            self.value_shape, self.value_dtype = tuple(a[3].shape), a[3].dtype
+            self.metadata_shapes = tuple(tuple(t.shape) for t in a[6:10])
+            self.rows = a[6].numel()
+            self.metadata = None
+            self.counts = None
+            self.plan_handle = self.plan.handle
+            self.arguments = None
+        return self
+
+    def __call__(self, key=None, value=None, counts=None, metadata=None):
+        if self._functional_layout is None:
+            _execute(*self.arguments, self.plan.handle)
+            return self.arguments[4], self.arguments[5]
+        if key is None or value is None or tuple(key.shape) != self.key_shape or tuple(value.shape) != self.value_shape:
+            raise ValueError("functional window staging requires candidate tensors with prepared geometry")
+        if metadata is None:
+            metadata = self.metadata
+        if metadata is None:
+            raise ValueError("functional window staging requires runtime metadata")
+        starts, states, offsets, lengths = (metadata.starts, metadata.state_rows,
+                                            metadata.query_start_loc, metadata.lengths)
+        if tuple(tuple(t.shape) for t in (starts, states, offsets, lengths)) != self.metadata_shapes:
+            raise ValueError("functional window staging metadata differs from prepared geometry")
+        for tensor, dtype in ((starts, torch.int64), (states, torch.int64),
+                              (offsets, torch.int32), (lengths, torch.int32)):
+            if tensor.device != key.device or tensor.dtype != dtype:
+                raise ValueError("functional window staging metadata has incompatible device or dtype")
+        (_, _, _, _, out_key_shape, out_dtype, out_value_shape, out_value_dtype,
+         _, _, _, _) = self._functional_layout
+        rows = self.rows
+        capacity = out_key_shape[1]
+        output_key = torch.empty(self.page_shapes[0], dtype=out_dtype, device=key.device)
+        output_value = torch.empty(self.page_shapes[1], dtype=out_value_dtype, device=value.device)
+        selected_counts = lengths if counts is None else counts
+        if (selected_counts.device != key.device or selected_counts.dtype != torch.int32
+                or selected_counts.numel() != rows):
+            raise ValueError("functional window staging counts differ from prepared geometry")
+        _execute(self.history_key, self.history_value, key, value,
+                 output_key.view(rows, capacity, *key.shape[1:]),
+                 output_value.view(rows, capacity, *value.shape[1:]),
+                 starts, states, offsets, lengths, selected_counts, self.plan_handle)
+        return output_key, output_value

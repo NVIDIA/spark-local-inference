@@ -2,13 +2,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Flare community contributors
 # SPDX-License-Identifier: Apache-2.0
 
-"""Shared activation storage preserves persistent selections and concurrent expert outputs."""
+"""Declaration tensors preserve geometry without owning serving temporaries."""
 
 import pytest
 import torch
 
-from ignition.preparation.disposable import storage_ranges
-from ignition.preparation.scratch import GraphBufferPool
 from ignition.recipes.deepseek41.bootstrap import PreparationConfig
 from ignition.recipes.deepseek41.decoder import Scratch
 
@@ -18,7 +16,7 @@ def _overlap(left, right):
         left.data_ptr() + left.nbytes, right.data_ptr() + right.nbytes)
 
 
-def test_serial_stages_share_storage_without_overwriting_live_residuals_or_selections():
+def test_declaration_stages_do_not_overwrite_residuals_or_selections():
     scratch = Scratch.allocate(128, 1, 4, "cpu", candidate_tokens=16)
     retained = (scratch.residual, scratch.engram_residual, scratch.attention_hc.residual,
                 scratch.ffn_hc.residual, scratch.attention.selected, scratch.attention.candidates,
@@ -29,7 +27,7 @@ def test_serial_stages_share_storage_without_overwriting_live_residuals_or_selec
         value.fill_(index + 1)
     for index, value in enumerate(concurrent):
         assert all(not _overlap(value, other) for other in (*retained, *concurrent[:index]))
-    assert any(_overlap(value, other) for value in concurrent
+    assert all(not _overlap(value, other) for value in concurrent
                for other in (scratch.embedding, scratch.engram.gathered, scratch.engram.projected))
     engram = (scratch.engram.gathered, scratch.engram.local, scratch.engram.partial, scratch.engram.projected)
     for index, value in enumerate(engram):
@@ -42,10 +40,9 @@ def test_serial_stages_share_storage_without_overwriting_live_residuals_or_selec
     assert scratch.rows(8, 1).attention.candidates.shape == (8, 16384)
 
 
-def test_suffix_destinations_and_variant_private_buffers_preserve_activation_storage():
-    pool = GraphBufferPool("cpu", chunk_bytes=2 << 20)
-    prefill = Scratch.allocate(128, 1, 4, "cpu", buffers=pool.cursor())
-    suffix = Scratch.allocate(32, 1, 4, "cpu", buffers=prefill.buffers)
+def test_suffix_declarations_preserve_full_prefill_sources():
+    prefill = Scratch.allocate(128, 1, 4, "cpu")
+    suffix = Scratch.allocate(32, 1, 4, "cpu")
     pairs = [(getattr(prefill.attention_hc, name), getattr(suffix.attention_hc, name))
              for name in ("normalized", "residual", "post", "comb")]
     pairs.append((prefill.attn_mix, suffix.attn_mix))
@@ -55,17 +52,11 @@ def test_suffix_destinations_and_variant_private_buffers_preserve_activation_sto
         destination.fill_(9)
         assert source.eq(7).all()
     first = prefill.rows(128, 1)
-    private = first.buffers.zeros((128, 512), torch.bfloat16)
-    capacity = pool.nbytes
     second = prefill.rows(32, 1)
-    reused = second.buffers.zeros((128, 512), torch.bfloat16)
-    assert reused.data_ptr() == private.data_ptr()
-    reused.fill_(33)
-    assert private[:32].eq(33).all()
+    assert first.residual.data_ptr() == second.residual.data_ptr() == prefill.residual.data_ptr()
+    assert second.attention_hc.normalized.shape == (32, 5120)
     for source, destination in pairs:
         assert source.eq(7).all() and destination.eq(9).all()
-    assert pool.nbytes == capacity
-    assert storage_ranges((prefill, suffix, first, second)) == storage_ranges(pool)
 
 
 @pytest.mark.parametrize("capacity,dspark,draft_width,expected", [

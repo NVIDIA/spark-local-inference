@@ -10,7 +10,7 @@ import triton.language as tl
 from b12x.comm.pcie import _owner_preparation
 
 from ignition.components.collectives import PreparedAllReduce
-from ignition.preparation.tuning import declare
+from ignition.preparation.tuning import declare, register_finalizer
 
 _OWNERS = weakref.WeakValueDictionary()
 _HANDLES = itertools.count()
@@ -32,6 +32,24 @@ def _fake_stage(local_indices, local_scores, indices, scores, dependencies, hand
     pass
 
 
+@torch.library.custom_op("flare::candidate_owner_stage_counted", mutates_args=("indices", "scores", "counts"))
+def _stage_counted(local_indices: torch.Tensor, local_scores: torch.Tensor, local_counts: torch.Tensor,
+                   indices: torch.Tensor, scores: torch.Tensor, counts: torch.Tensor,
+                   dependencies: list[torch.Tensor], handle: int) -> None:
+    operation = _OWNERS[handle]
+    if (indices.data_ptr() != operation.indices.data_ptr()
+            or scores.data_ptr() != operation.scores.data_ptr()
+            or counts.data_ptr() != operation.counts.data_ptr()):
+        raise ValueError("counted candidate-stage outputs must alias the reserved channel views")
+    with operation.runtime.capture(plan=operation.plan):
+        operation.runtime.stage_candidates(local_indices, local_scores, local_counts, plan=operation.plan)
+
+
+@_stage_counted.register_fake
+def _fake_stage_counted(local_indices, local_scores, local_counts, indices, scores, counts, dependencies, handle):
+    pass
+
+
 class PreparedCandidateOwnerStage:
     """Deliver rank-major score/ID rows to their contiguous row partitions.
 
@@ -39,12 +57,14 @@ class PreparedCandidateOwnerStage:
     storage; their consumers must complete before another call reuses it.
     """
 
-    def __init__(self, local_indices, local_scores, *, runtime, session, coordinator, name, dependencies=()):
+    def __init__(self, local_indices, local_scores, *, runtime, session, coordinator, name,
+                 local_counts=None, dependencies=()):
         self.runtime = runtime
-        self.local_indices, self.local_scores = local_indices, local_scores
+        self.local_indices, self.local_scores, self.local_counts = local_indices, local_scores, local_counts
         self.dependencies = list(dependencies)
         self.indices, self.scores = runtime.graph_candidate_views(local_indices.shape[0])
-        call = dict(local_indices=local_indices, local_scores=local_scores)
+        self.counts = None if local_counts is None else runtime.graph_count_views(local_indices.shape[0])
+        call = dict(local_indices=local_indices, local_scores=local_scores, local_counts=local_counts)
         self.plan = _owner_preparation.plan(
             _owner_preparation.query_from_runtime(runtime, call=call), runtime=runtime)
         declare(session, (self.plan.request(name=name,
@@ -53,8 +73,25 @@ class PreparedCandidateOwnerStage:
         self.handle = next(_HANDLES)
         _OWNERS[self.handle] = self
 
-    def __call__(self):
-        _stage(self.local_indices, self.local_scores, self.indices, self.scores, self.dependencies, self.handle)
+    def functional(self, *, session):
+        register_finalizer(session, self._release_examples)
+        return self
+
+    def _release_examples(self):
+        self.local_indices = self.local_scores = self.local_counts = None
+        self.dependencies = []
+
+    def __call__(self, local_indices=None, local_scores=None, local_counts=None, *, dependencies=()):
+        local_indices = self.local_indices if local_indices is None else local_indices
+        local_scores = self.local_scores if local_scores is None else local_scores
+        if self.counts is not None:
+            local_counts = self.local_counts if local_counts is None else local_counts
+            _stage_counted(local_indices, local_scores, local_counts,
+                           self.indices, self.scores, self.counts,
+                           [*self.dependencies, *dependencies], self.handle)
+            return self.indices, self.scores, self.counts
+        _stage(local_indices, local_scores, self.indices, self.scores,
+               [*self.dependencies, *dependencies], self.handle)
         return self.indices, self.scores
 
 
@@ -109,12 +146,24 @@ class PreparedOwnedRowBroadcast:
         self.reduction = PreparedAllReduce(self.send, self.received, runtime=runtime,
             session=session, coordinator=coordinator, name=name)
 
-    def __call__(self):
+    def functional(self, *, session):
+        self.output_layout = tuple(self.output.shape), self.output.dtype
+        self.source = self.output = self.send = self.received = None
+        self.reduction.functional(session=session)
+        return self
+
+    def __call__(self, source=None):
+        if source is None:
+            source, output, send = self.source, self.output, self.send
+        else:
+            shape, dtype = self.output_layout
+            output = torch.empty(shape, dtype=dtype, device=source.device)
+            send = torch.empty((self.rows, self.row_bytes), dtype=torch.bfloat16, device=source.device)
         grid = (self.rows, triton.cdiv(self.row_bytes, 1024))
         torch.library.wrap_triton(_encode_owned_rows)[grid](
-            self.source.view(torch.uint8), self.rank, self.send,
+            source.view(torch.uint8), self.rank, send,
             ROWS=self.rows, OWNER_ROWS=self.owner_rows, ROW_BYTES=self.row_bytes, BLOCK=1024, num_warps=4)
-        self.reduction(self.send)
+        received = self.reduction(send)
         torch.library.wrap_triton(_decode_owned_rows)[grid](
-            self.received, self.output.view(torch.uint8), ROW_BYTES=self.row_bytes, BLOCK=1024, num_warps=4)
-        return self.output
+            received, output.view(torch.uint8), ROW_BYTES=self.row_bytes, BLOCK=1024, num_warps=4)
+        return output

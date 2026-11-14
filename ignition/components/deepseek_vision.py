@@ -15,6 +15,7 @@ from ignition.components.mlp import MLPScratch, PreparedMLP
 from ignition.components.rms_norm import PreparedRMSNorm
 from ignition.components.varlen_attention import PreparedVarlenAttention
 from ignition.components.weights import MLPWeights
+from ignition.preparation.persistent import persistent_copy
 
 @dataclass(frozen=True)
 class VisionInputs:
@@ -67,25 +68,14 @@ class VisionScratch:
     output: torch.Tensor
 
     @classmethod
-    def allocate(cls, patches, device, *, hidden, buffers=None):
-        def zeros(cursor, *shape):
-            return (torch.zeros(shape, dtype=torch.bfloat16, device=device) if cursor is None
-                    else cursor.zeros(shape, torch.bfloat16))
+    def allocate(cls, patches, device, *, hidden):
+        def zeros(*shape):
+            return torch.zeros(shape, dtype=torch.bfloat16, device=device)
 
-        pixels = zeros(buffers, patches, 588)
-        residual, normalized, projected = (zeros(buffers, patches, 1024) for _ in range(3))
-        stages = [buffers.fork() for _ in range(3)] if buffers is not None else [None] * 3
-        attention, feedforward, merger = stages
-        mlp = MLPScratch.allocate(patches, 1024, 2816, device, buffers=feedforward)
-        qkv = zeros(attention, patches, 3072)
-        query, key, value = (zeros(attention, patches, 16, 64) for _ in range(3))
-        attended = zeros(attention, patches, 1024)
-        merged = zeros(merger, patches // 9, 9216)
-        aligned, activated, output = (zeros(merger, patches // 9, hidden) for _ in range(3))
-        if buffers is not None:
-            buffers.join(*stages)
-        return cls(pixels, residual, normalized, qkv, query, key, value, attended, projected,
-                   mlp, merged, aligned, activated, output)
+        return cls(zeros(patches, 588), zeros(patches, 1024), zeros(patches, 1024),
+            zeros(patches, 3072), *(zeros(patches, 16, 64) for _ in range(3)),
+            zeros(patches, 1024), zeros(patches, 1024), MLPScratch.allocate(patches, 1024, 2816, device),
+            zeros(patches // 9, 9216), *(zeros(patches // 9, hidden) for _ in range(3)))
 
     def rows(self, patches):
         return type(self)(
@@ -101,17 +91,12 @@ class VisionScratch:
 
 
 class PreparedVision:
-    def __init__(self, weights, scratch, inputs, *, session, workspace, name, buffers=None):
-        self.scratch, self.inputs = scratch, inputs
+    def __init__(self, weights, scratch, inputs, *, session, workspace, name):
+        self.inputs = inputs
+        self.capacity = scratch.patches.shape[0]
         tokens, device = scratch.patches.shape[0], scratch.patches.device
-        self.frequencies = 10000 ** (-torch.arange(0, 32, 2, dtype=torch.float32, device=device) / 32)
-        def zeros(shape, dtype=torch.int32):
-            return (torch.zeros(shape, dtype=dtype, device=device) if buffers is None
-                    else buffers.zeros(shape, dtype))
-        self.positions = zeros((tokens, 2), torch.int64)
-        self.cu = zeros((2,))
-        self.indices = zeros((tokens // 9, 9)).fill_(-1)
-        self.num_patches, self.num_features = zeros((1,)), zeros((1,))
+        self.frequencies = persistent_copy(10000 ** (-torch.arange(0, 32, 2, dtype=torch.float32, device=device) / 32))
+        cu = torch.zeros(2, dtype=torch.int32, device=device)
 
         def project(key, source, out):
             return UnquantizedProjection(
@@ -121,7 +106,7 @@ class PreparedVision:
                 bias=weights.get(key + ".bias"),
                 session=session,
                 name=name + "." + key,
-            )
+            ).functional(session=session)
 
         self.patch = project("vision.patch_embed.proj", scratch.patches, scratch.residual)
         self.blocks = []
@@ -134,7 +119,7 @@ class PreparedVision:
                 eps=1e-6,
                 session=session,
                 name=f"{name}.{index}.norm1",
-            )
+            ).functional()
             qkv = project(prefix + ".attn.wqkv", scratch.normalized, scratch.qkv)
             output = project(prefix + ".attn.wo", scratch.attended, scratch.projected)
             norm2 = PreparedRMSNorm(
@@ -144,7 +129,7 @@ class PreparedVision:
                 eps=1e-6,
                 session=session,
                 name=f"{name}.{index}.norm2",
-            )
+            ).functional()
             mlp = PreparedMLP(
                 scratch.normalized,
                 MLPWeights(weights[prefix + ".mlp.w1.weight"], weights[prefix + ".mlp.w2.weight"]),
@@ -155,18 +140,18 @@ class PreparedVision:
                 name=f"{name}.{index}.mlp",
                 workspace=workspace,
                 round_silu=True,
-            )
+            ).functional(session=session)
             self.blocks.append((norm1, qkv, output, norm2, mlp))
         self.attention = PreparedVarlenAttention(
             scratch.query,
             scratch.key,
             scratch.value,
-            self.cu,
+            cu,
             scratch.attended.view(tokens, 16, 64),
             session=session,
             workspace=workspace,
             name=name + ".attention",
-        )
+        ).functional(session=session)
         self.norm = PreparedRMSNorm(
             scratch.residual,
             weights["vision.norm.weight"],
@@ -174,35 +159,30 @@ class PreparedVision:
             eps=1e-6,
             session=session,
             name=name + ".norm",
-        )
+        ).functional()
         self.align1 = project("aligner.w1", scratch.merged, scratch.aligned)
         self.align2 = project("aligner.w2", scratch.activated, scratch.output)
 
-    def __call__(self):
-        s = self.scratch
-        self.patch(s.patches)
-        angles = (self.positions.float()[:, :, None] * self.frequencies).flatten(1)[:, None, :]
+    def __call__(self, pixels, positions, cu, indices):
+        residual = self.patch(pixels)
+        angles = (positions.float()[:, :, None] * self.frequencies).flatten(1)[:, None, :]
         cos, sin = angles.cos(), angles.sin()
 
-        def rotate(source, destination):
+        def rotate(source):
             a, b = source.float().chunk(2, dim=-1)
-            destination.copy_(torch.cat((a * cos - b * sin, b * cos + a * sin), dim=-1))
+            return torch.cat((a * cos - b * sin, b * cos + a * sin), dim=-1).to(source.dtype)
 
         for norm1, qkv, output, norm2, mlp in self.blocks:
-            q, k, v = qkv(norm1(s.residual)).view(-1, 3, 16, 64).unbind(1)
-            rotate(q, s.query)
-            rotate(k, s.key)
-            s.value.copy_(v)
-            self.attention()
-            s.residual.add_(output(s.attended))
-            s.residual.add_(mlp(norm2(s.residual)))
-        self.norm(s.residual)
-        indices = self.indices.long()
-        gathered = s.normalized[indices.clamp(0, s.normalized.shape[0] - 1)]
+            q, k, v = qkv(norm1(residual)).view(-1, 3, 16, 64).unbind(1)
+            attended = self.attention(rotate(q), rotate(k), v.contiguous(), cu).flatten(1)
+            residual = residual + output(attended)
+            residual = residual + mlp(norm2(residual))
+        normalized = self.norm(residual)
+        indices = indices.long()
+        gathered = normalized[indices.clamp(0, normalized.shape[0] - 1)]
         gathered = torch.where(indices[:, :, None] >= 0, gathered, 0)
-        s.merged.copy_(gathered.transpose(1, 2).reshape(s.merged.shape))
-        s.activated.copy_(F.gelu(self.align1(s.merged)))
-        return self.align2(s.activated)
+        merged = gathered.transpose(1, 2).reshape(indices.shape[0], -1)
+        return self.align2(F.gelu(self.align1(merged)))
 
 
 @dataclass(frozen=True)
@@ -243,11 +223,7 @@ class VisionState:
         self.arena = arena
         self.generation = torch.zeros(requests.capacity, dtype=torch.int64, device=device)
         self.count = torch.zeros(requests.capacity, dtype=torch.int32, device=device)
-        self.sentinels = torch.stack(
-            [
-                weights[name] for name in sentinel_names
-            ]
-        )
+        self.sentinels = persistent_copy(torch.stack([weights[name] for name in sentinel_names]))
 
     def visible(self, metadata):
         count = metadata.token_ids.numel()
@@ -282,17 +258,14 @@ class VisionState:
 
 
 class PreparedVisionGeneration:
-    def __init__(self, encoder, state, completion, frame, sequence, *, buffers=None):
+    def __init__(self, encoder, state, completion, frame, sequence):
         self.encoder, self.state = encoder, state
-        self.completion, self.frame, self.sequence = completion, frame, sequence
-        self.errors = (torch.zeros(1, dtype=torch.int32, device=completion.records.device) if buffers is None
-                       else buffers.zeros((1,), torch.int32))
         self.publish = PreparedFeaturePublication(state, encoder.inputs, completion, frame, sequence)
 
     def __call__(self):
         e, s = self.encoder, self.state
         i, r = e.inputs, s.requests
-        capacity = e.scratch.patches.shape[0]
+        capacity = e.capacity
         slot = i.vision_slot.long().clamp(0, r.capacity - 1)
         count, features = i.vision_num_patches, i.vision_num_features
         offset = i.vision_feature_offset
@@ -312,14 +285,13 @@ class PreparedVisionGeneration:
             | ((i.vision_position_ids[:capacity] >= 0) & (i.vision_position_ids[:capacity] < capacity))
         ).all()
         valid &= (s.feature_slot >= 0) & (s.feature_slot < s.arena.shape[0])
-        self.errors.copy_(~valid)
-        e.scratch.patches.copy_(torch.where(valid & patch_live[:, None], i.vision_pixel_values[:capacity], 0))
-        e.positions.copy_(torch.where(valid & patch_live[:, None], i.vision_position_ids[:capacity], 0))
-        e.indices.copy_(torch.where(valid & feature_live[:, None], indices, -1))
-        e.cu.copy_(torch.where(valid, i.vision_cu_seqlens, 0))
-        e.num_patches.copy_(torch.where(valid, count, 0))
-        e.num_features.copy_(torch.where(valid, features, 0))
-        output = e()
+        errors = (~valid).to(torch.int32)
+        pixels = torch.where(valid & patch_live[:, None], i.vision_pixel_values[:capacity], 0).to(torch.bfloat16)
+        positions = torch.where(valid & patch_live[:, None], i.vision_position_ids[:capacity], 0)
+        merge = torch.where(valid & feature_live[:, None], indices, -1)
+        cu = torch.where(valid, i.vision_cu_seqlens, 0)
+        num_features = torch.where(valid, features, 0)
+        output = e(pixels, positions, cu, merge)
         finite = (~feature_live[:, None] | torch.isfinite(output)).all()
-        self.errors.copy_(self.errors | (~finite).int() * 64)
-        self.publish(output, e.num_features, self.errors)
+        errors = errors | (~finite).int() * 64
+        self.publish(output, num_features, errors)

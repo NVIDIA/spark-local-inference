@@ -98,6 +98,34 @@ def test_preparation_selects_dflash_without_loading_inferact(monkeypatch, tmp_pa
     assert prepared.snapshot_budget_bytes == plan.snapshots * RECIPE.speculative_methods["dflash2"].ranks[16].state_row_bytes
 
 
+@pytest.mark.parametrize("online,scope", [(True, "kda-input"), (False, None), (True, "all")])
+def test_dflash_body_and_head_precision_reach_config_and_rebuild_metadata(
+        monkeypatch, tmp_path, online, scope):
+    from google.protobuf import json_format
+    from ignition.preparation import rebuild_manifest, runtime_core_pb2 as proto
+    from ignition.recipes import resolve
+    from .test_declarations import fitted
+
+    model = resolve("kimi-k3.1-pro")
+    plan = fitted(model, 16, concurrency=4, online_mxfp8=online, online_mxfp8_scope=scope,
+        speculation=replace(model.recipe.speculation, method="dflash2",
+                            draft_body_quantization="mxfp8", draft_head_quantization="nvfp4"))
+    (tmp_path / "dflash2").mkdir()
+    monkeypatch.setattr("ignition.preparation.rank_group.prepare_group",
+                        lambda snapshot, config, prepare, **kwargs: config)
+    prepared = model.recipe.prepare(tmp_path, plan, compile_forwards=True, kernel_cache=None, progress=None)
+    assert prepared.online_mxfp8 == online
+    assert prepared.online_mxfp8_scope == (scope or "all")
+    assert prepared.draft_body_quantization == "mxfp8"
+    assert prepared.draft_head_quantization == "nvfp4"
+    manifest = rebuild_manifest.from_plan(SimpleNamespace(directory=None), plan, compiled_forwards=True)
+    encoded = proto.RebuildManifest()
+    json_format.ParseDict(manifest, encoded)
+    assert encoded.speculation.draft_body_quantization == "mxfp8"
+    assert encoded.speculation.draft_head_quantization == "nvfp4"
+    assert encoded.online_mxfp8_scope == (scope or "all")
+
+
 @pytest.mark.parametrize("change", [dict(is_causal=False),dict(mla_use_nope=True),dict(sliding_window=1000),
     dict(num_target_layers=92),dict(hidden_size=8192),dict(rope_interleave=False)])
 def test_rejects_incompatible_draft(change):

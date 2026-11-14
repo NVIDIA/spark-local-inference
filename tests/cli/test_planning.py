@@ -308,7 +308,7 @@ def test_prefill_chunk_defaults_to_the_recipe_and_accepts_an_override():
 
 @pytest.mark.parametrize("model,world_size,packed", [
     pytest.param(ResolvedModel(recipe, checkpoint),
-                 8 if recipe.name == "mimo_v2" else recipe.tensor_parallel[0],
+                 recipe.checkpoint_tensor_parallel(checkpoint)[-1] if recipe.name == "mimo_v2" else recipe.tensor_parallel[0],
                  recipe.speculation.packed_verification, id=checkpoint.alias)
     for recipe in recipes() if recipe.speculation is not None for checkpoint in recipe.checkpoints
 ])
@@ -425,14 +425,37 @@ def test_online_mxfp8_scope_must_be_declared_by_recipe():
 
 
 @pytest.mark.parametrize("command", ["export", "debug-serve", "bench"])
-def test_online_mxfp8_has_no_user_scope_option(command, capsys):
+def test_online_mxfp8_scope_option(command):
     from ignition.cli import _parser
 
-    with pytest.raises(SystemExit) as error:
-        _parser().parse_args([command, "kimi-k3.1-pro", "--online-mxfp8",
-                              "--online-mxfp8-scope", "all"])
-    assert error.value.code == 2
-    assert "unrecognized arguments: --online-mxfp8-scope all" in capsys.readouterr().err
+    default = _parser().parse_args([command, "kimi-k3.1-pro", "--online-mxfp8"])
+    args = _parser().parse_args([command, "kimi-k3.1-pro", "--online-mxfp8",
+                                 "--online-mxfp8-scope", "all"])
+    assert default.online_mxfp8_scope is None
+    assert args.online_mxfp8_scope == "all"
+
+
+@pytest.mark.parametrize("command", ["export", "debug-serve", "bench"])
+def test_draft_body_quantization_option(command):
+    from ignition.cli import _parser
+
+    default = _parser().parse_args([command, "kimi-k3.1-pro", "--speculative-method", "dflash2"])
+    args = _parser().parse_args([command, "kimi-k3.1-pro", "--speculative-method", "dflash2",
+                                 "--draft-body-quantization", "mxfp8"])
+    assert default.draft_body_quantization is None
+    assert args.draft_body_quantization == "mxfp8"
+
+
+def test_draft_body_quantization_requires_dflash2_and_positive_depth():
+    from ignition.recipes.kimi31.recipe import RECIPE
+
+    with pytest.raises(UsageError, match="requires --speculative-method dflash2"):
+        devices = tuple(replace(gpu(i, 95), total_bytes=256 * GIB, free_bytes=255 * GIB) for i in range(16))
+        planning.fit(RECIPE, RECIPE.checkpoints[0], devices, concurrency=1,
+                     reserve_bytes=0, speculation=replace(RECIPE.speculation,
+                                                          draft_body_quantization="mxfp8"))
+    with pytest.raises(ValueError, match="positive learned draft depth"):
+        Speculation(0, draft_body_quantization="mxfp8")
 
 
 @pytest.mark.parametrize("alias,default", [("kimi-k3", "all"), ("kimi-k3.1-pro", "kda-input")])

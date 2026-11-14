@@ -1,0 +1,13 @@
+{
+  "source": {
+    "repository": "XiaomiMiMo/MiMo-V2.6-Flash-RL",
+    "revision": "f657ba2f7d24c9adc5730675baaa2d34de878a49",
+    "filename": "chat_template.jinja"
+  },
+  "source_sha256": "853650bee57bf95020373e4c928bd5a4b41b9915adf964a77711d2b49a291887",
+  "result_sha256": "cb45120bce30711bc944d1cf0d972682ca437fbef430c185995d477244634bfe",
+  "insertions": [
+    3106,
+    3674
+  ]
+}

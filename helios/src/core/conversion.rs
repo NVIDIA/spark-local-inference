@@ -2735,6 +2735,7 @@ fn rebuild_compatible(
             == (if b.online_mxfp8_scope.is_empty() { "all" } else { &b.online_mxfp8_scope })
         && a.language_model_only == b.language_model_only
         && a.mla_compute_mode == b.mla_compute_mode
+        && a.effective_draft_body_quantization() == b.effective_draft_body_quantization()
         && speculation(&a.speculation) == speculation(&b.speculation)
 }
 
@@ -7117,7 +7118,60 @@ mod tests {
         explicit_scope.online_mxfp8_scope = "all".into();
         assert!(rebuild_compatible(&Some(omitted_scope), &Some(explicit_scope)));
 
-        let semantic_cases: [(&str, fn(&mut runtime::RebuildManifest)); 9] = [
+        for (label, online, scope, compatible) in [
+            ("dflash-inherited-all", true, "all", true),
+            ("dflash-inherited-empty-scope", true, "", true),
+            ("dflash-checkpoint-body", false, "all", false),
+            ("dflash-target-kda-only", true, "kda-input", false),
+        ] {
+            let mut implicit = rebuild("same-code");
+            implicit.online_mxfp8 = online;
+            implicit.online_mxfp8_scope = scope.into();
+            implicit.speculation.as_mut().unwrap().method = "dflash2".into();
+            let mut explicit = implicit.clone();
+            explicit
+                .speculation
+                .as_mut()
+                .unwrap()
+                .draft_body_quantization = Some("mxfp8".into());
+            let (tp1, tp2) = publish_pair(label, implicit, explicit);
+            let output = scratch.join(&format!("{label}-combined"));
+            let result = combine(&CombineRequest {
+                sources: &[tp1, tp2],
+                output: &output,
+                publishers: std::slice::from_ref(&publisher),
+                accepted: "example",
+                target_accepted: "example",
+                target_publisher: None,
+                key: &key,
+            });
+            if compatible {
+                result.unwrap();
+                let metadata = Metadata::open(&output).unwrap();
+                let envelope = protect::envelope(&metadata.envelope).unwrap();
+                let recorded: BTreeSet<_> = envelope
+                    .deployments
+                    .iter()
+                    .map(|deployment| {
+                        wire::DeploymentBody::decode(deployment.body.as_slice())
+                            .unwrap()
+                            .rebuild
+                            .unwrap()
+                            .speculation
+                            .unwrap()
+                            .draft_body_quantization
+                    })
+                    .collect();
+                assert_eq!(recorded, BTreeSet::from([None, Some("mxfp8".into())]));
+            } else {
+                assert_eq!(
+                    result.unwrap_err().to_string(),
+                    "source deployments disagree on checkpoint or preparation semantics"
+                );
+            }
+        }
+
+        let semantic_cases: [(&str, fn(&mut runtime::RebuildManifest)); 10] = [
             ("checkpoint-repository", |value| value.checkpoint_repository = "other/model".into()),
             ("checkpoint-revision", |value| value.checkpoint_revision = "other".into()),
             ("local-checkpoint", |value| value.local_checkpoint = true),
@@ -7127,6 +7181,9 @@ mod tests {
             }),
             ("online-mxfp8", |value| value.online_mxfp8 = false),
             ("online-mxfp8-scope", |value| value.online_mxfp8_scope = "kda-input".into()),
+            ("draft-body-quantization", |value| {
+                value.speculation.as_mut().unwrap().draft_body_quantization = Some("mxfp8".into())
+            }),
             ("language-model-only", |value| value.language_model_only = true),
             ("mla-compute-mode", |value| value.mla_compute_mode = "sparse".into()),
         ];

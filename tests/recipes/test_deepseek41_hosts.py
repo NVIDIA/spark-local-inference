@@ -21,7 +21,7 @@ def test_four_hosts_may_each_use_their_own_gpu_zero():
         bootstrap.PreparationConfig(devices=(0,) * 4, hosts=("hertz",) * 4)
 
 
-@pytest.mark.parametrize("world", [3, 4])
+@pytest.mark.parametrize("world", [3, 4, 6])
 @pytest.mark.parametrize("draft_tokens", [5, 7])
 @pytest.mark.parametrize("remote", [False, True])
 def test_recipe_dispatches_the_complete_plan_to_the_rank_group(monkeypatch, remote, draft_tokens, world):
@@ -33,7 +33,7 @@ def test_recipe_dispatches_the_complete_plan_to_the_rank_group(monkeypatch, remo
         reserve_bytes=6 << 30, speculation=Speculation(draft_tokens=draft_tokens, token_capacity=128,
             packed_verification=True, draft_prefix_selection="gpu"),
         expert_scale_compression="csf")
-    ranks = SimpleNamespace(hosts=("hertz", "faraday", "ampere", "maxwell")[:world]) if remote else None
+    ranks = SimpleNamespace(hosts=("hertz", "faraday", "ampere", "maxwell", "kelvin", "curie")[:world]) if remote else None
     calls, result, storage = [], object(), object()
     monkeypatch.setattr(rank_group, "prepare_group", lambda *args, **kwargs: calls.append((args, kwargs)) or result)
     assert recipe.prepare("checkpoint", plan, compile_forwards=True, kernel_cache=None, progress=None,
@@ -105,8 +105,7 @@ def test_draft_factory_uses_its_bf16_channel_without_changing_target(monkeypatch
     target_runtime, draft_runtime = object(), object()
     calls = []
     monkeypatch.setattr(bootstrap, 'PreparedDraft', lambda *args, **kwargs: calls.append(kwargs) or object())
-    target, draft = bootstrap._forward_factories('bf16', window_staging=None,
-        suffix_scratch=None, vision=None, draft_vocabulary_runtime=draft_runtime)
+    target, draft = bootstrap._forward_factories('bf16', vision=None, draft_vocabulary_runtime=draft_runtime)
     draft(vocabulary_runtime=target_runtime)
     assert calls[0]['vocabulary_runtime'] is draft_runtime
     assert target.keywords['mla_compute_mode'] == calls[0]['mla_compute_mode'] == 'bf16'

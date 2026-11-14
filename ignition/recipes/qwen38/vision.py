@@ -29,12 +29,11 @@ class VisionMetadata:
     num_patches: torch.Tensor
 
     @classmethod
-    def allocate(cls, patches: int, images: int, device: torch.device, *, buffers=None) -> VisionMetadata:
+    def allocate(cls, patches: int, images: int, device: torch.device) -> VisionMetadata:
         if patches <= 0 or patches % 4 or images <= 0:
             raise ValueError("vision requires positive image capacity and a patch capacity divisible by four")
         def zeros(shape, dtype):
-            return (torch.zeros(shape, dtype=dtype, device=device) if buffers is None
-                    else buffers.zeros(shape, dtype))
+            return torch.zeros(shape, dtype=dtype, device=device)
         return cls(zeros((patches, 4), torch.int64), zeros((patches, 4), torch.float32),
                    zeros((patches, 2), torch.int64), zeros((images + 1,), torch.int32),
                    zeros((1,), torch.int32))
@@ -55,31 +54,16 @@ class VisionScratch:
     output: torch.Tensor
 
     @classmethod
-    def allocate(cls, patches: int, device: torch.device, *, buffers=None) -> VisionScratch:
+    def allocate(cls, patches: int, device: torch.device) -> VisionScratch:
         if patches <= 0 or patches % 4:
             raise ValueError("vision patch capacity must be positive and divisible by four")
-        def zeros(cursor, *shape):
-            return (torch.zeros(shape, device=device, dtype=torch.bfloat16) if cursor is None
-                    else cursor.zeros(shape, torch.bfloat16))
-        hidden, projected = (zeros(buffers, patches, 1152) for _ in range(2))
-        stages = [buffers.fork() for _ in range(4)] if buffers is not None else [None] * 4
-        attention, mlp, patch, merger = stages
-        query, key, value = (zeros(attention, patches, 16, 72) for _ in range(3))
-        projection = attention.fork() if attention is not None else None
-        attended = attention.fork() if attention is not None else None
-        qkv = zeros(projection, patches, 3456)
-        output = zeros(attended, patches, 1152)
-        if attention is not None:
-            # QKV is consumed by the rotary and value copies before attention writes its output.
-            attention.join(projection, attended)
-        intermediate = zeros(mlp, patches, 4304)
-        pixels = zeros(patch, patches, 1536)
-        merger_intermediate = zeros(merger, patches // 4, 4608)
-        features = zeros(merger, patches // 4, 2560)
-        if buffers is not None:
-            buffers.join(*stages)
-        return cls(pixels, hidden, qkv, query, key, value, output, projected,
-                   intermediate, merger_intermediate, features)
+        def zeros(*shape):
+            return torch.zeros(shape, device=device, dtype=torch.bfloat16)
+        hidden, projected = (zeros(patches, 1152) for _ in range(2))
+        query, key, value = (zeros(patches, 16, 72) for _ in range(3))
+        return cls(zeros(patches, 1536), hidden, zeros(patches, 3456), query, key, value,
+                   zeros(patches, 1152), projected, zeros(patches, 4304),
+                   zeros(patches // 4, 4608), zeros(patches // 4, 2560))
 
     def rows(self, patches: int) -> VisionScratch:
         if patches <= 0 or patches % 4 or patches > self.patches.shape[0]:
@@ -136,14 +120,12 @@ class _Attention(torch.nn.Module):
             name=name, math_mode=attention_math_mode)
 
     def forward(self, hidden_states, cu_seqlens, position_embeddings=None, **kwargs):
-        s = self.scratch
         projected = self.qkv(hidden_states).view(-1, 3, 16, 72)
         query, key = apply_rotary_pos_emb_vision(projected[:, 0], projected[:, 1], *position_embeddings)
-        s.query.copy_(query)
-        s.key.copy_(key)
-        s.value.copy_(projected[:, 2])
-        self.attention()
-        return self.proj(s.attention)
+        query = query.contiguous()
+        key = key.contiguous()
+        value = projected[:, 2].contiguous()
+        return self.proj(self.attention(query, key, value, cu_seqlens).view(-1, 1152))
 
 
 class PreparedVision:
@@ -152,7 +134,7 @@ class PreparedVision:
     Geometry is computed by the native processor and copied into metadata.
     Padding is excluded from attention by cumulative lengths. Canonical block,
     layer normalization, activation, residual, and merger methods run only
-    during graph construction. The returned embedding buffer is persistent.
+    during graph construction. The returned embedding tensor is graph-local.
     Each capacity requires its own canonical module tree because methods are
     bound to capacity-specific prepared objects.
     """
@@ -203,20 +185,36 @@ class PreparedVision:
                 name=f"{name}.merger.{key}", activation_mode="a16", bias=original.bias,
                 workspace=projection_workspace)))
         def refresh_attention_workspace():
-            self.attention_workspace = module.blocks[0].attn.attention.scratch
+            if self.scratch is not None:
+                self.attention_workspace = module.blocks[0].attn.attention.scratch
 
         register_finalizer(session, refresh_attention_workspace, workspace=attention_workspace)
         self.output_rows = torch.arange(capacity // 4, device=device)
 
-    def __call__(self, pixels: torch.Tensor) -> torch.Tensor:
-        s, metadata, module = self.scratch, self.metadata, self.module
-        s.patches.copy_(pixels)
-        hidden = self.patch_embed(s.patches)
+    def functional(self, *, session):
+        self.patch_embed.projection.functional(session=session)
+        self.module.blocks[0].attn.attention.functional(session=session)
+        for block in self.module.blocks:
+            block.attn.qkv.functional(session=session)
+            block.attn.proj.functional(session=session)
+            block.attn.scratch = None
+            block.mlp.linear_fc1.projection.functional(session=session)
+            block.mlp.linear_fc2.projection.functional(session=session)
+        self.module.merger.linear_fc1.projection.functional(session=session)
+        self.module.merger.linear_fc2.projection.functional(session=session)
+        self.capacity = self.scratch.hidden.shape[0]
+        self.scratch = self.metadata = self.output_rows = None
+        return self
+
+    def __call__(self, pixels: torch.Tensor, metadata) -> torch.Tensor:
+        module = self.module
+        hidden = self.patch_embed(pixels.to(torch.bfloat16))
         positions = (module.pos_embed(metadata.interpolation_indices) * metadata.interpolation_weights[:, :, None]).sum(1)
         hidden = hidden + positions.to(hidden.dtype)
         rope = module.rotary_pos_emb(hidden, metadata.position_ids)
         for block in module.blocks:
             hidden = block(hidden, cu_seqlens=metadata.cu_seqlens, position_embeddings=rope)
         result = module.merger(hidden)
-        result.masked_fill_((self.output_rows >= metadata.num_patches // 4)[:, None], 0)
+        output_rows = torch.arange(self.capacity // 4, device=pixels.device)
+        result.masked_fill_((output_rows >= metadata.num_patches // 4)[:, None], 0)
         return result

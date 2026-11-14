@@ -175,6 +175,8 @@ class Plan:
     graph_bytes: int
     # Ranks shard each page's context when the recipe declares context-parallel page costs.
     context_parallel: bool = True
+    # TP16 Kimi may use one DCP16 group or two independent DCP8 context/head groups.
+    context_parallel_size: int | None = None
     # Captured graphs run independent branches on an auxiliary stream when the recipe declares
     # stream overlap; otherwise every branch runs serially on the main stream.
     stream_overlap: bool = True
@@ -205,6 +207,13 @@ class Plan:
     benchmark_selection: BenchmarkSelection | None = None
 
     def __post_init__(self):
+        if self.context_parallel_size is not None:
+            if (type(self.context_parallel_size) is not int or not 1 <= self.context_parallel_size <= self.world_size
+                    or self.world_size % self.context_parallel_size):
+                raise UsageError("context parallel size must divide the selected tensor parallel size")
+            if (self.context_parallel_size != self.world_size
+                    and (self.recipe.name != "kimi31" or self.world_size != 16 or self.context_parallel_size != 8)):
+                raise UsageError("hybrid context parallelism currently supports only Kimi K3.1 TP16 DCP8")
         if self.online_mxfp8_scope is None:
             object.__setattr__(self, "online_mxfp8_scope",
                                self.recipe.online_mxfp8_scope if self.online_mxfp8 else "all")
@@ -216,8 +225,8 @@ class Plan:
             selection = self.benchmark_selection
             if not isinstance(selection, BenchmarkSelection):
                 raise UsageError("benchmark selection requires explicit complete-round geometry")
-            if (self.recipe.name, self.world_size) not in (("qwen38_dense", 1), ("kimi31", 16)):
-                raise UsageError("benchmark graph preparation requires Qwen3.8-27B on one GPU or Kimi K3.1 Pro on sixteen GPUs")
+            if (self.recipe.name, self.world_size) not in (("qwen38_dense", 1), ("kimi31", 16), ("nemotron_h", 1)):
+                raise UsageError("benchmark graph preparation requires Qwen3.8-27B or Nemotron Bolt on one GPU, or Kimi K3.1 Pro on sixteen GPUs")
             if selection.speculation_study and self.recipe.name != "qwen38_dense":
                 raise UsageError("speculation studies require Qwen3.8-27B DFlash2")
             required_widths = (8,) if selection.speculation_study else selection.selected_verification_widths
@@ -304,7 +313,9 @@ class Plan:
 
     @property
     def page_tokens(self) -> int:
-        return (self.costs.page_tokens if self.context_parallel else None) or self.recipe.page_tokens
+        if not self.context_parallel or self.costs.page_tokens is None:
+            return self.recipe.page_tokens
+        return self.recipe.page_tokens * (self.context_parallel_size or self.world_size)
 
     @property
     def minimum_pages(self) -> int:
@@ -364,7 +375,9 @@ class Plan:
                       "total_bytes": gpu.total_bytes} for gpu in self.gpus],
             "tensor_parallel": self.world_size, "max_concurrency": self.concurrency,
             "image_concurrency": self.image_concurrency,
-            "prefill_chunk": self.prefill_chunk, "roce_ring": self.roce_ring, "roce_chain": self.roce_chain, "context_parallel": self.context_parallel,
+            "prefill_chunk": self.prefill_chunk, "roce_ring": self.roce_ring, "roce_chain": self.roce_chain,
+            "context_parallel": self.context_parallel,
+            "context_parallel_size": self.context_parallel_size or self.world_size,
             "stream_overlap": self.stream_overlap,
             "mixed_prefill": self.mixed_prefill,
             "prompt_logprobs": self.prompt_logprobs,
@@ -389,6 +402,8 @@ class Plan:
                 "packed_verification": self.speculation.packed_verification,
                 "draft_prefix_selection": self.speculation.draft_prefix_selection,
                 "draft_head_quantization": self.speculation.draft_head_quantization,
+                **({} if self.speculation.draft_body_quantization is None else {
+                    "draft_body_quantization": self.speculation.draft_body_quantization}),
                 "markov_head_quantization": self.speculation.markov_head_quantization,
                 "vocabulary_parallel_sampling": self.speculation.vocabulary_parallel_sampling,
                 **({"graph_budget": self.speculation.graph_budget}
@@ -411,7 +426,7 @@ class Plan:
 
 def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concurrency: int, reserve_bytes: int,
         speculation: Speculation | None, prefill_chunk: int | None = None,
-        context_parallel: bool = True, stream_overlap: bool = True, cache_states: int | None = None,
+        context_parallel: bool = True, context_parallel_size: int | None = None, stream_overlap: bool = True, cache_states: int | None = None,
         mixed_prefill: bool = False, prompt_logprobs: bool = False,
         expert_scale_compression: str | None = None, roce_ring: bool = False,
         roce_chain: bool = False,
@@ -452,6 +467,12 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
             if value is not None and value not in getattr(recipe, f"{head}_head_quantizations"):
                 raise UsageError(f"--{head}-head-quantization {value}: {checkpoint.alias}"
                                  " does not prepare this proposal head format")
+        body = speculation.draft_body_quantization
+        if body is not None and body not in recipe.draft_body_quantizations:
+            raise UsageError(f"--draft-body-quantization {body}: {checkpoint.alias}"
+                             " does not prepare this draft body format")
+        if body is not None and speculation.method != "dflash2":
+            raise UsageError("--draft-body-quantization requires --speculative-method dflash2")
     if expert_scale_compression is not None and expert_scale_compression not in checkpoint.scale_compressed_device_bytes:
         raise UsageError(f"--expert-scale-compression {expert_scale_compression}: {checkpoint.alias}"
                          " does not prepare this scale encoding")
@@ -468,10 +489,17 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
         except ValueError as error:
             raise UsageError(f"--speculative-graph-budget: {error}") from error
     costs = recipe.costs(len(gpus), speculation, checkpoint)
+    if recipe.name == "kimi31" and len(gpus) == 16 and context_parallel_size == 8:
+        # The DCP-only reduction shrinks from 14 MiB to 512 KiB at C4/W8. Two
+        # staging slots with 30 shards release 849,346,560 bytes, but let the
+        # planner consume only 64 pages of that saving and retain the rest as headroom.
+        credit = min(849_346_560, 64 * costs.page_bytes)
+        costs = replace(costs, graph_bytes=costs.graph_bytes - credit)
     plan = Plan(recipe, checkpoint, gpus, concurrency, recipe.prefill_chunk if prefill_chunk is None else prefill_chunk,
                 speculation, 0, 0, 0, reserve_bytes,
                 recipe.weights_bytes(checkpoint, len(gpus), speculation, expert_scale_compression), costs.graph_bytes,
                 context_parallel=context_parallel and costs.page_tokens is not None,
+                context_parallel_size=context_parallel_size,
                 stream_overlap=stream_overlap and recipe.stream_overlap, mixed_prefill=mixed_prefill, prompt_logprobs=prompt_logprobs,
                 expert_scale_compression=expert_scale_compression, roce_ring=roce_ring, roce_chain=roce_chain,
                 mla_compute_mode=mla_compute_mode,
@@ -528,7 +556,8 @@ def host_shape_error(roce_ring: bool, roce_chain: bool, hosts: int | None) -> st
 
 def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selected: tuple[int, ...] | None,
          concurrency: int, reserve_bytes: int, speculation: Speculation | None,
-         prefill_chunk: int | None = None, context_parallel: bool = True, stream_overlap: bool = True,
+         prefill_chunk: int | None = None, context_parallel: bool = True, context_parallel_size: int | None = None,
+         stream_overlap: bool = True,
          cache_states: int | None = None, mixed_prefill: bool = False, prompt_logprobs: bool = False,
          expert_scale_compression: str | None = None, roce_ring: bool = False, roce_chain: bool = False,
          image_concurrency: int | None = None, online_mxfp8: bool = False, online_mxfp8_scope: str | None = None,
@@ -565,7 +594,7 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
     if chunk % 64 or not 64 <= chunk <= recipe.context:
         raise UsageError(f"--prefill-chunk-size for {checkpoint.alias} must be a multiple of 64"
                          f" from 64 through {recipe.context:,}")
-    world_sizes = recipe.tensor_parallel
+    world_sizes = recipe.checkpoint_tensor_parallel(checkpoint)
     if speculation is not None and speculation.vocabulary_parallel_sampling:
         if recipe.name != "deepseek41":
             raise UsageError("--vocabulary-parallel-sampling requires DeepSeek V4.1")
@@ -594,6 +623,7 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
     def fitted(group, *, concurrency=concurrency, reserve_bytes=reserve_bytes, speculation=speculation):
         return fit(recipe, checkpoint, group, concurrency=concurrency, reserve_bytes=reserve_bytes,
                    speculation=speculation, prefill_chunk=chunk, context_parallel=context_parallel,
+                   context_parallel_size=context_parallel_size,
                    stream_overlap=stream_overlap, cache_states=cache_states,
                    mixed_prefill=mixed_prefill, prompt_logprobs=prompt_logprobs,
                    expert_scale_compression=expert_scale_compression, roce_ring=roce_ring, roce_chain=roce_chain,

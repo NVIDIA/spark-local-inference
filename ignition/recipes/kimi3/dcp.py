@@ -151,3 +151,4 @@ class ContextParallel:
     peers: dict
     slab: torch.Tensor
     window: int = CONTEXT_WINDOW
+    groups: tuple = ()

@@ -13,6 +13,9 @@ import torch
 from b12x.gemm.blockscaled import Weight
 from b12x.preparation import PreparationSession
 from b12x.sequence import gdn_decode, gdn_prefill, short_conv
+from b12x.sequence.gdn_decode._kernels import _gdn_decode_op as gdn_decode_out
+from b12x.sequence.gdn_prefill._ops import gdn_prefill_out
+from b12x.sequence.short_conv.api import _pipeline as short_conv_out
 
 from ignition.components.gated_norm import PreparedGatedRMSNorm
 from ignition.components.linear import QuantizedProjection, UnquantizedProjection
@@ -23,6 +26,7 @@ from ignition.components.recurrent import (
     prepare_sequence_binding,
 )
 from ignition.preparation.scratch import ScratchArena
+from ignition.preparation.tuning import register_finalizer
 
 from ignition.components import sm103
 from ignition.components.gdn_prefill_sm103 import PreparedGdnPrefill, PrefillBuffers
@@ -98,11 +102,15 @@ class GDNScratch:
 
     @cached_property
     def mxfp8_output(self):
+        return self.allocate_mxfp8_output()
+
+    def allocate_mxfp8_output(self, *, buffers=None):
         from b12x.quantization import mxfp8
 
         rows, columns = self.gated.shape
         shapes = mxfp8.dense_rows_storage_shapes(rows, columns)
-        bases = tuple(torch.zeros(shape, dtype=dtype, device=self.gated.device)
+        bases = tuple(torch.zeros(shape, dtype=dtype, device=self.gated.device) if buffers is None
+                      else buffers.zeros(shape, dtype)
                       for shape, dtype in zip(shapes, (torch.float8_e4m3fn, torch.uint8, torch.uint8), strict=True))
         bases[1].fill_(127)
         bases[2].fill_(127)
@@ -141,18 +149,17 @@ class PreparedGDN:
     The module supplies geometry and exact unquantized parameters. The projection
     mapping supplies calibrated QKV/Z and output weights with packed or BF16 B/A
     projections. Preparation
-    requires zero live counts and must finish before graph capture. All plans,
-    buffers, weights, and canonical norm parameters remain strongly owned.
+    requires zero live counts and must finish before graph capture. Bound calls
+    retain caller scratch; ``functional`` keeps selected plans, weights, metadata,
+    and persistent state while tracing allocations for sequence intermediates.
 
     ``workspace`` and ``projection_workspace`` may be shared by serialized
     layers and graph buckets. Their storage must cover every selected plan and
     remain live until all referencing graphs drain. Concurrent graph execution
     over either shared workspace is invalid.
 
-    Prefill uses canonical PyTorch gated RMSNorm inside the captured graph.
-    Its temporary tensors remain private to that graph; gated and final outputs
-    are copied/written into caller-owned scratch. No Python callback is needed
-    after the graph is handed to the native replay worker.
+    Prefill preserves the gated norm's BF16 rounding and optional MXFP8 output
+    encoding. Captured execution requires no Python callback.
     """
 
     def __init__(
@@ -175,6 +182,7 @@ class PreparedGDN:
         in_place: bool = False,
         partitions=None,
         prepare_projections: bool = True,
+        gdn_buffers=None,
     ) -> None:
         self.world_size = 48 // module.num_v_heads
         self.key_heads, self.value_heads = module.num_k_heads, module.num_v_heads
@@ -189,6 +197,7 @@ class PreparedGDN:
             metadata,
         )
         self.mode = mode
+        self._binding_workspace = workspace
         self.tokens, self.device = source.shape[0], source.device
         if (
             source.ndim != 2
@@ -273,9 +282,11 @@ class PreparedGDN:
 
         from b12x.gemm.blockscaled._linear import MXFP8LinearWeight
 
-        self.output_encoding = (scratch.mxfp8_output if prepare_projections and mode == "prefill" and partitions is None
-            and not sm103.is_sm103(self.device) and isinstance(projections["out_proj"], MXFP8LinearWeight)
-            else None)
+        self.output_encoding = None
+        if (prepare_projections and mode == "prefill" and partitions is None
+                and not sm103.is_sm103(self.device) and isinstance(projections["out_proj"], MXFP8LinearWeight)):
+            self.output_encoding = (scratch.mxfp8_output if gdn_buffers is None
+                                   else scratch.allocate_mxfp8_output(buffers=gdn_buffers))
 
         def projection(key, inputs, output):
             weight = projections[key]
@@ -384,7 +395,7 @@ class PreparedGDN:
                 mixed_qkv=scratch.convolved_qkv, a=scratch.a, b=scratch.b, A_log=module.A_log,
                 dt_bias=module.dt_bias, state=state.recurrent, metadata=metadata, output=scratch.recurrence,
                 records=records, key_heads=self.key_heads, value_heads=self.value_heads,
-                convolution=conv_args if fused_convolution else None)
+                convolution=conv_args if fused_convolution else None, buffers=gdn_buffers)
         elif mode == "decode":
             caps = gdn_decode.Caps(
                 device=self.device,
@@ -476,7 +487,156 @@ class PreparedGDN:
                 eps=module.norm.variance_epsilon, round_normalized=True, activation=module.norm.activation,
                 encoded=self.output_encoding)
 
-    def __call__(self, source: torch.Tensor) -> torch.Tensor:
+    def functional(self, *, session, dynamic_metadata=False):
+        """Keep selected kernels and persistent state while tracing intermediate allocations."""
+        if getattr(self, "_functional_requested", False):
+            return self
+        self._functional_requested = True
+        self._dynamic_metadata = dynamic_metadata
+        self._has_partitions = self.partitions is not None
+        self._functional_ready = False
+        self.encoding_layout = ()
+        if self.output_encoding is not None:
+            from b12x.quantization import mxfp8
+
+            self.encoding_layout = tuple((tuple(base.shape), base.dtype) for base in (
+                self.output_encoding.values, self.output_encoding.scale_rows.view(torch.uint8),
+                mxfp8.dense_scale_storage(self.output_encoding.scale_mma)))
+        if hasattr(self, "projections"):
+            for projection in self.projections.values():
+                projection.functional(session=session)
+            if self.parallel_projections is not None:
+                self.parallel_projections.functional(session=session)
+        if self.partitions is not None:
+            if not dynamic_metadata:
+                self.partitions = self.partitions.functional()
+            for sequence in self.sequences_by_role:
+                sequence.functional(session=session, dynamic_metadata=dynamic_metadata)
+        elif self.recovered is not None:
+            self.recovered.functional(dynamic_metadata=dynamic_metadata)
+        elif self.chunked is not None:
+            self.chunked.functional(session=session, dynamic_metadata=dynamic_metadata)
+        if hasattr(self, "output_norm"):
+            self.output_norm.functional(session=session, dynamic_live=dynamic_metadata)
+        register_finalizer(session, self._finalize_functional, workspace=self._binding_workspace)
+        return self
+
+    def _finalize_functional(self):
+        if getattr(self, "conv_binding", None) is not None:
+            self.convolution_scratch = tuple((tuple(t.shape), tuple(t.stride()), t.dtype)
+                                            for t in (self.conv_binding.gathered_state,
+                                                      self.conv_binding.request_ids))
+        if (self.partitions is None and self.recovered is None and self.chunked is None
+                and self.mode == "prefill" and self.recurrent_binding is not None):
+            scratch = self.recurrent_binding.scratch
+            self.recurrence_scratch = (tuple(scratch.shape), tuple(scratch.stride()), scratch.dtype)
+        self.conv_binding = None
+        self.recurrent_binding = None
+        self.scratch = None
+        self.output_encoding = None
+        self.workspace = None
+        self._binding_workspace = None
+        if getattr(self, "_dynamic_metadata", False):
+            self.metadata = None
+            if self._has_partitions:
+                self.partitions = None
+        self._functional_ready = True
+
+    def _functional_sequence(self, projected, z, a, b, *, records=None, metadata=None):
+        runtime_metadata = metadata
+        metadata = self.metadata if metadata is None else metadata
+        if metadata is None:
+            raise ValueError("functional GDN requires metadata at invocation")
+        state, module = self.state, self.module
+        if records is not None and self.recovered is None:
+            raise ValueError("GDN correction records require a prepared verification recurrence")
+        convolved = torch.empty((self.tokens, module.conv_dim), dtype=torch.bfloat16, device=projected.device)
+        if self.conv_plan is not None:
+            gathered, request_ids = (torch.empty_strided(shape, stride, dtype=dtype, device=projected.device)
+                                     for shape, stride, dtype in self.convolution_scratch)
+            short_conv_out(projected, self.conv_weight, metadata.query_start_loc,
+                metadata.convolution_slots, metadata.fresh, metadata.accepted_tokens, metadata.fresh,
+                metadata.num_seqs, metadata.num_tokens, state.convolution, convolved,
+                gathered, request_ids, None, self.conv_plan.handle)
+        if self.recovered is not None:
+            recurrence = self.recovered(convolved, a, b, projected=projected, records=records,
+                                        metadata=runtime_metadata)
+        elif self.chunked is not None:
+            recurrence = self.chunked(convolved, a, b, metadata=runtime_metadata)
+        elif self.mode == "decode":
+            gated = torch.empty((self.tokens, self.value_heads, 128), dtype=torch.bfloat16, device=projected.device)
+            gdn_decode_out(convolved, a, b, z.view_as(gated), module.A_log, module.dt_bias,
+                module.norm.weight, state.recurrent, metadata.query_start_loc, metadata.accepted_tokens,
+                metadata.state_indices, metadata.num_seqs, metadata.num_tokens, gated,
+                module.norm.variance_epsilon, 128 ** -.5, 0., self.recurrent_plan.handle)
+            return gated.view(self.tokens, -1), None
+        else:
+            recurrence = torch.zeros((self.tokens, self.value_heads, 128), dtype=torch.bfloat16,
+                                     device=projected.device)
+            q, k, v = convolved.split((self.key_heads * 128, self.key_heads * 128, self.value_heads * 128), dim=-1)
+            shape, stride, dtype = self.recurrence_scratch
+            workspace = torch.empty_strided(shape, stride, dtype=dtype, device=projected.device)
+            gdn_prefill_out(workspace, q.view(self.tokens, self.key_heads, 128),
+                k.view(self.tokens, self.key_heads, 128), v.view(self.tokens, self.value_heads, 128),
+                a, b, module.A_log, module.dt_bias, state.recurrent, metadata.query_start_loc,
+                metadata.initial_state_indices, metadata.final_state_indices,
+                metadata.checkpoint_state_indices, metadata.checkpoint_offsets, metadata.num_seqs,
+                metadata.num_tokens, recurrence, self.recurrent_plan.handle, 128 ** -.5, 1e-6, None, None)
+        recurrence = recurrence.view(self.tokens, self.value_heads, 128)
+        encoded = None
+        if self.encoding_layout:
+            encoded = tuple(torch.empty(shape, dtype=dtype, device=projected.device) if index == 0
+                            else torch.full(shape, 127, dtype=dtype, device=projected.device)
+                            for index, (shape, dtype) in enumerate(self.encoding_layout))
+        gated = self.output_norm(recurrence, z.view_as(recurrence), encoded_bases=encoded,
+                                 live=metadata.num_tokens)
+        return (recurrence if gated is None else gated).view(self.tokens, -1), encoded
+
+    def _functional(self, source, *, records=None, metadata=None, partitions=None):
+        if not self._functional_ready:
+            raise RuntimeError("functional GDN requires completed sequence binding finalization")
+        if self.fused_qkvzba:
+            packed = self.projections["in_proj_qkvzba"](source)
+            qkvz, ba = packed.split((16384 // self.world_size, 96 // self.world_size), dim=-1)
+        elif self.parallel_projections is not None:
+            qkvz, ba = self.parallel_projections(source)
+        else:
+            qkvz = self.projections["in_proj_qkvz"](source) if self.fused_qkvz else None
+            if qkvz is None:
+                projected = self.projections["in_proj_qkv"](source)
+                z = self.projections["in_proj_z"](source)
+            ba = self.projections["in_proj_ba"](source)
+        if qkvz is not None:
+            projected, z = qkvz.split((10240 // self.world_size, 6144 // self.world_size), dim=-1)
+        b, a = ba.chunk(2, dim=-1)
+        if not self._has_partitions:
+            if metadata is None:
+                gated, encoded = self._functional_sequence(projected, z, a, b, records=records)
+            else:
+                gated, encoded = self._functional_sequence(projected, z, a, b, records=records, metadata=metadata)
+        else:
+            partitions = self.partitions if partitions is None else partitions
+            if partitions is None:
+                raise ValueError("functional partitioned GDN requires runtime partitions")
+            qkvz = torch.cat((projected, z), dim=-1) if qkvz is None else qkvz
+            outputs = []
+            for part, sequence in zip(partitions.parts, self.sequences_by_role, strict=True):
+                packed_qkvz, packed_ba = part.gather(qkvz), part.gather(ba)
+                part_projected, part_z = packed_qkvz.split((10240 // self.world_size, 6144 // self.world_size), dim=-1)
+                part_b, part_a = packed_ba.chunk(2, dim=-1)
+                values, _ = sequence._functional_sequence(part_projected, part_z, part_a, part_b,
+                    records=records if part.mode == "decode" else None, metadata=part.metadata)
+                outputs.append(values)
+            gated, encoded = partitions.combine(outputs), None
+        if encoded is None:
+            return self.projections["out_proj"](gated)
+        return self.projections["out_proj"](gated, encoded_bases=encoded)
+
+    def __call__(self, source: torch.Tensor, *, records=None, metadata=None, partitions=None) -> torch.Tensor:
+        if getattr(self, "_functional_requested", False):
+            return self._functional(source, records=records, metadata=metadata, partitions=partitions)
+        if records is not None or metadata is not None or partitions is not None:
+            raise ValueError("runtime GDN operands require functional execution")
         scratch = self.scratch
         if self.fused_qkvzba:
             self.projections["in_proj_qkvzba"](source)

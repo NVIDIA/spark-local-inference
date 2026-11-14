@@ -121,8 +121,9 @@ def test_stream_overlap_flag_is_a_preparation_flag_that_overlapping_recipes_acce
         assert not preparation.stream_overlap(serial, resolve(model))
         assert preparation.stream_overlap(_parser().parse_args(["export", model]), resolve(model))
     # MiMo composes no concurrent branches, so serializing them is rejected rather than ignored.
-    assert export("mimo-v2.6-pro-mopd", "--no-stream-overlap") == 2
-    assert "--no-stream-overlap: mimo-v2.6-pro-mopd runs no branches concurrently" in failure(capsys)[0]
+    for alias in ("mimo-v2.6-pro-mopd", "mimo-v2.6-flash-rl"):
+        assert export(alias, "--no-stream-overlap") == 2
+        assert f"--no-stream-overlap: {alias} runs no branches concurrently" in failure(capsys)[0]
 
 
 def test_direct_execution_is_an_explicit_serve_diagnostic(host, capsys):

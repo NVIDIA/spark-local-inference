@@ -104,61 +104,64 @@ def test_mtp_forward_preserves_feedback_alignment_and_all_streams(monkeypatch):
     monkeypatch.setattr(embedding.embedding, "plan", lambda *args, **kwargs: plan)
     monkeypatch.setattr(embedding.embedding, "run", lambda weight, ids, *, out, **kwargs: out.copy_(ids[:, None]))
 
-    class Feedback:
-        def __init__(self, module, token, hidden, output, workspace, **kwargs):
-            self.token, self.hidden, self.output = token, hidden, output
+    class Embedding:
+        def __init__(self, *args, **kwargs):
+            pass
 
-        def __call__(self):
-            self.output.view(-1, 4, 2560).copy_(self.hidden.view(-1, 4, 2560) + self.token[:, None])
+        def __call__(self, *, token_ids):
+            self.seen = token_ids.clone()
+            return token_ids[:, None].expand(-1, 2560).to(torch.bfloat16)
+
+    class Feedback:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __call__(self, token, hidden):
+            return (hidden.view(-1, 4, 2560) + token[:, None]).flatten(1)
 
     class HC:
         def __init__(self, module, buffers, **kwargs):
-            self.buffers = buffers
+            pass
 
         def prepare_combine_norm(self, following, **kwargs):
-            self.following = following
+            pass
 
-        def mix(self, source, *, pre_normalized=False):
-            if pre_normalized:
-                source = self.buffers.normalized
-            self.buffers.block_input.copy_(source.view(-1, 4, 2560).mean(1))
-            return self.buffers.block_input
+        def mix_runtime(self, source, normalized=None):
+            return source.view(-1, 4, 2560).mean(1), None
 
-        def combine(self, source, block):
+        def combine_runtime(self, source, block, injection):
             return (source.view(-1, 4, 2560) + block[:, None]).flatten(1)
 
-        def combine_norm(self, source, block):
-            source.copy_(self.combine(source, block))
-            self.following.buffers.normalized.copy_(source)
-            return source
+        def combine_norm_runtime(self, source, block, injection):
+            value = self.combine_runtime(source, block, injection)
+            return value, value
 
     class Attention:
         def __init__(self, module, weights, source, buffers, state, meta, rotary, **kwargs):
             assert meta.rope_positions is positions
             assert kwargs["draft_tokens"] == 7
-            self.buffer = buffers.output
 
-        def __call__(self, source):
-            return self.buffer.copy_(source * 2)
+        def __call__(self, source, meta):
+            return source * 2
 
         def rebind_pages_for_preparation(self, state):
             self.state = state
 
     class Moe:
         def __init__(self, source, weights, **kwargs):
-            self.buffer = kwargs["scratch"].output
+            pass
 
         def __call__(self, source):
-            return self.buffer.copy_(source * 3)
+            return source * 3
 
     class Head:
         def __init__(self, source, weight, output, **kwargs):
-            self.output = output
+            self.width = output.shape[-1]
 
         def __call__(self, source):
-            return self.output.copy_(source[:, :1])
+            return source[:, :1].expand(-1, self.width)
 
-    for name, value in (("PreparedMTPFeedback", Feedback), ("PreparedHyperconnection", HC),
+    for name, value in (("PreparedEmbedding", Embedding), ("PreparedMTPFeedback", Feedback), ("PreparedHyperconnection", HC),
                         ("PreparedAttention", Attention), ("PreparedQwenMoe", Moe), ("UnquantizedProjection", Head)):
         monkeypatch.setattr(mtp, name, value)
     layer = SimpleNamespace(attn_hyper_connection=object(), mlp_hyper_connection=object(), self_attn=object())
@@ -168,17 +171,16 @@ def test_mtp_forward_preserves_feedback_alignment_and_all_streams(monkeypatch):
     operator = mtp.PreparedMTP(weights, scratch, ids, target, object(), metadata, object(),
         ScratchArena("cpu"), output_indices=selected, session=SimpleNamespace(prepare=lambda _: None), name="draft")
     for _ in range(2):
-        out = operator()
+        out = operator(ids, target, metadata, selected)
         expected = original.view(3, 4, 2560) + ids.clamp_min(0)[:, None, None]
         expected[1].zero_()
         expected += 2 * expected.mean(1, keepdim=True)
         expected += 3 * expected.mean(1, keepdim=True)
-        assert out is operator.output
         assert torch.equal(out.residual, expected.flatten(1))
         assert torch.equal(out.hidden, expected.mean(1))
         assert torch.equal(out.logits, expected.mean(1)[selected, :1].expand_as(out.logits))
         assert torch.equal(target, original)
-        assert scratch.embedding_ids.tolist() == ids.clamp_min(0).tolist()
+        assert operator.embedding.seen.tolist() == ids.clamp_min(0).tolist()
         ids[0] = 3
         selected.copy_(torch.tensor([0, 2]))
     replacement = object()

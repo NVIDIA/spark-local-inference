@@ -80,6 +80,8 @@ def test_live_row_state_survives_width_one_and_retains_accepted_endpoint():
     residual = torch.arange(8, device=device, dtype=torch.bfloat16)[:, None].expand(8, 10240).contiguous()
     hidden = residual[:, :2560].contiguous()
     states[8].prepare_commit(counts, before, residual, hidden)
+    for state in states.values():
+        state.functional()
     requests.admit(2, RequestAdmission(11, 42), list(range(128)), consumed_tokens=61)
     requests.pending_token[2] = 901
     inputs.row_slot_ids[0] = 2
@@ -87,36 +89,38 @@ def test_live_row_state_survives_width_one_and_retains_accepted_endpoint():
     inputs.live_rows.fill_(1)
     inputs.page_tables[2].copy_(torch.tensor([5, 3, 1, 7], device=device, dtype=torch.int32))
     accepted[2] = 8
-    states[1].begin()
-    assert states[1].gdn.accepted_tokens.tolist() == [8]
+    runtime = states[1].begin_runtime(candidates)
+    assert runtime.gdn.accepted_tokens.tolist() == [8]
     # Verification resumes from and commits into the live row; later columns stay null.
-    assert states[1].gdn.state_indices.tolist() == [[3, 0, 0, 0, 0, 0, 0, 0]]
-    assert states[1].token_ids.tolist() == [901]
+    assert runtime.gdn.state_indices.tolist() == [[3, 0, 0, 0, 0, 0, 0, 0]]
+    assert runtime.ple.token_ids.tolist() == [901]
     for width in range(2, 8):
-        states[width].begin()
-        assert states[width].token_ids.tolist() == list(range(901, 901 + width))
-        assert states[width].qsa.query_positions.tolist() == list(range(61, 61 + width))
-        assert states[width].gdn.accepted_tokens.tolist() == [8]
-    states[8].begin()
-    assert states[8].qsa.slot_mapping.tolist() == [381, 382, 383, 192, 193, 194, 195, 196]
+        runtime = states[width].begin_runtime(candidates)
+        assert runtime.ple.token_ids.tolist() == list(range(901, 901 + width))
+        assert runtime.qsa.query_positions.tolist() == list(range(61, 61 + width))
+        assert runtime.gdn.accepted_tokens.tolist() == [8]
+    runtime = states[8].begin_runtime(candidates)
+    assert runtime.qsa.slot_mapping.tolist() == [381, 382, 383, 192, 193, 194, 195, 196]
     for layer in pool.gdn.values():
         layer.convolution[3].copy_(torch.arange(100, 110, device=device, dtype=torch.bfloat16))
     pool.ple_convolution[3].copy_(torch.arange(100, 116, device=device, dtype=torch.bfloat16))
-    states[8].commit()
+    states[8].commit_runtime(runtime, hidden, residual, counts)
     assert accepted[2].item() == 5
     assert pool.last_hidden[3, 0].item() == 4
     assert pool.region("target_residual")[3, 0].item() == 4
     graph = torch.cuda.CUDAGraph()
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
+    captured_accepted = torch.empty((1,), dtype=torch.int32, device=device)
     with torch.cuda.graph(graph, stream=stream):
-        states[1].begin()
+        captured_runtime = states[1].begin_runtime(candidates)
+        captured_accepted.copy_(captured_runtime.gdn.accepted_tokens)
     before_allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
     graph.replay()
     torch.cuda.synchronize()
     assert torch.cuda.memory_stats()["allocation.all.allocated"] == before_allocations
-    assert states[1].gdn.accepted_tokens.tolist() == [5]
-    assert states[1].gdn.state_indices.shape == (1, 8)
+    assert captured_accepted.tolist() == [5]
+    assert captured_runtime.gdn.state_indices.shape == (1, 8)
     graph.reset()
 
 
@@ -136,77 +140,161 @@ def test_recursive_draft_reorders_residuals_and_physical_copy_hints(temperature,
     regions = {"target_residual": torch.zeros((5, 10240), dtype=torch.bfloat16),
                "target_residual_position": torch.zeros((5, 3), dtype=torch.int64)}
     pool = SimpleNamespace(region=lambda name: regions[name], rope_delta=torch.zeros((5, 1), dtype=torch.int64))
+    from ignition.recipes.qwen38.draft_state import DRAFT_RAW_FIELDS
+
+    cache = SimpleNamespace(**{name: torch.zeros((1,), dtype=torch.int64) for name in DRAFT_RAW_FIELDS})
     owner = SimpleNamespace(requests=requests, pool=pool,
         copy_generation=torch.tensor([0, 0, 0, copy_epoch]),
-        inputs=SimpleNamespace(request_state_rows=torch.arange(1, 5)[:, None].expand(4, 8), row_slot_ids=slots, row_generations=epochs, live_rows=torch.tensor([2], dtype=torch.int32)),
-        cache={48: SimpleNamespace()},
+        inputs=SimpleNamespace(request_state_rows=torch.arange(1, 5)[:, None].expand(4, 8),
+            row_slot_ids=slots, row_generations=epochs, live_rows=torch.tensor([2], dtype=torch.int32),
+            query_lengths=torch.full((batch,), width, dtype=torch.int32)),
+        cache={48: cache},
         draft_rng_generation=torch.zeros(4, dtype=torch.int64), draft_rng_offset=torch.zeros(4, dtype=torch.int64),
         copy_expected=torch.tensor([-1, -1, -1, 64]), copy_count=torch.tensor([0, 0, 0, 1]),
-        copy_ids=torch.full((4, 7), -1, dtype=torch.int64), candidates=torch.zeros((4, 8), dtype=torch.int64),
+        copy_ids=torch.full((4, 7), -1, dtype=torch.int64),
         draft_tables=torch.ones((4, 4), dtype=torch.int32))
     owner.copy_ids[3, 0] = 27
     operation = PreparedSpeculativeRound.__new__(PreparedSpeculativeRound)
     operation.owner, operation.batch, operation.width = owner, batch, width
-    operation.token_limits = None
-    operation.state = SimpleNamespace(_validate=lambda: None, token_ids=torch.zeros(batch * width, dtype=torch.int64),
-        qsa=SimpleNamespace(rope_positions=torch.zeros((batch * width, 3), dtype=torch.int64)))
-    for name in ("before", "pending", "seed", "offset", "base_offset", "sampled", "copy_mask"):
-        setattr(operation, name, torch.zeros(batch, dtype=torch.int64))
-    operation.previous = torch.zeros((batch, 10240), dtype=torch.bfloat16)
-    operation.previous_rope = torch.zeros((batch, 3), dtype=torch.int64)
-    operation.rope_delta = torch.zeros(batch, dtype=torch.int64)
-    operation.active = torch.zeros(batch, dtype=torch.bool)
-    operation.drafts = torch.zeros((batch, width - 1), dtype=torch.int64)
-    operation.draft_valid = torch.zeros((batch, width - 1), dtype=torch.bool)
-    operation.draft_probabilities = torch.zeros((batch, width - 1, 128), dtype=torch.float32)
-    operation.raw_backup = {}
-    operation.rows = torch.arange(batch)
-    operation.target_residual = torch.zeros((batch * width, 10240), dtype=torch.bfloat16)
-    feedback = torch.zeros((batch * width, 10240), dtype=torch.bfloat16)
-    operation.draft_metadata = DraftMetadata(tokens=batch, rows=batch, context=256, device="cpu", hidden=feedback[:batch])
-    operation.absorb_metadata = DraftMetadata(tokens=batch * width, rows=batch, context=256, device="cpu", hidden=feedback)
+    operation.gdn_commit = None
+    operation.draft_metadata = DraftMetadata(tokens=batch, rows=batch, context=256, device="cpu").functional()
+    operation.absorb_metadata = DraftMetadata(tokens=batch * width, rows=batch, context=256, device="cpu").functional()
 
     class Draft:
-        scratch = SimpleNamespace(residual=torch.zeros((batch, 10240), dtype=torch.bfloat16))
         inputs = []
         tokens = []
 
-        def __call__(self):
-            self.inputs.append(operation.draft_metadata.hidden.clone())
-            self.tokens.append(operation.draft_metadata.token_ids.clone())
-            self.scratch.residual.zero_()
-            self.scratch.residual[0].fill_(99 + len(self.inputs))
+        def __call__(self, tokens, hidden, metadata, indices):
+            self.inputs.append(hidden.clone())
+            self.tokens.append(tokens.clone())
+            residual = torch.zeros((batch, 10240), dtype=torch.bfloat16)
+            residual[0].fill_(99 + len(self.inputs))
+            return SimpleNamespace(residual=residual, logits=torch.zeros((batch, 128)))
 
     class Proposal:
-        probabilities = torch.nn.functional.one_hot(torch.full((batch, 1), 21), 128).float()
-        valid = torch.tensor([[False], [True]])
-        vocab_ids = torch.arange(128)
+        layout = {"valid": ((batch, 1), torch.bool)}
 
-        def __call__(self):
-            # Draft proposals draw into the round's shared sample buffer.
-            operation.sampled.copy_(self.probabilities[:, 0].argmax(-1))
+        def run(self, scratch, logits, *, sampled, **kwargs):
+            sampled.fill_(21)
+            scratch["valid"].copy_(torch.tensor([[False], [True]]))
+            return torch.nn.functional.one_hot(torch.full((batch, 1), 21), 128).float()
+
+    class Target:
+        layout, vocab_ids = {}, torch.arange(128)
+
+        def run(self, scratch, logits, **kwargs):
+            scratch["valid"] = torch.ones((batch, width), dtype=torch.bool)
+            return torch.full((batch, width, 128), 1 / 128)
+
+    class Verify:
+        layout = {}
+        probabilities = None
+        drafts = None
+
+        def run(self, scratch, draft_probs, target_probs, target_valid, *, drafts, **kwargs):
+            self.probabilities, self.drafts = draft_probs.clone(), drafts.clone()
+            return object()
 
     class Commit:
-        emitted_count = torch.tensor([0, 1], dtype=torch.int32)
+        mask = None
 
-        def __call__(self):
-            pass
+        def __call__(self, logits, *, copy_offered_mask, **kwargs):
+            self.mask = copy_offered_mask.clone()
+            return SimpleNamespace(emitted_count=torch.tensor([0, 1], dtype=torch.int32))
 
+    verification, commit = Verify(), Commit()
     operation.draft = Draft()
-    operation.decoder = lambda: operation.state.token_ids.copy_(owner.candidates[:batch, :width].reshape(-1))
-    operation.absorb = lambda: None
-    operation.operations = (Proposal(), (Proposal(),) * 3, lambda: None, Commit(), ())
+    operation.absorb = lambda *args: None
+    operation.operations = (Target(), (Proposal(),) * 3, verification, commit)
+    operation.state = SimpleNamespace(
+        begin_runtime=lambda candidates, inputs: SimpleNamespace(ple=SimpleNamespace(token_ids=candidates[:, :width].reshape(-1)),
+            qsa=SimpleNamespace(rope_positions=torch.zeros((batch * width, 3), dtype=torch.int64))),
+        commit_runtime=lambda *args: None)
+    operation.decoder = lambda runtime: (torch.zeros((batch * width, 2560), dtype=torch.bfloat16),
+        torch.zeros((batch * width, 128)), SimpleNamespace(residual=torch.zeros((batch * width, 10240), dtype=torch.bfloat16)), None)
     operation()
     chosen = 27 if copy_epoch == 13 else 21
-    assert operation.drafts[1].tolist() == [chosen, 21, 21]
-    assert operation.copy_mask.tolist() == [0, int(copy_epoch == 13)]
-    assert operation.draft_probabilities[1, 0, chosen] == 1
-    assert operation.draft_probabilities[1, 0].count_nonzero() == 1
+    assert verification.drafts[1].tolist() == [chosen, 21, 21]
+    assert commit.mask.tolist() == [0, int(copy_epoch == 13)]
+    assert verification.probabilities[1, 0, chosen] == 1
+    assert verification.probabilities[1, 0].count_nonzero() == 1
     assert operation.draft.tokens[1][0] == chosen
     assert operation.draft.inputs[1][0].eq(100).all()
     assert operation.draft.inputs[2][0].eq(101).all()
     assert owner.draft_rng_offset.tolist() == [0, 0, 0, 12]
     assert owner.draft_rng_generation.tolist() == [0, 0, 0, 13]
+
+
+@pytest.mark.parametrize("copy_epoch, expected_mask", [(13, 7), (12, 0)])
+def test_functional_round_passes_physical_copy_mask_to_commit(copy_epoch, expected_mask):
+    from ignition.recipes.qwen38.sampling import DeviceRequestState, RequestAdmission
+    from ignition.recipes.qwen38.speculative_model import PreparedSpeculativeRound
+    from ignition.recipes.qwen38.draft_state import DRAFT_RAW_FIELDS
+
+    batch, width = 1, 4
+    requests = DeviceRequestState.allocate("cpu", vocab_size=128)
+    requests.admit(3, RequestAdmission(13, 42, eos_token_ids=()), [3] * 64, consumed_tokens=64)
+    requests.pending_token[3] = 17
+    slots = torch.tensor([3], dtype=torch.int32)
+    regions = {"target_residual": torch.zeros((5, 10240), dtype=torch.bfloat16),
+               "target_residual_position": torch.zeros((5, 3), dtype=torch.int64)}
+    pool = SimpleNamespace(region=lambda name: regions[name], rope_delta=torch.zeros((5, 1), dtype=torch.int64))
+    cache = SimpleNamespace(**{name: torch.zeros((1,), dtype=torch.int64) for name in DRAFT_RAW_FIELDS})
+    owner = SimpleNamespace(requests=requests, pool=pool, cache={48: cache},
+        inputs=SimpleNamespace(request_state_rows=torch.arange(1, 5)[:, None].expand(4, 8),
+            row_slot_ids=slots, row_generations=torch.tensor([13]), live_rows=torch.tensor([1], dtype=torch.int32), query_lengths=torch.tensor([width], dtype=torch.int32)),
+        copy_generation=torch.tensor([0, 0, 0, copy_epoch]), copy_expected=torch.tensor([-1, -1, -1, 64]),
+        copy_count=torch.tensor([0, 0, 0, 3]), copy_ids=torch.full((4, 7), -1, dtype=torch.int64),
+        draft_rng_generation=torch.zeros(4, dtype=torch.int64), draft_rng_offset=torch.zeros(4, dtype=torch.int64),
+        draft_tables=torch.ones((4, 4), dtype=torch.int32))
+    owner.copy_ids[3, :3] = torch.tensor([27, 28, 29])
+    operation = PreparedSpeculativeRound.__new__(PreparedSpeculativeRound)
+    operation.owner, operation.batch, operation.width, operation.token_limits = owner, batch, width, None
+    operation.gdn_commit = None
+    operation.draft_metadata = DraftMetadata(tokens=batch, rows=batch, context=256, device="cpu").functional()
+    operation.absorb_metadata = DraftMetadata(tokens=batch * width, rows=batch, context=256, device="cpu").functional()
+
+    class Proposal:
+        layout = {"valid": ((batch, 1), torch.bool)}
+
+        def run(self, scratch, logits, *, sampled, **kwargs):
+            sampled.fill_(21)
+            scratch["valid"].fill_(True)
+            return torch.nn.functional.one_hot(torch.full((batch, 1), 21), 128).float()
+
+    class Target:
+        layout, vocab_ids = {}, torch.arange(128)
+
+        def run(self, scratch, logits, *, candidates, **kwargs):
+            scratch["valid"] = torch.ones((batch, width), dtype=torch.bool)
+            return torch.full((batch, width, 128), 1 / 128)
+
+    class Verify:
+        layout = {}
+
+        def run(self, scratch, draft_probs, target_probs, target_valid, **kwargs):
+            return object()
+
+    class Commit:
+        seen = None
+
+        def __call__(self, logits, *, acceptance, inputs, copy_offered_mask, **kwargs):
+            self.seen = copy_offered_mask.clone()
+            return SimpleNamespace(emitted_count=torch.ones(batch, dtype=torch.int32))
+
+    commit = Commit()
+    operation.operations = (Target(), (Proposal(),) * 3, Verify(), commit)
+    operation.draft = lambda *args: SimpleNamespace(residual=torch.zeros((batch, 10240), dtype=torch.bfloat16),
+                                                     logits=torch.zeros((batch, 128)))
+    operation.absorb = lambda *args: None
+    operation.state = SimpleNamespace(_validate=lambda: None,
+        begin_runtime=lambda candidates, inputs: SimpleNamespace(ple=SimpleNamespace(token_ids=candidates[:, :width].reshape(-1)),
+            qsa=SimpleNamespace(rope_positions=torch.zeros((batch * width, 3), dtype=torch.int64))),
+        commit_runtime=lambda *args: None)
+    operation.decoder = lambda runtime: (torch.zeros((batch * width, 2560), dtype=torch.bfloat16),
+        torch.zeros((batch * width, 128)), SimpleNamespace(residual=torch.zeros((batch * width, 10240), dtype=torch.bfloat16)), None)
+    operation()
+    assert commit.seen.tolist() == [expected_mask]
 
 
 @CUDA
@@ -234,11 +322,12 @@ def test_fixed_verification_masks_context_tail_without_changing_shape():
     inputs.page_tables.fill_(0)
     state = PreparedVerificationState(inputs, requests, pool, candidates, accepted,
         width=4, rows=4, token_limits=inputs.query_lengths)
-    state.begin()
+    state.functional()
+    runtime = state.begin_runtime(candidates)
     assert requests.status.tolist() == [1] * 4
-    assert state.qsa.query_positions.reshape(4, 4).tolist() == [
+    assert runtime.qsa.query_positions.reshape(4, 4).tolist() == [
         [62, 63, -1, -1], [60, 61, 62, 63], [63, -1, -1, -1], [61, 62, 63, -1]]
-    assert state.qsa.sequence_lengths.tolist() == [64] * 4
-    assert state.gdn.query_start_loc.tolist() == [0, 4, 8, 12, 16]
-    assert state.qsa.slot_mapping.reshape(4, 4).tolist() == [
+    assert runtime.qsa.sequence_lengths.tolist() == [64] * 4
+    assert runtime.gdn.query_start_loc.tolist() == [0, 4, 8, 12, 16]
+    assert runtime.qsa.slot_mapping.reshape(4, 4).tolist() == [
         [62, 63, -1, -1], [60, 61, 62, 63], [63, -1, -1, -1], [61, 62, 63, -1]]

@@ -6,10 +6,30 @@
 
 import torch
 from b12x.attention import sparse_mla
-from b12x.preparation import PreparedCall
+from b12x.preparation import PreparedCall, plan_from_handle
 
 from ignition.preparation.scratch import planned_scratch, prime_owners
 from ignition.preparation.tuning import declare, register_finalizer
+
+
+@torch.library.custom_op("flare::sparse_mla", mutates_args=("output", "lse", "scratch"))
+def _attend(query: torch.Tensor, cache: torch.Tensor, selected: torch.Tensor,
+            lengths: torch.Tensor, selected_lengths: torch.Tensor, sink: torch.Tensor | None,
+            output: torch.Tensor, lse: torch.Tensor | None, scratch: torch.Tensor, handle: int) -> None:
+    binding = sparse_mla.bind(plan_from_handle(handle), scratch=scratch, q=query, kv_cache=cache,
+        selected_indices=selected, cache_lengths=lengths, selected_lengths=selected_lengths, attention_sink=sink)
+    result = sparse_mla.run(binding)
+    if isinstance(result, tuple):
+        output.copy_(result[0])
+        if lse is not None:
+            lse.copy_(result[1])
+    else:
+        output.copy_(result)
+
+
+@_attend.register_fake
+def _fake_attend(query, cache, selected, lengths, selected_lengths, sink, output, lse, scratch, handle):
+    pass
 
 
 class PreparedLatentCacheWriter:
@@ -27,8 +47,16 @@ class PreparedLatentCacheWriter:
             prepare_call=lambda state: PreparedCall(
                 run=lambda: state.run(source, cache, slots), owners=(source, cache, slots))),))
 
-    def __call__(self):
-        sparse_mla.concat_and_cache_glm_next_mla(self.source, self.cache, self.slots, plan=self.plan)
+    def functional(self, *, session):
+        register_finalizer(session, self._release_examples)
+        return self
+
+    def _release_examples(self):
+        self.source = self.slots = None
+
+    def __call__(self, source=None, slots=None):
+        sparse_mla.concat_and_cache_glm_next_mla(self.source if source is None else source, self.cache,
+                                               self.slots if slots is None else slots, plan=self.plan)
 
 
 class PreparedSparseMLA:
@@ -65,6 +93,8 @@ class PreparedSparseMLA:
         declare(session, (self.plan.request(name=name, prepare_call=prepare),))
 
         def finalize():
+            if self.output is None:
+                return
             self.binding = sparse_mla.bind(self.plan,
                 scratch=planned_scratch(self.plan.scratch_specs(), workspace), **self.inputs)
 
@@ -74,9 +104,30 @@ class PreparedSparseMLA:
     def rebind_cache(self, cache):
         """Bind replacement paged storage before capture; the plan's max_kv_rows bounds its size."""
         self.inputs["kv_cache"] = cache
-        self._finalize()
+        if self._finalize is not None:
+            self._finalize()
 
-    def __call__(self):
+    def functional(self, *, session):
+        self.output_layout = tuple(self.output.shape), tuple(self.output.stride()), self.output.dtype
+        self.return_lse = self.lse is not None
+        self.lse_layout = None if self.lse is None else (tuple(self.lse.shape), tuple(self.lse.stride()))
+        register_finalizer(session, self._finalize_functional)
+        return self
+
+    def _finalize_functional(self):
+        self.scratch_layout = tuple((tuple(spec.shape), spec.dtype) for spec in self.plan.scratch_specs())
+        self.inputs = {key: value for key, value in self.inputs.items() if key in ("kv_cache", "attention_sink")}
+        self.output = self.lse = self.binding = self._finalize = None
+
+    def __call__(self, query=None, selected=None, cache_lengths=None, selected_lengths=None, *, cache=None):
+        if self.output is None:
+            shape, stride, dtype = self.output_layout
+            output = torch.empty_strided(shape, stride, dtype=dtype, device=query.device).zero_()
+            lse = torch.empty_strided(*self.lse_layout, dtype=torch.float32, device=query.device).zero_() if self.return_lse else None
+            scratch, = (torch.empty(shape, dtype=dtype, device=query.device) for shape, dtype in self.scratch_layout)
+            _attend(query, self.inputs["kv_cache"] if cache is None else cache, selected, cache_lengths,
+                    selected_lengths, self.inputs["attention_sink"], output, lse, scratch, self.plan.handle)
+            return (output, lse) if self.return_lse else output
         result = sparse_mla.run(self.binding)
         if isinstance(result, tuple):
             self.output.copy_(result[0])

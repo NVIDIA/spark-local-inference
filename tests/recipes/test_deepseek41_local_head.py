@@ -11,7 +11,6 @@ import torch
 from ignition.components.vocabulary import PreparedVocabularyProjection
 from ignition.recipes.deepseek41.decoder import PreparedDecoder
 from ignition.recipes.deepseek41.bootstrap import PreparationConfig
-from ignition.preparation.scratch import GraphBufferPool
 
 
 class CpuProjection:
@@ -19,9 +18,13 @@ class CpuProjection:
     def __init__(self, source, weight, output, **kwargs):
         self.weight, self.output = weight, output
 
+    def functional(self, **kwargs):
+        self.output = None
+        return self
+
     def __call__(self, source):
-        self.output.copy_(torch.nn.functional.linear(source.float(), self.weight.float()))
-        return self.output
+        value = torch.nn.functional.linear(source.float(), self.weight.float())
+        return value if self.output is None else self.output.copy_(value)
 
 
 @pytest.mark.parametrize("batch,physical", PreparationConfig(max_active=4,
@@ -30,26 +33,22 @@ def test_packed_head_factory_uses_disjoint_logical_local_output(monkeypatch, bat
     monkeypatch.setattr("ignition.components.vocabulary.UnquantizedProjection", CpuProjection)
     decoder = PreparedDecoder.__new__(PreparedDecoder)
     logical = batch * 8
-    cursor = GraphBufferPool("cpu", chunk_bytes=1 << 20).cursor()
     decoder.scratch = SimpleNamespace(hidden=torch.arange(logical * 4).reshape(logical, 4).bfloat16(),
-        local_logits=cursor.full((logical, 3), float("nan"), torch.float32),
-        logits=cursor.full((logical, 12), float("nan"), torch.float32))
-    assert decoder.scratch.local_logits.untyped_storage().data_ptr() == decoder.scratch.logits.untyped_storage().data_ptr()
+        local_logits=torch.full((logical, 3), float("nan"), dtype=torch.float32),
+        logits=torch.full((logical, 12), float("nan"), dtype=torch.float32))
     decoder.weights = SimpleNamespace(head=torch.arange(3 * 4).reshape(3, 4).bfloat16())
     indices = torch.arange(logical, dtype=torch.int64).flip(0) % physical
     decoder.output_metadata = SimpleNamespace(token_ids=torch.zeros(physical, dtype=torch.int64), sample_indices=indices)
     decoder._prepare_head(vocabulary_parallel=True, vocabulary_runtime=None,
                           coordinator=None, session=None, name="target")
-    decoder.head(decoder.head_hidden)
+    observed = decoder.head(decoder.head_hidden, row_indices=indices if physical < logical else None)
     expected = torch.nn.functional.linear(decoder.head_hidden.float(), decoder.weights.head.float())
     if physical < logical:
         expected = expected[indices]
-        assert decoder.local_logits.data_ptr() == decoder.scratch.logits.data_ptr()
-        assert decoder.scratch.local_logits[physical:].isnan().all()
-    else:
-        assert decoder.local_logits.data_ptr() == decoder.scratch.local_logits.data_ptr()
-    assert decoder.local_logits.shape == (logical, 3) and decoder.local_logits.is_contiguous()
-    torch.testing.assert_close(decoder.local_logits, expected)
+    assert decoder.scratch.local_logits.isnan().all()
+    assert observed.shape == (logical, 3) and observed.is_contiguous()
+    torch.testing.assert_close(observed, expected)
+
 
 
 @pytest.mark.parametrize("invalid", ["dtype", "rows", "columns", "overlap"])
@@ -70,3 +69,26 @@ def test_local_expansion_rejects_invalid_geometry_and_aliases(monkeypatch, inval
     with pytest.raises(ValueError):
         PreparedVocabularyProjection(source, weight, local[:2], output, runtime=None,
             session=None, coordinator=None, name="local", row_indices=indices, gather=False)
+
+
+@pytest.mark.parametrize("gather", [False, True])
+@pytest.mark.parametrize("dynamic", [False, True])
+def test_functional_head_uses_runtime_indices_and_preserves_bound_defaults(monkeypatch, gather, dynamic):
+    import weakref
+
+    monkeypatch.setattr("ignition.components.vocabulary.UnquantizedProjection", CpuProjection)
+    source = torch.arange(8).reshape(2, 4).float()
+    weight = torch.arange(12).reshape(3, 4).float()
+    indices = torch.tensor([0, 1, 0, 1])
+    reference = weakref.ref(indices)
+    operation = PreparedVocabularyProjection(source, weight, torch.empty(2, 3), torch.empty(4, 3),
+        runtime=None, session=None, coordinator=None, name="indices", row_indices=indices, gather=gather)
+    operation.functional(session=None, dynamic_indices=dynamic)
+    if dynamic:
+        del indices
+        assert reference() is None
+    else:
+        torch.testing.assert_close(operation(source), torch.nn.functional.linear(source, weight)[indices])
+    compiled = torch.compile(lambda values, rows: operation(values, row_indices=rows), backend="eager", fullgraph=True)
+    for rows in (torch.tensor([1, 0, 1, 0]), torch.tensor([0, 0, 1, 1])):
+        torch.testing.assert_close(compiled(source, rows), torch.nn.functional.linear(source, weight)[rows])

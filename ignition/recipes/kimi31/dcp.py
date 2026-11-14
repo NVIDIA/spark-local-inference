@@ -55,6 +55,7 @@ class ContextParallel:
     selections: object = None
     candidate_owners: object = None
     selection_tuning: object = None
+    groups: tuple = ()
 
 
 def index_pages(model_pages, output):

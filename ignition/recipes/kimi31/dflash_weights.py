@@ -9,6 +9,7 @@ import torch
 
 from ignition.components.weights import DirectWeightLoader, MLPWeights, quantize_bf16_linear_as_mxfp8
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
+from ignition.preparation.persistent import persistent_cat, persistent_empty
 
 
 @dataclass(frozen=True)
@@ -44,29 +45,30 @@ class DraftWeights:
         conv_range = shard.partition(4 * h // 16, alignment=8)
         pack = (partial(quantize_bf16_linear_as_mxfp8, retain_scale_rows=False)
                 if online_mxfp8 else lambda weight: weight)
+        cat = torch.cat if online_mxfp8 else persistent_cat
         with DirectWeightLoader(manifest, device, progress=progress, progress_label="Load draft weights") as loader:
-            def matrix(name, rows=None, columns=None):
+            def matrix(name, rows=None, columns=None, *, temporary=False):
                 return loader.load_tensor(name + ".weight", extent=(slice(*(rows or (None, None))),
-                    slice(*(columns or (None, None)))))
-            project = pack(matrix("fc", rows=shard.partition(h, alignment=64)))
+                    slice(*(columns or (None, None)))), temporary=temporary)
+            project = pack(matrix("fc", rows=shard.partition(h, alignment=64), temporary=online_mxfp8))
             hidden_norm, norm = loader.load_tensors(("hidden_norm.weight", "norm.weight"))
             layers, context = [], []
             for i in range(d.layers):
                 p = f"layers.{i}"
                 a = p + ".self_attn"
-                qa = matrix(a + ".q_a_proj", rows=q_range)
-                ka = matrix(a + ".kv_a_proj_with_mqa", rows=kv_range)
+                qa = matrix(a + ".q_a_proj", rows=q_range, temporary=True)
+                ka = matrix(a + ".kv_a_proj_with_mqa", rows=kv_range, temporary=True)
                 context.append(ka)
-                fused = torch.cat((qa, ka))
-                fused = torch.cat((fused, fused.new_zeros((-fused.shape[0] % 8, h))))
-                kv = matrix(a + ".kv_b_proj", rows=(h0 * 256, h1 * 256)).view(h1 - h0, 256, 512)
-                attention = dict(latent_gate=pack(fused), q_b=pack(matrix(a + ".q_b_proj", rows=(h0*192, h1*192))),
-                    key=kv[:, :128].contiguous(), value=kv[:, 128:].transpose(1, 2).contiguous(),
+                fused = cat((qa, ka, qa.new_zeros((-(qa.shape[0] + ka.shape[0]) % 8, h))))
+                kv = matrix(a + ".kv_b_proj", rows=(h0 * 256, h1 * 256), temporary=True).view(h1 - h0, 256, 512)
+                attention = dict(latent_gate=pack(fused), q_b=pack(matrix(a + ".q_b_proj", rows=(h0*192, h1*192), temporary=online_mxfp8)),
+                    key=persistent_empty((h1 - h0, 128, 512), dtype=kv.dtype, device=kv.device).copy_(kv[:, :128]),
+                    value=persistent_empty((h1 - h0, 512, 128), dtype=kv.dtype, device=kv.device).copy_(kv[:, 128:].transpose(1, 2)),
                     query_norm=loader.load_tensor(a + ".q_a_layernorm.weight"),
                     kv_norm=loader.load_tensor(a + ".kv_a_layernorm.weight"),
-                    output=pack(matrix(a + ".o_proj", columns=(h0*128, h1*128))))
-                mlp = MLPWeights(pack(torch.cat([matrix(p + ".mlp." + n, rows=intermediate)
-                    for n in ("gate_proj", "up_proj")])), pack(matrix(p + ".mlp.down_proj", columns=intermediate)))
+                    output=pack(matrix(a + ".o_proj", columns=(h0*128, h1*128), temporary=online_mxfp8)))
+                mlp = MLPWeights(pack(cat([matrix(p + ".mlp." + n, rows=intermediate, temporary=True)
+                    for n in ("gate_proj", "up_proj")])), pack(matrix(p + ".mlp.down_proj", columns=intermediate, temporary=online_mxfp8)))
                 def conv(kind):
                     return dict(base=loader.load_tensor(p + "." + kind + ".base_kernel"),
                         projection=matrix(p + "." + kind + ".kernel_projection", rows=conv_range))
@@ -79,8 +81,7 @@ class DraftWeights:
         if draft_head_quantization is not None:
             from ignition.components.vocabulary import mxfp8_draft_head, nvfp4_draft_head
             head = {"mxfp8": mxfp8_draft_head, "nvfp4": nvfp4_draft_head}[draft_head_quantization](target_head)
-        context = torch.cat(context)
-        context = torch.cat((context, context.new_zeros((-context.shape[0] % 8, h))))
+        context = cat((*context, context[0].new_zeros((-sum(weight.shape[0] for weight in context) % 8, h))))
         return cls(project, hidden_norm, pack(context), norm, tuple(layers),
                    dict(zip(("projection", "predecessor", "successor"), values, strict=True)), head)
 

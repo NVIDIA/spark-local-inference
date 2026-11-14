@@ -23,9 +23,10 @@ and review comments, plans, progress messages, handoffs, and completion reports.
   experiment labels, profile numbers, implementation shorthand, or names such
   as `XOR-Cheb-T12` the vocabulary of the design. Mention literal identifiers
   only after describing what they mean and only when the reader needs them.
-- Canonical documentation is a present-state specification, not a changelog.
-  Replace stale claims instead of layering history on top. Put chronology,
-  rejected attempts, and retrospectives only in explicitly historical documents.
+- Documentation is a present-state specification, not a changelog. Replace
+  stale claims instead of layering history on top. The repository keeps no
+  historical documents: do not write chronology, rejected attempts,
+  retrospectives, defect reports, or run journals into any document.
 - Distinguish implementation from qualification. Where support or readiness
   matters, state what is implemented and the conditions under which it is
   qualified; identify research-only or unsupported behavior explicitly. An

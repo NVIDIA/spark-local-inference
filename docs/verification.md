@@ -73,8 +73,9 @@ nothing about destroying the fixture's resource owners. Never replace a required
 production behavior with a stub and claim it was verified.
 
 See the [Kani manual](https://model-checking.github.io/kani/) for supported
-features and harness syntax. The checked Helios targets and commands are listed
-in [Helios lifecycle verification](../verification/helios-lifecycle/README.md).
+features and harness syntax. The checked Helios targets, the pinned Kani
+release, and the commands are listed in
+[Helios lifecycle verification](../verification/helios-lifecycle/README.md#sequential-rust-proofs).
 
 ## Use TLA+ for states and ordering
 
@@ -97,7 +98,13 @@ is bounded conformance evidence; formal refinement requires establishing that
 every reachable implementation transition maps to an allowed specification
 transition. An unbounded theorem requires a proof beyond finite TLC exploration.
 
-Use pstack's `statechart` skill to interpret model results and
+The TLA+ specifications, their TLC configurations, and the runner
+`verification/helios-lifecycle/check.py` are described in
+[Helios lifecycle verification](../verification/helios-lifecycle/README.md);
+the repository's [helios-lifecycle skill](../.agents/skills/helios-lifecycle/SKILL.md)
+states when to run them. pstack is an agent-skill plugin installed separately
+from this repository. Where it is installed, use its `statechart` skill to
+interpret model results and
 `maintain-formal-verification-skill` when covered code changes without rechecking
 the specification. Document the functions, state projection, bounds, and external
 contracts needed to interpret the check.
@@ -109,6 +116,8 @@ functions and relevant tests before considering a wider run. Keep caught,
 surviving, unviable, and timed-out mutations distinct. Compilation failures do not
 demonstrate test sensitivity. Inspect a surviving mutation before treating it as
 a missing test; a generated change can be equivalent for the declared contract.
+The pinned cargo-mutants version and the scoped Helios commands are in
+[Helios lifecycle verification](../verification/helios-lifecycle/README.md#mutation-coverage-with-cargo-mutants).
 
 A targeted fault can calibrate an invariant that the tool's mutation operators
 do not generate. Use scratch changes, require the expected behavioral failure,

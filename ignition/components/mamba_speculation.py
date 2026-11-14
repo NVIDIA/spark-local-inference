@@ -13,8 +13,9 @@ from b12x.preparation import PreparedCall
 from b12x.preparation.types import plan_from_handle, require_prepared
 from b12x.sequence import mamba_ssd
 
+from ignition.preparation.persistent import persistent_copy
 from ignition.preparation.scratch import planned_scratch
-from ignition.preparation.tuning import benchmark_resource, declare, register_finalizer
+from ignition.preparation.tuning import benchmark_resource, declare
 
 from .mamba import _operands
 from .native_operator import native_contract, native_plan
@@ -122,9 +123,9 @@ class PreparedMambaVerification:
     """
 
     def __init__(self, args, records, ring_start, pending_count, indices, *, width, session, workspace, name):
-        self.args, self.output, self.records = _operands(args), args["out"], tuple(records)
-        self.ring_start, self.pending_count, self.indices = ring_start, pending_count, indices
-        q = mamba_ssd.query_from_call(*self.args, out=self.output)
+        self.output_shape, self.output_dtype = tuple(args["out"].shape), args["out"].dtype
+        device = args["out"].device
+        q = mamba_ssd.query_from_call(*_operands(args), out=args["out"])
         if q.max_tokens > q.max_seqs * width:
             raise ValueError("Mamba verification token capacity exceeds its per-sequence width")
         slots = args["recurrent_state"].shape[0]
@@ -146,7 +147,8 @@ class PreparedMambaVerification:
         query = VerificationQuery(q.heads, q.groups, q.head_dim, q.dstate, q.max_seqs, q.max_tokens,
             width, ring_length, q.state_dtype, q.dt_dtype, q.index_dtype,
             q.state_stride, q.x_stride, q.dt_stride, q.b_stride, q.c_stride,
-            torch.cuda.get_device_properties(self.output.device).multi_processor_count)
+            torch.cuda.get_device_properties(device).multi_processor_count)
+        self.query = query
 
         def materialize(tactic):
             from flashinfer.mamba.checkpointing_ssu import _get_module
@@ -156,7 +158,7 @@ class PreparedMambaVerification:
                 q.head_dim, q.dstate, width, ring_length - width, q.heads // q.groups, q.groups, 0, False)
             return VerificationState(module, query, tactic)
 
-        self.plan = native_plan(contract=CONTRACT, query=query, device=self.output.device,
+        self.plan = native_plan(contract=CONTRACT, query=query, device=device,
             scratch_bytes=lambda tactic: _scratch_bytes(query), materialize=materialize)
 
         def benchmark(state):
@@ -169,15 +171,13 @@ class PreparedMambaVerification:
 
         declare(session, (self.plan.request(name=name,
             prepare_call=lambda state: replace(benchmark(state), owners=()), benchmark_call=benchmark),))
-        register_finalizer(session, lambda: self._bind(workspace), workspace=workspace)
 
-    def _bind(self, workspace):
-        self.scratch = planned_scratch(self.plan.scratch_specs(), workspace)
-
-    def __call__(self):
-        _verification(*self.args, *self.records, self.ring_start, self.pending_count, self.indices,
-                      self.output, self.scratch, self.plan.handle)
-        return self.output
+    def __call__(self, operands, records, ring_start, pending_count, indices):
+        output = torch.empty(self.output_shape, dtype=self.output_dtype, device=operands["x"].device)
+        scratch = torch.empty(_scratch_bytes(self.query), dtype=torch.uint8, device=operands["x"].device)
+        _verification(*_operands(operands), *records, ring_start, pending_count, indices,
+                      output, scratch, self.plan.handle)
+        return output
 
 
 class _Fixture:
@@ -272,11 +272,11 @@ class PreparedMambaReplay:
     """Materialize accepted records across layers before changing execution width.
 
     Replay fields and ring metadata live in continuation rows, so native state
-    transfers preserve the complete history. Contiguous metadata vectors are
-    per-graph scratch populated only for the physically backed active rows.
+    transfers preserve the complete history. Ring vectors are produced for each
+    invocation and populated only for physically backed active rows.
     """
 
-    def __init__(self, backing, layout, regions, A, rows, lengths, *, ring_region, count_region, ring_length, buffers):
+    def __init__(self, backing, layout, regions, A, *, ring_region, count_region, ring_length):
         if A.ndim != 2 or A.dtype != torch.float32 or A.shape[0] != len(regions):
             raise ValueError("Mamba replay needs one FP32 decay vector per recurrent layer")
         state, x, b, dt = regions[0]
@@ -287,24 +287,24 @@ class PreparedMambaReplay:
         for r in regions:
             if tuple((v.shape, v.dtype) for v in r) != tuple((v.shape, v.dtype) for v in regions[0]):
                 raise ValueError("batched Mamba replay requires matching layer geometry")
-        self.backing, self.A, self.rows, self.lengths = backing, A, rows, lengths
-        self.offsets = torch.tensor([[r.offset for r in layer] for layer in regions], dtype=torch.int64, device=A.device)
-        self.ring_start = buffers.zeros((backing.shape[0],), torch.int32)
-        self.pending_count = buffers.zeros((backing.shape[0],), torch.int32)
+        self.backing, self.A = backing, A
+        self.offsets = persistent_copy(torch.tensor([[r.offset for r in layer] for layer in regions],
+                                                    dtype=torch.int64, device=A.device))
         self.constants = dict(ROW_BYTES=layout.row_bytes, RING_OFFSET=ring_region.offset,
             COUNT_OFFSET=count_region.offset, RING=ring_length)
         self.geometry = dict(HEADS=heads, GROUPS=b.shape[0], DIM=dim, N=n)
-        # Blocks visit multiple tiles so unchanged rows do not launch one block per state tile.
-        self.grid = (len(regions), rows.numel(), min(256, triton.cdiv(heads * dim * n, 256)))
-
-    def prepare(self, *, width=1):
+    def prepare(self, rows, lengths, *, width=1):
+        ring_start = torch.empty((self.backing.shape[0],), dtype=torch.int32, device=self.backing.device)
+        pending_count = torch.empty_like(ring_start)
         limit = 0 if width == 1 else self.constants["RING"] - width
-        torch.library.wrap_triton(_materialize)[self.grid](self.backing, self.offsets, self.A, self.rows, self.lengths,
+        grid = (len(self.offsets), rows.numel(), min(256, triton.cdiv(self.geometry["HEADS"] * self.geometry["DIM"] * self.geometry["N"], 256)))
+        torch.library.wrap_triton(_materialize)[grid](self.backing, self.offsets, self.A, rows, lengths,
             **self.constants, **self.geometry, LIMIT=limit, BLOCK=256, num_warps=4)
-        torch.library.wrap_triton(_replay_metadata)[(self.rows.numel(),)](self.backing, self.rows, self.lengths,
-            self.ring_start, self.pending_count, self.lengths, **self.constants, LIMIT=limit, COMMIT=False, WINDOW=0)
+        torch.library.wrap_triton(_replay_metadata)[(rows.numel(),)](self.backing, rows, lengths,
+            ring_start, pending_count, lengths, **self.constants, LIMIT=limit, COMMIT=False, WINDOW=0)
+        return ring_start, pending_count
 
-    def commit(self, counts, *, width):
-        torch.library.wrap_triton(_replay_metadata)[(self.rows.numel(),)](self.backing, self.rows, self.lengths,
-            self.ring_start, self.pending_count, counts, **self.constants, LIMIT=0, COMMIT=True,
+    def commit(self, counts, rows, lengths, ring_start, pending_count, *, width):
+        torch.library.wrap_triton(_replay_metadata)[(rows.numel(),)](self.backing, rows, lengths,
+            ring_start, pending_count, counts, **self.constants, LIMIT=0, COMMIT=True,
             WINDOW=self.constants["RING"] - width)

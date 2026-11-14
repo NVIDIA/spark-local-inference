@@ -14,13 +14,16 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
             core_storage=None, ranks=None):
     if not plan.context_parallel:
         raise ValueError("Kimi K3.1 preparation requires context parallelism")
+    if (plan.context_parallel_size or plan.world_size) not in (8, 16):
+        raise ValueError("Kimi K3.1 TP16 supports DCP8 or DCP16")
     if plan.speculation is not None and plan.speculation.method == "dflash2":
         from .dflash_config import REPOSITORY, REVISION
         return prepare_kimi(snapshot, plan, compile_forwards=compile_forwards, kernel_cache=kernel_cache,
             progress=progress, retain_graphs=retain_graphs, core_storage=core_storage, ranks=ranks,
             recipe=RECIPE, draft_source=(REPOSITORY, REVISION), draft_directory="dflash2")
-    if plan.speculation is not None and plan.speculation.draft_head_quantization is not None:
-        raise ValueError("Kimi draft head conversion requires --speculative-method dflash2")
+    if plan.speculation is not None and (plan.speculation.draft_head_quantization is not None
+                                         or plan.speculation.draft_body_quantization is not None):
+        raise ValueError("Kimi draft conversion requires --speculative-method dflash2")
     return prepare_kimi(snapshot, plan, compile_forwards=compile_forwards, kernel_cache=kernel_cache,
         progress=progress, retain_graphs=retain_graphs, core_storage=core_storage, ranks=ranks,
         recipe=RECIPE, draft_source=(DSPARK_REPOSITORY, DSPARK_REVISION))
@@ -40,7 +43,7 @@ RECIPE = Recipe(
     speculation=Speculation(draft_tokens=7, token_capacity=128, packed_verification=True, graph_budget=64),
     max_draft_tokens=7, verification_rows=0, max_images=4, image_bytes=32 << 20,
     online_mxfp8=True, online_mxfp8_scope="kda-input", online_mxfp8_scopes=("all", "kda-input"),
-    draft_head_quantizations=("mxfp8", "nvfp4"),
+    draft_head_quantizations=("mxfp8", "nvfp4"), draft_body_quantizations=("mxfp8",),
     speculative_methods=MappingProxyType({"dflash2": SpeculativeMethod(MappingProxyType({
         16: RankCosts(state_row_bytes=35_450_112, page_bytes=2_174_976, graph_bytes=9 << 29, page_tokens=128*16),
     }), draft_bytes=5_569_622_016)}),

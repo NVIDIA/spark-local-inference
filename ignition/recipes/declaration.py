@@ -85,13 +85,16 @@ class Checkpoint:
     # Estimated resident device weights after optional lossless expert-scale compression.
     scale_compressed_device_bytes: Mapping[str, int] = field(default_factory=dict)
     # Per-rank costs replacing the recipe's `ranks` and `plain_ranks` when this checkpoint's draft or state
-    # layout differs, such as a draft model that only this checkpoint carries.
+    # layout differs, such as a draft model that only this checkpoint carries. The declared sizes may be
+    # a subset of the recipe's when the checkpoint's stored shards exclude a tensor-parallel size.
     ranks: Mapping[int, "RankCosts"] | None = None
     # Bytes of weights one decode step reads for one request across every rank: dense weights
     # plus the experts one token activates, at their stored precision. Zero leaves the serving
     # contract without the value, and dashboards then show no weight bandwidth.
     decode_weight_bytes: int = 0
     plain_ranks: Mapping[int, "RankCosts"] | None = None
+    # API model name advertised for this checkpoint; empty uses the recipe's `served_model_name`.
+    served_model_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -118,6 +121,7 @@ class Speculation:
     vocabulary_parallel_sampling: bool = False
     method: str | None = None
     mtp_only: bool = False
+    draft_body_quantization: str | None = None
 
     def __post_init__(self):
         if self.mtp_only and self.draft_tokens < 1:
@@ -134,6 +138,10 @@ class Speculation:
                 raise ValueError(f"{head} head quantization must be omitted or one of: {', '.join(choices)}")
             if value is not None and self.draft_tokens < 1:
                 raise ValueError("draft head quantization requires positive learned draft depth")
+        if self.draft_body_quantization not in (None, "mxfp8"):
+            raise ValueError("draft body quantization must be omitted or mxfp8")
+        if self.draft_body_quantization is not None and self.draft_tokens < 1:
+            raise ValueError("draft body quantization requires positive learned draft depth")
         if self.graph_budget is not None:
             if type(self.graph_budget) is not int or self.graph_budget < 1:
                 raise ValueError("speculative graph budget must be a positive integer")
@@ -250,6 +258,7 @@ class Recipe:
     export_repository: str = ""
     # Preparation overrides for vocabulary and transition projections used only by proposals.
     draft_head_quantizations: tuple[str, ...] = ()
+    draft_body_quantizations: tuple[str, ...] = ()
     markov_head_quantizations: tuple[str, ...] = ()
 
     def mixed_shapes(self, concurrency, chunk, speculation):
@@ -280,13 +289,23 @@ class Recipe:
             if method.draft_bytes is not None and method.draft_bytes <= 0:
                 raise ValueError("speculative draft bytes must be positive")
         for checkpoint in self.checkpoints:
-            if any(costs is not None and set(costs) != set(self.ranks)
+            if any(costs is not None and (not costs or not set(costs) <= set(self.ranks))
                    for costs in (checkpoint.ranks, checkpoint.plain_ranks)):
-                raise ValueError(f"{checkpoint.alias} declares costs for other tensor-parallel sizes than its recipe")
+                raise ValueError(f"{checkpoint.alias} declares costs for tensor-parallel sizes its recipe does not serve")
+            if (checkpoint.ranks is None) != (checkpoint.plain_ranks is None) or (
+                    checkpoint.ranks is not None and set(checkpoint.ranks) != set(checkpoint.plain_ranks)):
+                raise ValueError(f"{checkpoint.alias} declares costs with and without speculation for different sizes")
 
     @property
     def tensor_parallel(self) -> tuple[int, ...]:
         return tuple(sorted(self.ranks))
+
+    def checkpoint_tensor_parallel(self, checkpoint: Checkpoint) -> tuple[int, ...]:
+        """Tensor-parallel sizes `checkpoint` prepares: its own declared sizes, else the recipe's."""
+        return self.tensor_parallel if checkpoint.ranks is None else tuple(sorted(checkpoint.ranks))
+
+    def served_name(self, checkpoint: Checkpoint) -> str:
+        return checkpoint.served_model_name or self.served_model_name
 
     def costs(self, world_size: int, speculation: Speculation | None, checkpoint: Checkpoint | None = None) -> RankCosts:
         """Return one rank's costs under the given speculation settings, for `checkpoint` when it declares its own."""

@@ -56,6 +56,7 @@ pub enum Command {
     Discover(String),
     OpenModel(PathBuf),
     Download(String),
+    ClearFailedDownloads,
     Activate(String),
     Stop,
     Resume(u64),
@@ -72,8 +73,10 @@ pub struct ModelMetadata {
     pub license: String,
     pub quantization: String,
     pub hardware: String,
+    pub build_target_match: Option<bool>,
     pub revision: String,
     pub revision_commit: String,
+    pub revision_updated_at: String,
     pub base_model: String,
     pub context_tokens: Option<u64>,
     pub parameter_count: Option<u64>,
@@ -1080,8 +1083,10 @@ impl Worker {
                             license: entry.license,
                             quantization: entry.quantization,
                             hardware: entry.hardware,
+                            build_target_match: entry.build_target_match,
                             revision: entry.revision,
                             revision_commit: entry.revision_commit,
+                            revision_updated_at: entry.revision_updated_at,
                             base_model: entry.base_model,
                             context_tokens: entry.context_tokens,
                             parameter_count: entry.parameter_count,
@@ -1140,6 +1145,7 @@ impl Worker {
             Command::Download(source) => {
                 self.queue_download(id, source, self.settings.model_directory.clone())
             }
+            Command::ClearFailedDownloads => self.clear_failed_downloads(),
             Command::Resume(previous) => {
                 let saved = self
                     .persistent
@@ -1270,6 +1276,14 @@ fn external_id(path: &Path) -> String {
     format!("external:{:016x}", hash.finish())
 }
 
+fn local_model_name(entry: &crate::application::LibraryEntry) -> String {
+    let name = match entry.hub_repositories.as_slice() {
+        [repository] => repository.split_once('/').map_or(entry.model.as_str(), |(_, name)| name),
+        _ => &entry.model,
+    };
+    recommendations::local_name(name, &entry.hub_repositories)
+}
+
 fn local_model_metadata(entry: &crate::application::LibraryEntry) -> ModelMetadata {
     let mut result = ModelMetadata {
         author: entry.hub_repositories.first()
@@ -1353,6 +1367,35 @@ mod tests {
     use std::time::Instant;
 
     #[test]
+    fn local_card_names_use_an_unambiguous_acquisition_repository() {
+        let mut entry = crate::application::LibraryEntry {
+            model: "checkpoint".into(),
+            model_key: "checkpoint".into(),
+            version: "gb10-tp1-build".into(),
+            selected: false,
+            leased: false,
+            verification: crate::application::VerificationState::Unverified,
+            hub_repositories: vec![
+                "local-inference-lab/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-FLARE".into(),
+            ],
+            metadata: None,
+            error: None,
+        };
+        assert_eq!(
+            local_model_name(&entry),
+            "NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-FLARE"
+        );
+        entry.hub_repositories.push("another-publisher/another-name".into());
+        assert_eq!(local_model_name(&entry), "checkpoint");
+        entry.hub_repositories.clear();
+        assert_eq!(local_model_name(&entry), "checkpoint");
+        entry.model = "Locally prepared model".into();
+        assert_eq!(local_model_name(&entry), "Locally prepared model");
+        entry.hub_repositories.push(recommendations::PREPARED_REPOSITORY.into());
+        assert_eq!(local_model_name(&entry), recommendations::DISPLAY_MODEL);
+    }
+
+    #[test]
     fn local_card_context_uses_an_unambiguous_deployment() {
         let mut entry = crate::application::LibraryEntry {
             model: "Model".into(), model_key: "model".into(), version: "version".into(),
@@ -1424,7 +1467,7 @@ mod tests {
                 id: format!("hub:{source}"),
                 name: source.into(),
                 source: source.into(),
-                metadata: ModelMetadata { context_tokens: Some(1048576), hardware: "GB202".into(), ..Default::default() },
+                metadata: ModelMetadata { context_tokens: Some(1048576), hardware: "GB202".into(), build_target_match: Some(false), revision: "gb202".into(), revision_updated_at: "2026-11-05T18:06:29Z".into(), ..Default::default() },
                 flags: 16,
                 ..Default::default()
             })
@@ -1434,7 +1477,11 @@ mod tests {
         assert_eq!(matched[0].id, "local:local-model@selected");
         assert_eq!(matched[0].metadata.context_tokens, Some(262144));
         assert_eq!(matched[0].metadata.hardware, "GB10");
+        assert_eq!(matched[0].metadata.build_target_match, Some(false));
         assert_eq!(matched[0].metadata.rank_count, Some(1));
+        assert_eq!(matched[0].metadata.revision, "gb202");
+        assert_eq!(matched[0].metadata.revision_updated_at, "2026-11-05T18:06:29Z");
+        assert!(models[1].metadata.revision_updated_at.is_empty());
         assert_eq!(matched[0].name, repository);
         assert_eq!(matched[0].logical_bytes, Some(42));
         assert_eq!(matched[0].flags, 1 | 16);
@@ -1535,6 +1582,111 @@ mod tests {
         assert_eq!(restored.downloads[0].id, 17);
         state.save(&path).unwrap();
         assert!(Persistent::load(&path).is_ok());
+    }
+    #[test]
+    fn clear_failed_downloads_preserves_other_entries_files_and_preferences() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = configuration(directory.path());
+        let state_file = config.with_file_name("desktop-state.json");
+        let data = directory.path().join("models");
+        std::fs::create_dir_all(&data).unwrap();
+        let partial = data.join("core.incomplete");
+        let installed = data.join("model.safetensors");
+        std::fs::write(&partial, b"partial core data").unwrap();
+        std::fs::write(&installed, b"installed core data").unwrap();
+        let states = [FAILED, COMPLETE, FAILED, PAUSED, CANCELLED, QUEUED, RUNNING];
+        let saved = Persistent {
+            appearance: Appearance { compact: true, ..Default::default() },
+            extra: serde_json::from_value(serde_json::json!({"retained_preference": 7})).unwrap(),
+            downloads: states.iter().enumerate().map(|(index, state)| SavedDownload {
+                installed_model: String::new(),
+                id: index as u64 + 1,
+                source: format!("publisher/model-{index}@gb10"),
+                directory: data.clone(),
+                state: *state,
+                error: String::new(),
+            }).collect(),
+            ..Default::default()
+        };
+        saved.save(&state_file).unwrap();
+        let app = Controller::new(Some(config.clone())).unwrap();
+        wait_for(&app, |view| !view.busy && view.downloads.len() == states.len());
+        // Restored transfers are paused; live transfer state must survive cleanup too.
+        app.shared.update(|inner| {
+            for (slot, state) in inner.downloads.iter_mut().zip(states) {
+                slot.view.state = state;
+                if matches!(state, QUEUED | RUNNING) {
+                    inner.operations.insert(slot.view.operation_id, Operation::new());
+                }
+            }
+        });
+        app.submit(Command::ClearFailedDownloads).unwrap();
+        let cleared = wait_for(&app, |view| {
+            !view.busy && view.downloads.len() == states.len() - 2
+        });
+        assert!(cleared.error.is_empty());
+        assert_eq!(
+            cleared.downloads.iter().map(|download| download.state).collect::<Vec<_>>(),
+            [COMPLETE, PAUSED, CANCELLED, QUEUED, RUNNING]
+        );
+        assert_eq!(
+            cleared.downloads.iter().map(|download| download.operation_id).collect::<Vec<_>>(),
+            [2, 4, 5, 6, 7]
+        );
+        {
+            let inner = app.shared.inner.lock().unwrap();
+            for id in [6, 7] {
+                assert!(!inner.operations[&id].cancel.load(Ordering::Acquire));
+            }
+        }
+        let persisted = Persistent::load(&state_file).unwrap();
+        assert_eq!(
+            persisted.downloads.iter().map(|download| download.id).collect::<Vec<_>>(),
+            [2, 4, 5, 6, 7]
+        );
+        assert!(persisted.appearance.compact);
+        assert_eq!(persisted.extra, saved.extra);
+        assert_eq!(std::fs::read(&partial).unwrap(), b"partial core data");
+        assert_eq!(std::fs::read(&installed).unwrap(), b"installed core data");
+        close(&app);
+        drop(app);
+        let restored = Controller::new(Some(config)).unwrap();
+        assert_eq!(restored.snapshot().downloads.len(), states.len() - 2);
+        assert!(restored.snapshot().downloads.iter().all(|download| download.state != FAILED));
+        close(&restored);
+    }
+    #[test]
+    fn clear_failed_downloads_keeps_history_when_persistence_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = configuration(directory.path());
+        let state_file = config.with_file_name("desktop-state.json");
+        let saved = Persistent {
+            downloads: vec![SavedDownload {
+                installed_model: String::new(),
+                id: 1,
+                source: "publisher/model@gb10".into(),
+                directory: directory.path().join("models"),
+                state: FAILED,
+                error: "Transfer failed".into(),
+            }],
+            ..Default::default()
+        };
+        saved.save(&state_file).unwrap();
+        let app = Controller::new(Some(config)).unwrap();
+        wait_for(&app, |view| !view.busy && view.downloads.len() == 1);
+        std::fs::remove_file(&state_file).unwrap();
+        std::fs::create_dir(&state_file).unwrap();
+        app.submit(Command::ClearFailedDownloads).unwrap();
+        let failed = wait_for(&app, |view| !view.busy && !view.error.is_empty());
+        assert_eq!(failed.downloads.len(), 1);
+        assert_eq!(failed.downloads[0].state, FAILED);
+        assert_eq!(failed.downloads[0].error, "Transfer failed");
+        std::fs::remove_dir(&state_file).unwrap();
+        saved.save(&state_file).unwrap();
+        app.submit(Command::ClearFailedDownloads).unwrap();
+        wait_for(&app, |view| !view.busy && view.downloads.is_empty());
+        assert!(Persistent::load(&state_file).unwrap().downloads.is_empty());
+        close(&app);
     }
     #[test]
     fn loading_observation_exposes_stable_stage_and_measured_progress() {
@@ -1756,7 +1908,7 @@ impl Worker {
                 .unwrap_or_default();
             models.push(ModelView {
                 id: id.clone(),
-                name: recommendations::local_name(&entry.model, &entry.hub_repositories),
+                name: local_model_name(entry),
                 version: entry.version.clone(),
                 source: "Local library".into(),
                 path,
@@ -2044,6 +2196,9 @@ impl Worker {
         let phase = progress.phase("Load tokenizer", None);
         let mut config = owner.server_config().clone();
         config["thinking_token_budget"] = serde_json::json!(self.settings.thinking_token_budget);
+        if let Some(fraction) = self.settings.scheduler_checkpoint_extra_work_fraction {
+            config["scheduler_checkpoint_extra_work_fraction"] = fraction.into();
+        }
         let mut loaded = match LoadedSession::new(owner, config) {
             Ok(loaded) => loaded,
             Err(error) => {
@@ -2236,6 +2391,18 @@ impl Worker {
                 cancelled: false,
             });
         }
+        Ok(())
+    }
+    fn clear_failed_downloads(&mut self) -> Result<(), String> {
+        let mut saved = self.persistent.clone();
+        saved.downloads.retain(|download| download.state != FAILED);
+        if saved.downloads.len() == self.persistent.downloads.len() {
+            return Ok(());
+        }
+        saved.save(&self.settings.state_file)?;
+        self.persistent = saved;
+        self.shared
+            .update(|state| state.downloads.retain(|slot| slot.view.state != FAILED));
         Ok(())
     }
     fn finish_download(&mut self, done: DownloadDone) {

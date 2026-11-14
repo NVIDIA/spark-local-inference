@@ -277,6 +277,39 @@ def test_complete_layer_csf_scales_expand_once_without_scratch(manifest):
             assert torch.equal(persistent[expert], expansion[expert].view(torch.uint8))
 
 
+def test_csf_expert_persistent_storage_contains_final_weights(manifest):
+    from ignition.components.parallel import TensorParallelShard
+    from ignition.preparation.core_storage import CoreStorage
+    from ignition.preparation.tensor_metadata import merge_ranges, subtract_ranges, tensor_ranges
+
+    ids = (0, 511)
+    prefix = f"{TEXT_PREFIX}.layers.0.mlp.experts"
+    fields = ("w1_fp4", "w1_blockscale", "w1_alphas", "a1_gscale",
+              "w2_fp4", "w2_blockscale", "w2_alphas", "a2_gscale")
+    torch.cuda.set_device(0)
+    storage = CoreStorage(device=0)
+    try:
+        with storage:
+            for force_a16, rank, world in ((False, 0, 1), (True, 0, 1), (True, 1, 2)):
+                case = f"forced A16={force_a16}, rank={rank}, TP={world}"
+                start = 0 if storage._persistent_arena is None else storage._persistent_arena.used
+                with QwenWeightLoader(manifest, "cuda:0",
+                        prefixes=tuple(f"{prefix}.{expert}." for expert in ids),
+                        shard=TensorParallelShard(rank, world), force_moe_decode_a16=force_a16) as loader:
+                    actual = loader.load_experts(0, expert_ids=ids)._impl
+                torch.cuda.synchronize()
+                arena = storage._persistent_arena
+                retained = merge_ranges([span for name in fields for span in tensor_ranges(getattr(actual, name))])
+                assert all(arena.region.address <= left < right <= arena.region.address + arena.used
+                           for left, right in retained), f"{case}: runtime weights must remain in persistent storage"
+                unowned = subtract_ranges([(arena.region.address + start, arena.region.address + arena.used)],
+                                         merge_ranges([*retained, *arena.unused_ranges()]))
+                unowned_bytes = sum(right - left for left, right in unowned)
+                assert unowned_bytes <= 1024, f"{case}: retained {unowned_bytes} bytes outside runtime weights"
+    finally:
+        storage.close()
+
+
 @pytest.mark.parametrize("rank,world", [(0, 1), (1, 2), (3, 4)])
 def test_mtp_expert_shards_match_checkpoint_arithmetic(manifest, rank, world):
     from dataclasses import replace

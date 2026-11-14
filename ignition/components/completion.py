@@ -4,13 +4,13 @@
 
 """Persistent two-frame generation outputs and their request flags."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
 from ignition.components.capacity import completion_token_capacity
 from ignition.preparation.disposable import storage_ranges
-from ignition.preparation.scratch import GraphBufferPool
+from ignition.preparation.persistent import persistent_zeros
 
 MAX_TOP_LOGPROBS = 20
 MAX_LOGPROB_TOKEN_IDS = 128
@@ -21,9 +21,6 @@ VECTOR_TOKENS_FIELD = 16
 # Each token/logprob pair occupies two int32 words, starting with the chosen token.
 LOGPROB_PAIR_FIELDS = 2
 LOGPROB_FIELDS = LOGPROB_PAIR_FIELDS * (1 + MAX_LOGPROB_TOKEN_IDS)
-# Small chunks bound unused tails for reductions and mixed-role outputs; the
-# general graph pool default would reserve far more than these buffers need.
-_POOL_CHUNK_BYTES = 256 << 10
 
 
 @dataclass(frozen=True)
@@ -35,17 +32,15 @@ class CompletionOutputs:
     ``logprobs`` is int32 [2, slots, token_capacity, 258]: the chosen token followed by up to
     128 requested alternatives, each packed as [token ID, FP32 logprob bits]. Per-slot
     int32 ``requested`` flags gate reductions; only committed positions are valid.
-    ``scratch`` shares reduction storage across serial variants. ``private_storage``
-    keeps mixed-role outputs disjoint until their active-frame merge.
+    Mixed-role outputs remain disjoint until their active-frame merge.
     """
     records: torch.Tensor
     logprobs: torch.Tensor
     requested: torch.Tensor
     token_ids: torch.Tensor
     token_id_counts: torch.Tensor
-    scratch: GraphBufferPool
-    private_storage: GraphBufferPool
     speculative_survival: torch.Tensor | None = None
+    _private: list = field(default_factory=list, compare=False, repr=False)
 
     @classmethod
     def allocate(cls, shape, *, device):
@@ -60,8 +55,7 @@ class CompletionOutputs:
             torch.zeros((frames, slots, tokens, LOGPROB_FIELDS), dtype=torch.int32, device=device),
             torch.zeros(slots, dtype=torch.int32, device=device),
             torch.zeros((slots, MAX_LOGPROB_TOKEN_IDS), dtype=torch.int32, device=device),
-            torch.zeros(slots, dtype=torch.int32, device=device), GraphBufferPool(device, chunk_bytes=_POOL_CHUNK_BYTES),
-            GraphBufferPool(device, chunk_bytes=_POOL_CHUNK_BYTES),
+            torch.zeros(slots, dtype=torch.int32, device=device),
             torch.full((frames, slots, tokens - 1), -1., dtype=torch.float32, device=device) if tokens > 1 else None)
 
     @property
@@ -78,18 +72,22 @@ class CompletionOutputs:
 
     @property
     def nbytes(self):
-        return sum(t.nbytes for t in self.buffers().values()) + self.scratch.nbytes + self.private_storage.nbytes
+        return sum(t.nbytes for t in self.buffers().values()) + sum(
+            t.nbytes for child in self._private for t in (child.records, child.logprobs, child.speculative_survival) if t is not None)
 
     def zero_ranges(self):
-        return storage_ranges([self.buffers(), self.scratch.chunks, self.private_storage.chunks])
+        return storage_ranges([self.buffers(), *(child.buffers() for child in self._private)])
 
-    def private(self, buffers):
-        """Mixed roles share flags but retain disjoint outputs until their merge."""
-        return CompletionOutputs(buffers.zeros(self.records.shape, torch.int64),
-            buffers.zeros(self.logprobs.shape, torch.int32), self.requested, self.token_ids, self.token_id_counts,
-            self.scratch, self.private_storage,
-            buffers.zeros(self.speculative_survival.shape, torch.float32).fill_(-1.)
+    def private(self):
+        """Allocate disjoint mixed-role outputs while sharing request flags."""
+        device = self.records.device
+        child = CompletionOutputs(persistent_zeros(self.records.shape, torch.int64, device),
+            persistent_zeros(self.logprobs.shape, torch.int32, device), self.requested,
+            self.token_ids, self.token_id_counts,
+            persistent_zeros(self.speculative_survival.shape, torch.float32, device).fill_(-1.)
             if self.speculative_survival is not None else None)
+        self._private.append(child)
+        return child
 
     def merge(self, prompt, decode, prompt_slot, frame):
         for value in (prompt, decode):

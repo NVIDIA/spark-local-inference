@@ -1,18 +1,31 @@
 # Multi-token prediction and speculative execution
 
-Flare's speculative engine supports the embedded MTP modules in
-`local-inference-lab/Qwen3.8-Flash-Next-NVFP4-MXFP8-CSF-QAD` and
-`local-inference-lab/GLM-5.3-Flash-NVFP4-MXFP8-CSF-QAD`, and the DSpark drafter in
-`deepseek-ai/DeepSeek-V4.1-Flash` on SM120/121. Python prepares
+Flare's speculative engine supports the embedded MTP modules in the
+`qwen3.8-flash` recipe's checkpoint `nvidia/Qwen3.8-Flash-Next-FP4-Local` and
+the `glm-5.3-flash` recipe's checkpoint `nvidia/GLM-5.3-Flash-FP4-Local`, and
+the DSpark drafter in
+`deepseek-ai/DeepSeek-V4.1-Flash-1017` on SM120/121. This document specifies
+those three drafters. Other recipes declare their own learned drafters through
+`Recipe.speculation` in `ignition/recipes/declaration.py` and use the shared
+transaction, completion, and scheduling contracts described here;
+`ignition --help` lists each recipe's default and maximum draft counts. Python prepares
 weights, kernels, storage and CUDA graphs; Rust schedules requests and launches
-graphs. Acceptance and token feedback remain on the device. Speculative serving uses the ABI6 token-vector completion contract.
-Ignition prepares the recipe's learned drafter unless `--no-mtp` is given. The advanced flags
-select the draft-token maximum and default verification policy.
+graphs. Acceptance and token feedback remain on the device. Speculative serving
+uses the token-vector completion contract of execution ABI 6
+([execution manifest](../helios/manifest.md)).
+Ignition prepares the recipe's learned drafter unless `--no-mtp` is given.
+`--mtp-draft-tokens N` selects the draft-token maximum and
+`--no-mtp-adaptive-verification` selects fixed-width verification as the
+default policy. `flare run` accepts `--mtp-draft-tokens` within the core's
+prepared capacities and selects the policy with `--mtp-adaptive-verification`
+or `--no-mtp-adaptive-verification`.
 `flare run CORE --history-drafts` augments Qwen's learned MTP proposals
 with continuations from shared decoded history. `--no-history-drafts` disables
 that augmentation. History drafting defaults to off and is selected at startup;
-Ignition exports no history preference. Both settings use the same captured
-MTP graphs and buffers. Development native `ignition debug-serve` accepts the same
+Ignition exports no history preference. It requires speculative graphs that
+declare copy-token inputs, which only the `qwen3.8-flash` MTP graphs do. Both
+settings use the same captured
+MTP graphs and buffers. Native `ignition debug-serve` accepts the same
 options.
 
 With copying enabled, each loaded model retains the most recent 65,536 committed
@@ -27,8 +40,8 @@ The ring survives request completion and is discarded when the model unloads.
 Queries may use prompt context without inserting it into the shared corpus.
 
 The design combines adaptive verification budgets, native MTP proposals and
-continuations copied from shared decoded history. Compact recurrent commit and token
-trees are additional capabilities with explicit operator requirements. A
+continuations copied from shared decoded history. Compact recurrent commit is
+implemented for Qwen. Token trees are designed, not implemented. A
 separately trained parallel drafter is optional; it is not needed to use the
 checkpoint's MTP weights.
 
@@ -37,10 +50,10 @@ lifetime.
 
 ## Qwen checkpoint model and reference
 
-The exact checkpoint has one MTP decoder layer, 512 routed experts with top-10
+The `qwen3.8-flash` checkpoint has one MTP decoder layer, 512 routed experts with top-10
 routing, four 2,560-wide hidden streams, and a hyperconnection output mixer.
 Its sparse-attention layer has 24 query heads and two KV heads of dimension 256.
-The MTP decoder has no GDN or PLE layer. Target verification still executes all
+The MTP decoder has no GDN or PLE layer. Target verification executes all
 36 GDN layers, 12 QSA layers and target PLE operations.
 
 | MTP storage | Contract |
@@ -57,7 +70,8 @@ The [checkpoint manifest](../ignition/preparation/qwen38.py) validates MTP
 tensor geometry. Target loading excludes those tensors; the separate
 [MTP loader](../ignition/recipes/qwen38/mtp_weights.py) prepares their weights.
 
-Transformers `4cc2aa84301c9aa210b5513dab9fefae03981f6e` ignores `mtp.*`
+The Transformers revision pinned in `pyproject.toml`,
+`1d9654e78a23fb167ef539cbd699dfbd3e4830cf`, ignores `mtp.*` checkpoint keys
 and has no MTP module. The [MTP recipe](../ignition/recipes/qwen38/mtp.py) composes
 b12x operators for feedback, attention, expert execution, and output mixing.
 Feedback arithmetic is checked against `b12x.sequence.mtp_feedback.reference`;
@@ -78,7 +92,7 @@ accepted next-token IDs.
 
 ## Available operator contracts
 
-| Responsibility | Existing library interface | Bound or invariant |
+| Responsibility | Library interface | Bound or invariant |
 | --- | --- | --- |
 | MTP feedback | `b12x.sequence.mtp_feedback` prepared plan/bind/run | Four streams; caller-owned output and scratch |
 | Target recurrent verification | `b12x.sequence.gdn_decode`, or Ignition `PreparedRecoveredRecurrence` with `PreparedGDNCommit` | At most eight inputs; checkpoint columns or per-token correction records followed by accepted-prefix commit |
@@ -112,9 +126,10 @@ It shares the target's vocabulary projection. Its experts use NVFP4 weights
 with E4M3 block scales and BF16 activations; target experts use CSF storage.
 The draft decoder has no mHC streams, KDA recurrence, or rotary positions.
 
-GLM prepares TP2 or TP4 graphs and defaults to a maximum of five draft tokens.
-With concurrency four, batches one, two, and four each capture draft
-counts `{5,4,3,2,1,0}`.
+GLM prepares TP1, TP2, or TP4 graphs and defaults to five draft tokens, with a
+maximum of seven.
+With concurrency four and the default depth, batches one, two, and four each
+capture draft counts `{5,4,3,2,1,0}`.
 The shared native controller selects among the available counts. All ranks
 sample identical gathered distributions with identical device RNG state.
 History-copy proposals are not part of the GLM recipe.
@@ -197,7 +212,7 @@ history. A round offers `K` drafts after `p`.
 3. **Accept:** select the accepted draft prefix and the target correction or
    bonus token. With `a` accepted drafts, ordinary chain verification consumes
    `a+1` inputs and produces `a+1` newly generated tokens: `a` drafts and one
-   pending target sample. The incoming `p` was generated previously.
+   pending target sample. The incoming `p` was generated by the preceding round.
 4. **Commit:** clip at device-visible EOS or output budget; select the matching
    target state, advance committed histories and penalties once, repair draft
    history using actual target residuals, and write a bounded token-vector
@@ -251,9 +266,11 @@ The target's FP32 recurrent matrices occupy **108 MiB per saved verification
 position**. Four requests with seven additional positions require 2.953 GiB;
 fifteen require 6.328 GiB, excluding histories, logits and weights. Recurrent
 writes also cost 108 MiB per verified row: batch one at width eight writes
-864 MiB, approximately 0.5 ms at 1.79 TB/s before other traffic. A
-batch-four width-eight shape would write 3.375 GiB, approximately 2 ms.
-Measured round timings must include these writes. Existing GDN
+864 MiB, approximately 0.5 ms before other traffic at the 1.79 TB/s memory
+bandwidth that the [core design](core-design.md#performance-acceptance) uses
+for its weight-traffic bound. A
+batch-four width-eight shape writes 3.375 GiB, approximately 2 ms.
+Measured round timings must include these writes. GDN verification
 supports a maximum of seven drafts plus the guaranteed input per request.
 
 One additional BF16 QSA layer adds 2,112 bytes per cached token, including
@@ -264,28 +281,39 @@ by the draft model. Preparation reports exact persistent, graph-pool and scratch
 costs before allocating KV pages, preserving configured headroom and snapshot
 budgets.
 
-The current compact recurrence retains one committed matrix plus per-token
+The compact recurrence (`PreparedRecoveredRecurrence` in
+`ignition/components/gdn_recovery.py`) retains one committed matrix plus per-token
 correction vectors, normalized keys and decay records. `PreparedGDNCommit`
 applies accepted updates before the following round or checkpoint publication.
 The [recovery tests](../tests/recipes/test_qwen38_gdn_recovery_cuda.py) compare
-this arithmetic with b12x checkpointed decode. Full checkpoint columns remain
-the component reference; capacity and write-traffic savings still require
-complete-round measurements.
+this arithmetic with b12x checkpointed decode. Full checkpoint columns are
+the component reference. A capacity or write-traffic saving claimed for the
+compact recurrence requires complete-round measurements.
 
 ## Graph catalog, control and scheduling
 
-The chain catalog has request capacities `B ∈ {1,2,4}` and integer verification
+The chain catalog has request capacities `B` at each power of two from one
+through the padded concurrency limit (`batch_capacities` in
+`ignition/components/capacity.py`) and integer verification
 widths `1 <= W <= K_max + 1`, where `K=W-1`.
-`PreparationConfig.speculative_widths` lists the prepared widths; its largest entry is
+Each recipe's `PreparationConfig.speculative_widths` lists the prepared widths; its largest entry is
 `K_max + 1`, and its default gives five drafts for Qwen and GLM.
-Capture includes the Cartesian product of prepared batch capacities and widths.
-With concurrency four and five drafts, this is eighteen speculative graphs.
+`speculative_shapes` in the same module selects the captured shapes: width one
+at every batch capacity, and each wider width where `B × W` fits the
+speculative token capacity. That capacity is `--speculative-token-capacity`,
+128 rows by default for Qwen and GLM.
+With concurrency four and five drafts, every batch and width fits: eighteen
+speculative graphs.
 Flare reduces concurrency and draft depth by selecting the required subset
 before loading GPU resources; adaptive or fixed verification is a serving policy.
 
-Every core also captures ordinary prefill, decode, resume, and prefix-cache
-operations without draft computation or state maintenance. A maximum draft count
-of zero selects those operations and disables speculative scheduling. Width one
+Unless it was exported with `--mtp-only`, a core also captures ordinary
+prefill, decode, resume, and prefix-cache
+operations without draft computation or state maintenance.
+`flare run --mtp-draft-tokens 0`
+selects those operations and disables speculative scheduling.
+`ignition export --mtp-draft-tokens 0` instead prepares only width-one
+speculative rounds, which retain draft state. Width one
 inside an enabled speculative catalog maintains draft state, allowing the next
 round to use a wider verification graph. Graphs declare their serving mode through
 `speculation_enabled`; shared operations leave the field absent.
@@ -293,8 +321,9 @@ round to use a wider verification graph. Graphs declare their serving mode throu
 Per-width cost measurements must include the total target rows `B × W`.
 The small-row MoE band through eight rows covers widths through eight at
 batch one, four at batch two, and two at batch four. Larger shapes can select
-grouped expert kernels with different costs. The Cartesian catalog includes
-those shapes; preparation does not enforce an eight-row cap. Measure each
+grouped expert kernels with different costs. The catalog includes
+those shapes up to the speculative token capacity; preparation does not enforce
+an eight-row cap. Measure each
 captured shape and locate the kernel-band transition before choosing serving
 defaults. Odd widths require the same validation as even widths.
 Adaptive width-one rounds continue absorbing target feedback into the MTP cache so
@@ -302,28 +331,37 @@ requests can resume drafting when concurrency falls. The native adaptive
 controller chooses only among that batch's captured counts.
 `speculative_widths` may be any increasing set of widths that includes one, so
 the prepared draft counts need not be contiguous.
-`speculative_fixed_width=4` selects three speculative graphs at runtime: one for
+With concurrency four, `speculative_fixed_width=4` selects three speculative
+graphs at runtime: one for
 each batch capacity, each evaluating three drafts plus the pending input. Capture
 retains every configured width regardless of the default verification policy. A
-fixed width must belong to `speculative_widths`. Fixed drafting has no aggregate row cap;
+fixed width must belong to `speculative_widths`. Fixed drafting uses the fixed
+width at each batch capacity where the speculative token capacity admitted that
+shape, and width one elsewhere;
 batch four with three drafts evaluates sixteen target rows. Context tails,
 host stop boundaries, and grammar constraints limit each request's valid prefix
 inside that same graph. Masked positions cannot write KV or commit request state.
 Verification widths include the pending input and remain an internal graph-layout
 detail. A zero-draft graph consumes the pending input and emits one target token;
-MTP history still absorbs the committed feedback pair. All shapes are prepared,
+MTP history absorbs the committed feedback pair. All shapes are prepared,
 tuned, warmed and captured before handoff.
-The Qwen metadata contract declares at least:
+Each graph's `ExecutionGraph` entry in the execution manifest
+(`helios/proto/runtime_core.proto`) declares:
 
 ```text
-operation: prefill+mtp_absorb | resume+mtp_seed | speculative_round | maintenance
-request_capacity: B
-verification_width: W
+kind: prefill | scored_prefill | decode | resume | speculative | mixed
+      | init | restore | snapshot | vision
+batch_capacity: B
+token_capacity: W for a speculative graph
 sampling_mode: general
-state_layout_version, arithmetic_policy, checkpoint_identity
+draft_tokens, verify_tokens, draft_source: draft depth D, verification width,
+      and proposal source, on graphs that declare a draft depth
+speculation_enabled: true or false for one serving mode; absent for shared operations
+packed_token_capacity: physical target rows P; zero for the rectangular B × W layout
 ```
 
-Prefill-plus-absorb uses the configured prefill buckets. A speculative round
+Prefill graphs of the speculative serving mode absorb target feedback into the
+MTP cache and use the configured prefill buckets. A speculative round
 captures draft, target verification, acceptance and commit in one dependency
 chain. A larger width cannot be selected until its kernels, history extent,
 page reservations and completion storage exist. Padding changes capacity, not
@@ -333,7 +371,7 @@ preceding round's accepted count can exceed the following round's width. A
 width-eight to width-one transition must preserve that count and state layout;
 it cannot reuse an ordinary one-column, non-speculative binding by truncating
 metadata. Width one also retains MTP absorption, so its measured cost differs
-from a request with MTP disabled. Same-shaped graph variants share the existing
+from a request with MTP disabled. Same-shaped graph variants share
 `ScratchArena.views(*shapes_and_dtypes)` storage only where lifetimes permit;
 candidate logits, feedback, accepted IDs and state surviving another operator
 have persistent storage. Final bindings refresh after tuning and freeze before
@@ -348,9 +386,15 @@ capture.
 | Grammar advancement, stop sequences, output presentation | Rust with ordered token-vector completions |
 
 Rust adapts among prepared widths from request-local prefix survival and measured
-full-round costs. Combined graphs learn from emitted/offered/accepted records,
-or optional verification probabilities supplied by prepared graphs. Split graphs
-use proposal-confidence forecasts. A separate funded exploration budget can
+full-round costs. Every speculative graph is a complete proposal, verification,
+and commit program. The controller learns from its emitted/offered/accepted
+records, or optional verification probabilities supplied by prepared graphs;
+graphs that declare `confidence_width` also return proposal-confidence
+forecasts. Standalone proposal and verification graphs are not part of the
+execution contract: their operation identifiers 10, 11, and 13 are reserved in
+`helios/proto/runtime_core.proto`, and Helios rejects a prepared contract
+that declares them as an unsupported graph operation. A separate
+funded exploration budget can
 probe beyond the ordinary choice without replacing its historical mean;
 see [the scheduling policy](scheduling-runtime-design.md#funded-acceptance-learning).
 The fixed-width catalog gives each active row the same maximum draft
@@ -437,13 +481,14 @@ width-pattern graph with separate fixed-length one-row invocations. Arbitrary
 per-round heterogeneous lengths require a qualified public length-aware sampler.
 Masking target rows or inventing padded proposal probabilities is insufficient.
 
-The existing sampler uses one-row FlashInfer calls so Philox subsequence zero
+The ordinary decode sampler (`ignition/components/sampling.py`) uses one-row
+FlashInfer calls so Philox subsequence zero
 is independent of packed lane position. Preserve this property for speculative
 requests: use per-request one-row chain invocations with explicit device seeds
 and offsets, unless a library API supplies an equally qualified request-keyed
 stream. Draft randomness and target acceptance/correction randomness have
 separate declared domains. Their offset-consumption law must be verified from
-the selected library kernel. The inspected chain kernel consumes `K+1` scalar
+the selected library kernel. FlashInfer's chain kernel consumes `K+1` scalar
 Philox draws when all drafts are accepted and `K+2` after a rejection: its
 independent-acceptance statistic samples the rejection position again. Reserve
 nonoverlapping ranges by converting that bound to the RNG API's offset units,
@@ -459,41 +504,48 @@ logit ties; comparisons use measured operator bounds and repeatability.
 
 The controller selects bounded captured widths from completed-round token counts
 and measured round cost. Copied request continuations use the same verification
-budget as MTP proposals. Compact recurrence is a separate state-representation
-extension; token trees additionally require parent-indexed GDN, convolution,
-PLE and QSA histories.
+budget as MTP proposals. Token trees, which are designed and not implemented,
+require parent-indexed GDN, convolution, PLE and QSA histories.
 
-## Implementation dependencies and acceptance
+## Implementation status and acceptance
 
-1. **Baseline and reference.** Record exact-checkpoint non-MTP serving at
-   prefill capacities 512 and 4,096: cold TTFT, 256-token decode at concurrency
-   1/2/4, 4K/64K prefill, 4,096-prefix-plus-11-tail TTFT, startup, and measured
-   host submission gaps. Retain actual token IDs, EOS behavior and workload
-   identities. CUDA completion events with timing disabled do not provide a GPU
-   timeline; use explicit timing instrumentation or correlated profiler traces.
-2. **Copy transaction and ABI.** Implement bounded vector completions,
-   verification-row logits, state selection and persistent outputs using public
-   operators and host-supplied history continuations alongside learned MTP
-   proposals. Qualify every accepted count and prefix publication.
-   Stochastic history verification uses a point-mass proposal distribution
-   at each copied token. Requests requiring per-token host decisions use the
-   scheduler's existing constrained execution path.
-3. **MTP weights and arithmetic.** Load the exact W4A16 experts and BF16 tensors;
-   qualify feedback, target-hidden alignment, draft attention, routed/shared
-   experts and logits against component operator references. Match activation
-   policy, KV dtype and draft-head policy explicitly. Add target-derived MTP absorption to prefill,
-   accepted rounds and prefix checkpoints. Keep canonical eager comparisons
-   diagnostic.
-4. **Adaptive budget.** Measure fixed depths including zero first, with the
-   checkpoint's stochastic defaults as the primary workload. Temperature-zero
-   fixtures qualify probability semantics separately. Compare the controller
-   against the same inputs and completed-token
-   counts; record offered/accepted counts, draft/verify/commit timings,
-   throughput, tail latency and memory. Preserve regressions and rejected cases.
-5. **Compact commit and trees.** Require component state equivalence against
-   full snapshots before replacing that representation. Add tree ancestry only
-   with a corresponding target reference and measured benefit. Parallel-drafter
-   training remains a separate model-development decision.
+Implemented for Qwen: token-vector completions
+(`ignition/components/completion.py`), copy proposals from shared decoded
+history (`helios/src/scheduler/decoded_history.rs`), the MTP loader and decoder
+(`ignition/recipes/qwen38/mtp_weights.py` and `mtp.py`), adaptive width
+selection (`helios/src/scheduler/`), and the compact recurrent commit
+(`PreparedGDNCommit`). Designed, not implemented: token trees. Each mechanism
+must satisfy these requirements:
+
+- **Baseline and reference.** A speculative performance claim compares against
+  exact-checkpoint non-MTP serving at prefill capacities 512 and 4,096: cold
+  TTFT, 256-token decode at concurrency 1/2/4, 4K/64K prefill,
+  4,096-prefix-plus-11-tail TTFT, startup, and measured host submission gaps.
+  Record actual token IDs, EOS behavior and workload identities. CUDA
+  completion events with timing disabled do not provide a GPU timeline; use
+  explicit timing instrumentation or correlated profiler traces.
+- **Copy transaction and ABI.** Bounded vector completions, verification-row
+  logits, state selection and persistent outputs use public operators, with
+  host-supplied history continuations alongside learned MTP proposals. Qualify
+  every accepted count and prefix publication. Stochastic history verification
+  uses a point-mass proposal distribution at each copied token. Requests
+  requiring per-token host decisions use the scheduler's width-one constrained
+  execution path.
+- **MTP weights and arithmetic.** The loader preserves the W4A16 experts and
+  BF16 tensors. Qualify feedback, target-hidden alignment, draft attention,
+  routed/shared experts and logits against component operator references.
+  Match activation policy, KV dtype and draft-head policy explicitly. Prefill,
+  accepted rounds and prefix checkpoints absorb target-derived MTP history.
+  Canonical eager comparisons are diagnostic.
+- **Adaptive budget.** Measure fixed depths including zero first, with the
+  checkpoint's stochastic defaults as the primary workload. Temperature-zero
+  fixtures qualify probability semantics separately. Compare the controller
+  against the same inputs and completed-token counts; record offered/accepted
+  counts, draft/verify/commit timings, throughput, tail latency and memory.
+  Preserve regressions and rejected cases.
+- **Compact commit and trees.** The compact commit requires component state
+  equivalence against full snapshots. Tree ancestry requires a corresponding
+  target reference and a measured benefit.
 
 Correctness includes all-accept/all-reject and every intermediate prefix; QSA
 groups of four and page boundaries of 64; all graph buckets and padded lanes;
@@ -559,7 +611,7 @@ these workload measurements.
 
 Performance compares ordinary decoding, minimal replay of the prepared
 speculative graph sequence, and the complete native service with matched settings.
-The native overhead target remains within 5% of that **measured replay floor**, separately
+The native overhead target is within 5% of that **measured replay floor**, separately
 from frontend delivery. The approximate 3.9 ms single-token weight-traffic bound
 is a non-speculative batch-one reference: amortized verification can reduce bytes
 per emitted token, while extra expert routes and MTP work can increase round

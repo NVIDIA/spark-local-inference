@@ -198,6 +198,9 @@ def _preparation_arguments(running, *, model_default="defaults.model"):
     advanced.add_argument("--native-dense-activations", action="store_true",
                           help="use quantized activations instead of auto precision for dense projections:"
                                " A8 for FP8 weights and A4 for FP4 weights; explicit recipe precision is retained")
+    advanced.add_argument("--draft-body-quantization", choices=("mxfp8",),
+                          help="prepare eligible DFlash2 draft-body projections as MXFP8 independently of"
+                               " target and proposal-head precision (Kimi K3.1; default: checkpoint precision)")
     advanced.add_argument("--draft-head-quantization", choices=("nvfp4", "mxfp8"),
                           help="prepare a separate quantized vocabulary head for learned draft proposals;"
                                " target verification retains its precision (NVFP4: DeepSeek V4/V4.1;"
@@ -238,6 +241,9 @@ def _preparation_arguments(running, *, model_default="defaults.model"):
     advanced.add_argument("--tuning-gpus", metavar="LIST",
                           help="local GPUs for kernel tuning, starting with --gpus and followed by complete"
                                " TP replicas; serving TP size is unchanged (default: serving GPUs)")
+    advanced.add_argument("--dcp-size", type=int, choices=(8, 16), metavar="N",
+                          help="decode context-parallel ranks per group; Kimi K3.1 TP16 supports 16 or 8"
+                               " (default: tensor-parallel size)")
     advanced.add_argument("--no-context-parallel", action="store_true",
                           help="keep each rank's attention context whole instead of sharding it across"
                                " tensor-parallel ranks; fewer cached tokens (default: the recipe's)")
@@ -253,6 +259,9 @@ def _preparation_arguments(running, *, model_default="defaults.model"):
                                " experts, MoE latent projections, and DSpark draft context, outputs and MLPs;"
                                " Qwen3.8 dense target attention/MLPs and DFlash2 context, attention and MLPs; Flash Next DFlash2 projections;"
                                " default: checkpoint precision)")
+    advanced.add_argument("--online-mxfp8-scope", metavar="SCOPE",
+                          help="select the recipe's online MXFP8 conversion group; Kimi K3.1 supports all"
+                               " (every eligible target and DFlash2 projection) or kda-input (default: recipe scope)")
     advanced.add_argument("--language-model-only", action="store_true",
                           help="prepare no vision encoder and reject images; its weights and scratch become KV"
                                " pages (recipes with a separable encoder; default: the recipe's image support)")

@@ -3,7 +3,17 @@
 
 """Read-only window-cache addresses shared by attention layers of one forward."""
 
+from dataclasses import dataclass
+
 import torch
+
+
+@dataclass(frozen=True)
+class WindowIndices:
+    window_slots: torch.Tensor
+    window_indices: torch.Tensor
+    window_lengths: torch.Tensor
+    window_page_size: int
 
 
 class PreparedWindowIndices:
@@ -26,6 +36,7 @@ class PreparedWindowIndices:
             raise ValueError("decode window indices require 128-token cache pages")
         self.metadata, self.mode, self.visible = metadata, mode, visible
         self.replay_start, self.window_page_size = replay_start, page_size
+        self.width = width
         self.offsets = torch.arange(width, device=metadata.positions.device)
         if buffers is None:
             device = metadata.positions.device
@@ -37,21 +48,27 @@ class PreparedWindowIndices:
             self.window_indices = buffers.full((tokens, width), -1, torch.int32)
             self.window_lengths = buffers.zeros((tokens,), torch.int32)
 
-    def __call__(self):
-        m = self.metadata
+    def functional(self):
+        self.metadata = self.visible = self.replay_start = self.offsets = None
+        self.window_slots = self.window_indices = self.window_lengths = None
+        return self
+
+    def __call__(self, metadata, visible=None, replay_start=None):
+        m = metadata
+        offsets = torch.arange(self.width, device=m.positions.device)
         live, position = m.positions >= 0, m.positions.clamp_min(0)
         rows, starts = m.state_rows[m.requests], m.starts[m.requests]
         left = (position - 127).clamp_min(0)
-        if self.replay_start is not None:
-            available = position + 1 - self.replay_start[m.requests]
+        if replay_start is not None:
+            available = position + 1 - replay_start[m.requests]
             left = position - available.clamp(0, 128) + 1
         right = position
-        if self.visible is not None:
-            image_left, image_right = self.visible
+        if visible is not None:
+            image_left, image_right = visible
             left = torch.minimum(left, position - image_left)
             right = position + image_right
-        self.window_lengths.copy_(torch.where(live, right - left + 1, 0))
-        positions = left[:, None] + self.offsets
+        lengths = torch.where(live, right - left + 1, 0)
+        positions = left[:, None] + offsets
         if self.mode == "decode":
             slots = rows * 128 + position % 128
             indices = rows[:, None] * 128 + positions % 128
@@ -63,8 +80,9 @@ class PreparedWindowIndices:
             indices = indices + base[:, None]
             if self.mode == "draft":
                 context = starts.clamp(max=128)
-                self.window_lengths.copy_(torch.where(live, context + m.lengths[m.requests], 0))
+                lengths = torch.where(live, context + m.lengths[m.requests], 0)
                 indices = base[:, None] + torch.where(
-                    self.offsets < context[:, None], self.offsets, 128 + self.offsets - context[:, None])
-        self.window_slots.copy_(torch.where(live, slots, -1))
-        self.window_indices.copy_(torch.where(self.offsets < self.window_lengths[:, None], indices, -1))
+                    offsets < context[:, None], offsets, 128 + offsets - context[:, None])
+        return WindowIndices(torch.where(live, slots, -1),
+            torch.where(offsets < lengths[:, None], indices, -1).to(torch.int32),
+            lengths.to(torch.int32), self.window_page_size)

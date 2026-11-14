@@ -26,6 +26,7 @@
         auto name=label(model.name,15);name.MaxLines(2);name.FontWeight(Windows::UI::Text::FontWeights::SemiBold());info.Children().Append(name);
         auto metadata=model.available()?(model.size_known?bytes(model.size)+L" · ":L"")+(model.flags&FLARE_MODEL_LOCAL?L"Downloaded":L"On this PC"):L"";
         if(!model.available()&&(model.metadata_known&FLARE_MODEL_REVISION_SIZE))metadata=bytes(model.revision_bytes)+L" repository files";
+        if(!model.revision_updated_at.empty())metadata+=(metadata.empty()?L"":L" · ")+std::wstring(L"Hub updated ")+updated_text(model.revision_updated_at,true);
         if(!model.error.empty())metadata=L"Needs attention";
         if(!metadata.empty()){auto caption=label(metadata,12,true);caption.MaxLines(2);info.Children().Append(caption);}row.Children().Append(info);
         StackPanel actions;actions.Orientation(Orientation::Horizontal);actions.Spacing(8);actions.VerticalAlignment(VerticalAlignment::Center);Grid::SetColumn(actions,2);
@@ -42,7 +43,7 @@
         auto fingerprint=std::to_wstring(can_change_model_)+L"/"+std::to_wstring(current_operation_)+L"/"+std::to_wstring(session_state_)+L"/"+std::to_wstring(home_inventory_pending_)+L"/"+std::to_wstring(card_padding_);
         for(auto const& model:models_)if((model.available()&&!model.catalog())||(model.catalog()&&model.recommended())){
             if(model.catalog())recommended.push_back(&model);else local.push_back(&model);
-            for(auto const& field:{std::wstring(to_hstring(model.id)),model.name,model.source,model.error})fingerprint+=std::to_wstring(field.size())+L":"+field;
+            for(auto const& field:{std::wstring(to_hstring(model.id)),model.name,model.source,model.error,model.revision_updated_at})fingerprint+=std::to_wstring(field.size())+L":"+field;
             fingerprint+=L"/"+std::to_wstring(model.flags)+L"/"+std::to_wstring(model.size)+L"/"+std::to_wstring(model.size_known);
             fingerprint+=L"/"+std::to_wstring(model.metadata_known)+L"/"+std::to_wstring(model.revision_bytes);
         }

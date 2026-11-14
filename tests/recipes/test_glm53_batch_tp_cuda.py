@@ -42,16 +42,28 @@ def _rank(rank, world, rendezvous):
         requests = DeviceRequestState.allocate(device, vocab_size=154880)
         metadata = DecoderMetadata.allocate(4, 4, 32, device)
         batch = PreparedBatch(inputs, requests, metadata, mode="decode",
-            shard=TensorParallelShard(rank, world), pages=64)
+            shard=TensorParallelShard(rank, world), pages=torch.tensor([64], device=device))
         with RecordedPreparationSession(device=device, checkpoint="glm-request-validation",
                 workload_schema="glm-batch-tp-v1", numerical_policy="default", coordinator=coordinator) as session:
-            agreement = PreparedAllReduce(batch.validation_input, batch.validation_sum,
+            validation = torch.empty((1, 8), dtype=torch.bfloat16, device=device)
+            totals = torch.empty_like(validation)
+            agreement = PreparedAllReduce(validation, totals,
                 runtime=runtime, coordinator=coordinator, session=session, name="batch.validation")
+            batch.functional()
+            agreement.functional(session=session)
             session.tune()
 
             def forward():
-                batch.begin(agreement(batch.validate()))
-                batch.finish()
+                validation, present = batch.validate()
+                reduced = agreement(validation)
+                totals.copy_(reduced)
+                packed = batch.begin(reduced, present)
+                metadata.token_ids.copy_(packed.token_ids)
+                for name in metadata.recurrent.__dataclass_fields__:
+                    getattr(metadata.recurrent, name).copy_(getattr(packed.recurrent, name))
+                for name in metadata.indexed.__dataclass_fields__:
+                    getattr(metadata.indexed, name).copy_(getattr(packed.indexed, name))
+                batch.finish(packed)
 
             call = compile_forward(forward)
             call()
@@ -63,7 +75,7 @@ def _rank(rank, world, rendezvous):
             torch.cuda.synchronize(device)
             session.freeze()
             bundle = PreparedGraphBundle(device=rank, graphs={"batch": graph},
-                buffers={"tokens": metadata.token_ids, "flags": batch.validation_sum},
+                buffers={"tokens": metadata.token_ids, "flags": totals},
                 resources=(requests, inputs, metadata, batch, agreement, call, runtime, session, stream))
             worker = bundle.start_worker()
             for fault in (None, "pending", "epoch"):

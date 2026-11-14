@@ -11,8 +11,8 @@ reject Orbit commands.
 Use [multi-host serving](multi-host.md) for installation, pairing, core
 preparation, and a launch example. This reference covers commands, placement,
 group lifecycle, storage, and the agent protocol. Discovery, fabric checks,
-preparation through agents, and automatic reconciliation are
-[proposals](orbit-proposals.md), not available commands.
+preparation through agents, and automatic reconciliation are designed, not
+implemented; [Orbit proposals](orbit-proposals.md) specifies them.
 
 Every host in a serving group, rank zero included, runs its rank under its
 agent. The ranks keep the rendezvous, capacity agreement, and RoCEnante
@@ -65,7 +65,7 @@ below compares the key a session authenticated.
 | --- | --- | --- |
 | Node key | `~/.config/flare/agent/node.key`, mode 0600 | `flare agent install`, or the agent's first start |
 | Authorized controllers | `~/.config/flare/agent/controllers.toml` | Pairing and controller-set updates |
-| Controller key | `~/.config/flare/orbit/controller.key`, mode 0600 | The first `flare orbit` command |
+| Controller key | `~/.config/flare/orbit/controller.key`, mode 0600 | The first `flare orbit`, `flare agent pair`, or `flare run --hosts` command |
 | Orbit file | `~/.config/flare/orbit.toml` | `flare orbit pair`, edited by the operator |
 
 A node's name defaults to its hostname and is recorded at pairing. Renaming a
@@ -215,11 +215,14 @@ sequenceDiagram
    repository. An explicit `--revision` overrides the suffix; otherwise the
    controller infers the revision from available candidate GPUs, refusing mixed
    hardware unless the operator supplies a revision or narrower node/GPU constraints.
-   The first candidate node with an available selected GPU downloads the pinned
-   core and its companions. `--filename`, `--offline`, and `--cache-dir`
-   apply to that node's Hub cache. The controller reads `--token-file` locally
+   The first candidate node with an available selected GPU acquires the pinned
+   core into its own Flare model cache. `--filename`, `--offline`, and
+   `--tensor-parallel` travel to that node; `--offline` resolves only that
+   node's model cache. The controller's `--cache-dir` and `--core-cache` paths
+   are not sent, so the node uses its own configured model cache and download
+   transport cache. The controller reads `--token-file` locally
    and sends its token through the encrypted agent session. It then resolves
-   the downloaded file as a node-held core, including publisher verification
+   the returned cache entry as a node-held core, including publisher verification
    and acceptance on the controller, and refreshes candidate status before
    placement. A repository's default group name is its repository name without
    the owner or revision suffix. Repository resolution can download files
@@ -270,7 +273,9 @@ sequenceDiagram
    --rendezvous ZERO:PORT` without a core argument. Serving ranks exchange CX7
    endpoints, then receive missing files and ranges through parallel streams.
    They verify stored data and publisher trust before capacity agreement and GPU
-   loading. Verified cache entries are shared with `orbit push` and manual runs.
+   loading. Each peer keeps its verified rank data as a model-cache entry and
+   reuses it on a later launch of the same export; see
+   [core caching](#core-caching).
 7. The controller prints rank zero's HTTP address and, unless `--detach` was
    given, follows output with `[rank R name]` prefixes. Process startup does not
    establish HTTP readiness: wait for the serving message or a successful
@@ -298,7 +303,8 @@ native work and the group shuts down through its coordinated shutdown. Peers
 still running 30 seconds after rank zero exits receive STOP. Peers are not
 signaled while rank zero drains, because the drain needs their collectives.
 
-The agent's systemd unit keeps `KillMode=control-group`: stopping or restarting
+The agent's systemd unit sets no `KillMode`, so systemd's default
+`control-group` mode applies: stopping or restarting
 the service stops its ranks. `flare agent install` replaces the agent copy and
 restarts that service. An APT upgrade only replaces `/usr/bin/flare`; updating
 the running agent requires a separate install. Upgrade agents between groups.
@@ -325,7 +331,7 @@ STATUS carries three lists beside the node's identity and free cache space.
 
 | List | Entry |
 | --- | --- |
-| `gpus` | Index, UUID, name, revision, memory total and free, utilization, temperature and SM clock where present, and the running group holding the GPU, if any |
+| `gpus` | Index, UUID, name, revision, memory total and free, and the running group holding the GPU, if any; METRICS adds utilization, temperature, and SM clock where present |
 | `groups` | Every group the agent runs or retains, oldest first: identifier, name, core, rank, GPUs, pid, state, exit status, uptime |
 | `cores` | Every cache directory: name, files with sizes, whether its stored data verified, bytes on disk |
 
@@ -373,9 +379,10 @@ flare orbit run --name glm53 --detach
 ```
 
 Persistence saves the core reference, serving settings, candidate nodes in
-rank order, GPU constraints, publisher profiles, trust-store path, and any
-executable override. Local core, executable, and verification paths are saved
-as absolute paths. The definition is written after placement validation and
+rank order, GPU constraints, the ring or chain selection, the transfer stream
+count, publisher profiles, trust-store path, and any executable override.
+Local core, executable, and verification paths are saved as absolute paths.
+The definition is written after placement validation and
 before starting ranks, so a startup failure can be retried. `--dry-run` saves
 nothing. A later run uses the saved configuration; overrides affect that launch
 only unless `--persistent` is passed again. An existing running group with the
@@ -412,7 +419,8 @@ nodes = ["maxwell", "hertz"]
 when the command names none, puts the group's `serving` words before the
 command line's serving options so the command line overrides them, and puts the
 group's `rank_zero` words before explicit command-line HTTP options. It takes
-`nodes`, `gpus`, `roce_ring`, `transfer_streams`, and `executable`
+`nodes`, `gpus`, `roce_ring`, `roce_chain`, `transfer_streams`, `executable`,
+`publisher_keys`, and `trust_store`
 as constraints when the command line gives none. `nodes` lists candidate
 nodes in rank order; `gpus` lists the NVML indices every member uses on its
 node. A group without them is placed from the whole orbit.
@@ -452,31 +460,48 @@ selected rank order.
 
 ## Core caching
 
-Agents and native serving receivers share `~/.cache/flare` in their account:
+An agent stores the files it receives through PUT and TRANSFER under
+`~/.cache/flare` in its account:
 
 | Location | Contents |
 | --- | --- |
 | `cores/<export>-<primary-size>/` | Complete core for rank zero or single-host serving |
-| `cores/<export>-<primary-size>-rank<R>/` | Files and ranges needed by a peer rank |
+| `cores/<export>-<primary-size>-rank<R>/` | Files and ranges of a peer rank staged by `orbit push` |
 | `blobs/<sha256>.safetensors` | Immutable payloads shared by core directories through hardlinks |
 | `bin/flare-<digest-prefix>` | Uploaded executable overrides |
 | `publishers/` | Public publisher profiles passed by controllers |
 
-Snapshot exports have a metadata-only primary and payload files bounded by the
-`64G` shard limit. Peers receive only the blobs their rank needs. A content-named
-blob is transferred whole and checked against its filename hash; core
-directories hardlink it from the blob store. A later snapshot with the same blob
-reuses those bytes. Cores with numbered or monolithic data files transfer
-selected ranges into sparse files instead. Their logical lengths can greatly
-exceed allocated disk space; use `du` to inspect allocation.
+An agent starts every rank with `--core-cache` set to that directory, which
+makes it the root of the rank's Flare model cache. A peer rank that receives
+its data during serving bootstrap publishes it as a model-cache entry,
+`models/<model-key>/<entry-id>/` with the primary named `model.safetensors`,
+writes a `.flare-verified.json` marker there after verifying stored data, and
+resolves that entry again on a later launch of the same export and rank. The
+serving receiver does not read the agent's `cores/<export>-<primary-size>-rank<R>/`
+directory. A manually started peer uses `--core-cache`, then `paths.core_cache`,
+then `~/.cache/flare/cores` as its model-cache root, so it shares entries with
+an agent-started peer only when given the agent's directory.
+
+A packed core is one `.safetensors` file. A directory core has a primary and
+companion files: payload-format companions have readable relative paths such as
+`weights/layer-000.safetensors`, and legacy companions are named by their
+SHA-256 beside the primary. No size threshold splits payloads. Peers receive
+only the files and ranges their rank needs. An agent transfers a
+digest-named companion whole, checks it against its filename hash, stores it
+under `blobs/`, and hardlinks it into the core directory, so another core with
+the same file reuses those bytes. Every other file receives its selected
+ranges into a sparse file. Sparse logical lengths can greatly exceed allocated
+disk space; use `du` to inspect allocation.
 
 The source of `NODE:PATH` is read in place. A source outside the agent cache is
-not copied merely to launch on that node. Hugging Face downloads use the hub
-cache directly, while transfers to other hosts populate each agent's own cache.
+not copied merely to launch on that node. A repository core is acquired into the
+downloading node's Flare model cache and read from that entry, while transfers
+to other hosts populate each agent's own cache.
 Keep source primaries, payloads, and symlink targets available while peers fetch
 and ranks serve.
 
-A node verifies fetched data before writing a `.verified` marker. New writes
+An agent verifies data fetched by TRANSFER before writing a `.verified` marker
+in that `cores/` directory. New writes
 invalidate the marker; a repeated transfer requiring no bytes can reuse it.
 Verification failure removes the core directory. Data sent directly by an
 authorized controller is not given that marker by PUT. `--verify-weights` asks
@@ -501,8 +526,13 @@ Single-host cores are always staged complete. A node that holds the core
 outside its cache is skipped. Node-to-node fetches are verified; a direct upload
 from the controller follows PUT's verification rules. `flare orbit cores` lists
 every node's cache directories with their file counts, bytes on disk and
-verification state. A launch reuses staged core data; an explicit executable
-override may still need uploading. Pre-staged core directories are unpinned
+verification state. A launch whose rank zero runs on a node holding the staged
+complete core reuses it. Peer ranks receive their data again through serving
+bootstrap unless their model cache already holds the entry, because the serving
+receiver does not read a per-rank directory staged by `orbit push`; placement
+still prefers a node whose STATUS lists that directory as verified. An explicit
+executable override may still need uploading. Pre-staged core directories are
+unpinned
 after transfer and can be evicted when another core arrives.
 
 With `--roce-ring`, list exactly one node per multi-host rank in physical ring
@@ -576,12 +606,15 @@ listeners, with plain TCP and core verification. It shares this path across
 manual, agent-assisted, and Orbit launches. No route signatures or encryption
 configuration are required by serving bootstrap.
 
-Rank-distributing `orbit push` and agent staging of the source onto rank zero
-transfer through the IPv4 interfaces discovered for the CX7 fabric. The controller obtains
+Rank-distributing `orbit push`, and staging onto rank zero from a source node
+that is another member of the group, transfer through the IPv4 interfaces
+discovered for the CX7 fabric. A source node outside the group has no fabric
+links in the grant; rank zero fetches its complete copy from that node's paired
+address over one stream. The controller obtains
 endpoint lists from authenticated agents and selects up to two reachable rails
 per connection. Direct topology connects each destination to the source rank.
-`--roce-ring` uses neighboring agents in rank order. The existing signed grant
-includes the endpoints and rank order; no additional configuration or keys are
+`--roce-ring` uses neighboring agents in rank order. The signed grant
+includes the endpoints and rank order; no other configuration or keys are
 required. Agent listeners must be reachable at their fabric IPs and configured ports.
 
 In ring mode, each destination pulls from the source along the shortest ring path; payloads
@@ -619,7 +652,7 @@ from that copy.
 Controller connections, metadata lookup, and serving rendezvous use the
 configured management addresses. Agent payload transfers use encrypted TCP
 and require no host routing changes or IP forwarding. Ignition checkpoint and
-prepared export transfers use rank-owned fabric helpers with the existing
+prepared export transfers use rank-owned fabric helpers with
 shared-token authentication. They require no Orbit
 agents or signed grants; preparation control and export manifests use the
 rendezvous connection.
@@ -640,13 +673,13 @@ with a message; an ERROR closes the session.
 | HAVE | Controller or node to node | Kind, name, size | Whether the cache holds the entry at that size |
 | PUT | Controller to node | Kind, name, size, optional ranges, then bytes | Stores an executable or core bytes at their offsets in a sparse file of the core's length |
 | CONTROLLERS | Controller to node | Signed controller-set record | Applies a higher revision signed by a current member |
-| TRANSFER | Controller to node | Grant, publisher profile, source node, cache directory, files with sizes and ranges | The node fetches those ranges from the source node into its cache, verifies the directory's stored data unless it verified before, and replies when done; a push's grant authorizes transfers alone |
+| TRANSFER | Controller to node | Grant, publisher profile, source node, cache directory, stream count, files with sizes and ranges | The node fetches those ranges from the source node into its cache, verifies the directory's stored data unless it verified before, and replies when done; a push's grant authorizes transfers alone |
 | FETCH | Node to node | Grant, file name, ranges | Streams the file's bytes to a node the grant names, from the core the node holds or its cache |
 | FABRIC | Controller to node | None | Reports active RoCE IPv4 endpoints for planning fabric TCP transfers |
 | FETCH_FABRIC | Node to fabric peer | Grant, source and destination ranks, rail, file name, size, ranges | Pulls directly or through signed ring endpoints; only the destination stores the bytes |
 | GET | Controller to node | Absolute path, offset, length | Streams up to 256 MiB of a node-local file, used to mirror a core's header and index |
 | STAT | Controller to node | Absolute path | The core file's size and its companions' names and sizes |
-| DOWNLOAD | Controller to node | Repository, resolved revision, filename and cache options, optional access token | Downloads a pinned core and its companions into the node's Hugging Face cache and returns its absolute path; a controller that negotiated progress receives DOWNLOAD_PROGRESS frames before the reply, with final transferred, total, verified, and free-space fields |
+| DOWNLOAD | Controller to node | Repository, resolved revision, filename, offline and tensor-parallel options, public publisher profiles, optional access token | Acquires a pinned core into the node's Flare model cache and returns the cache entry's absolute path; a controller that negotiated progress receives DOWNLOAD_PROGRESS frames before the reply, with final transferred, total, verified, and free-space fields |
 | DOWNLOAD_PROGRESS | Node to controller | Transferred and verified byte counts, optional cumulative network total, and advisory transport and model-cache free bytes | Live progress for the DOWNLOAD in progress; advisory and absent unless both HELLO frames advertised `download_progress` |
 | RUN | Controller to node | Grant, rank, optional cached executable name, publisher profile | Starts this host's rank on the GPUs the grant's member names, beside other groups on other GPUs, then streams LOG and EXIT; an absent or null executable name selects the agent's installed Flare |
 | ATTACH | Controller to node | Group identifier, required when several groups are on the node | Streams the rank's retained output, then live output |
@@ -671,7 +704,7 @@ serving bytes to another node.
 ```json
 {
   "group": "glm53-20261019T153000Z-3f9c",
-  "core": {
+  "package": {
     "export": "…",
     "length": 2122414256,
     "files": ["glm53-spark-tp2.safetensors", "<payload-sha256>.safetensors"],
@@ -688,12 +721,14 @@ serving bytes to another node.
   "roce_ring": false,
   "transfer_fabric": {
     "ring": false,
+    "chain": false,
     "links": [
       [[], [{"from": "10.200.0.12:29900", "to": "10.200.0.13:29900"}]],
       [[{"from": "10.200.0.13:29900", "to": "10.200.0.12:29900"}], []]
     ]
   },
   "single_host": false,
+  "roce_chain": false,
   "issued": 1792420200,
   "expires": 1792420800
 }
@@ -704,11 +739,14 @@ serving bytes to another node.
 its rank uses; the agent exposes exactly those through `CUDA_VISIBLE_DEVICES`
 and refuses a grant whose GPUs a running group holds. An empty list leaves the
 GPUs to the rank and excludes every other group from the node.
-`core.length` is the primary file's size, which names cache entries
-together with `export`. `source` names the node holding the core and is
-absent when the controller holds it. `issued` and `expires` are Unix seconds;
-a grant authorizes RUN for ten minutes, and the controller signs the grant
-again before RUN when transfers outlast that.
+The grant serializes its core record under the JSON key `package`, which keeps
+signed grants stable. `package.length` is the primary file's size, which names
+cache entries together with `package.export`. `source` names the node holding
+the core and is `null` when the controller holds it. `issued` and `expires` are
+Unix seconds; a grant authorizes RUN for ten minutes. The grant that authorizes
+transfers is signed first, and the controller signs the grant again with a new
+ten-minute window immediately before RUN, so transfer time does not consume
+the launch window.
 
 The signature covers the exact serialized JSON body in the signed record.
 A node accepts a RUN only when the grant names its own key at the requested rank,
@@ -721,8 +759,9 @@ The grant also authorizes node-to-node transfers. A FETCH is served only to a
 member of the grant, identified by the key that authenticated the session, for
 the core the grant names.
 
-The grant's `transfer_fabric` contains `ring` and a `links[source][destination]`
-matrix of rail endpoints. Direct topology records every peer connection; ring
+The grant's `transfer_fabric` contains `ring`, `chain`, and a
+`links[source][destination]` matrix of rail endpoints. Direct topology records
+every peer connection; ring
 topology records neighbors only. Each link carries `from` and `to` socket
 addresses. The topology is present for agent prestaging and source transfer;
 serving ranks discover their own endpoints during bootstrap.
@@ -775,8 +814,8 @@ only a serving executable does not update the resident agents that distribute
 cores.
 
 HELLO's optional `executable` path advertises support for using the installed
-agent binary in RUN. Agents without that field require `--executable PATH`
-until updated. RUN still accepts a cached binary name from controllers that
+agent binary in RUN. An agent that omits the field requires
+`--executable PATH`. RUN accepts a cached binary name from controllers that
 upload executables. Updating the installed agent with `flare agent install`
 also updates the default serving executable; restarting the agent stops its
 running ranks.
@@ -784,8 +823,8 @@ running ranks.
 HELLO's optional `download_progress` flag negotiates live DOWNLOAD progress
 within one protocol version. A controller sets it only when it can consume progress
 frames; an agent sends DOWNLOAD_PROGRESS only to a controller that set it.
-Peers without the field exchange the original DOWNLOAD request and reply, and
-their protocol bytes are otherwise unchanged.
+A peer that omits the field exchanges DOWNLOAD as one request and one reply,
+with no progress frames.
 
 ## Limitations
 
@@ -798,10 +837,11 @@ advisory snapshot of the transport parent and model cache filesystems, not a
 rejection criterion. Restarting an agent stops its ranks. Routing between controller and nodes uses
 the addresses recorded at pairing. Orbit does not configure the RoCE fabric,
 interfaces, or firewalls. Ring core transfers select fabric IPs as described
-above; other transfers use the paired addresses. All core transfers use
-encrypted TCP. Each connection performs encryption on one CPU thread. Throughput depends
+above; other transfers use the paired addresses. Agent core transfers use
+encrypted TCP, and each connection performs encryption on one CPU thread;
+serving bootstrap distributes peer data over plain TCP. Throughput depends
 on that work, the selected route, storage, and verification.
 
 Discovery, a preflight fabric check, preparation through agents, and automatic
-reconciliation are tracked in [Orbit proposals](orbit-proposals.md) and
-[the backlog](TODO.txt). Saved groups require manual restart.
+reconciliation are designed, not implemented; see
+[Orbit proposals](orbit-proposals.md). Saved groups require manual restart.
