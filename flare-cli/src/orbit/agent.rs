@@ -975,7 +975,7 @@ fn put(
         let _ = fs::remove_file(unit.join(VERIFIED));
     }
     pinned.pin(unit.clone());
-    for removed in cache::evict(unit.parent().unwrap(), &agent.pins)? {
+    for removed in cache::evict(unit.parent().unwrap(), kind, &agent.pins)? {
         eprintln!("removed superseded {}", removed.display());
     }
     Ok(Vec::new())
@@ -1104,7 +1104,7 @@ fn transfer(agent: &Agent, pinned: &mut Pinned, request: &Value) -> Result<Vec<u
             length as f64 / (1 << 20) as f64 / started.elapsed().as_secs_f64()
         );
     }
-    for removed in cache::evict(&cache::cores_directory(&agent.cache), &agent.pins)? {
+    for removed in cache::evict(&cache::cores_directory(&agent.cache), "core", &agent.pins)? {
         eprintln!("removed superseded {}", removed.display());
     }
     // Fetched bytes are verified once, here, and the directory remembers it; a rank started from

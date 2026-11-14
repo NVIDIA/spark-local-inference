@@ -636,6 +636,11 @@ rank files in this cache. The Orbit agent stores received rank files in a
 separate per-rank range store, `flare-cli/src/core_cache.rs`. Native
 executable caches with distinct purposes are separate stores.
 
+The agent range store and prepared-model cache can share the physical `cores/`
+root, or the legacy `packages/` root. Agent eviction removes only unpinned rank
+entries; it preserves the prepared cache layout and the Hub transport that holds
+resumable download bytes.
+
 ```text
 ~/.cache/flare/cores/
   blobs/<payload-sha256>.safetensors

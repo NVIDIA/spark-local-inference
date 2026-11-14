@@ -510,8 +510,11 @@ each serving rank to digest its stored data during loading as well.
 Transfer sessions and running groups pin cache entries. Native receivers hold
 file locks through serving, preventing agent eviction or concurrent replacement
 of active rank cores. Receiving files can
-evict unpinned executable overrides or core directories, but keeps reusable
-blobs. Group-history pruning and `orbit rm` remove neither cores nor blobs.
+evict unpinned executable overrides or core directories. Core eviction preserves
+prepared-model entries, their metadata and locks, and the Hub transport used for
+resumable downloads when they share the core directory. This also applies when
+the agent reuses the legacy `packages/` directory. Reusable blobs are retained.
+Group-history pruning and `orbit rm` remove neither cores nor blobs.
 The agent has no blob garbage-collection command; core-directory eviction
 alone may reclaim little space when hardlinks still exist in the blob store.
 

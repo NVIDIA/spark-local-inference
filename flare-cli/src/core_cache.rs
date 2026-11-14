@@ -231,15 +231,30 @@ impl Drop for Pinned {
     }
 }
 
-/// Remove a kind directory's units that nothing pins, leaving transfers in progress.
-pub fn evict(directory: &Path, pins: &Pins) -> Result<Vec<PathBuf>, Failure> {
+/// Direct children owned by the prepared-model cache and resumable Hub transport.
+fn is_model_cache_directory(path: &Path) -> bool {
+    matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some(
+            "blobs" | "models" | "refs" | "sources" | "origins" | "staging" | "locks" | "transport"
+        )
+    )
+}
+
+/// Remove unpinned cache units, leaving transfers in progress and prepared-model cache data alone.
+pub fn evict(directory: &Path, kind: &str, pins: &Pins) -> Result<Vec<PathBuf>, Failure> {
+    let core_cache = kind_directory(kind)? == "cores";
     let pins = pins.lock().unwrap();
     let mut removed = Vec::new();
     for entry in fs::read_dir(directory)? {
-        let path = entry?.path();
+        let entry = entry?;
+        let path = entry.path();
         let hidden = path
             .file_name()
             .is_none_or(|name| name.to_string_lossy().starts_with('.'));
+        if core_cache && is_model_cache_directory(&path) {
+            continue;
+        }
         if !hidden && !pins.contains_key(&path) {
             let Some(_lease) = Lease::evict(&path)? else {
                 continue;
@@ -607,11 +622,66 @@ mod tests {
         fs::write(core.join("model.safetensors"), b"held").unwrap();
         let lease = Lease::shared(&core).unwrap();
         let pins = Pins::default();
-        assert!(evict(&directory, &pins).unwrap().is_empty());
+        assert!(evict(&directory, "core", &pins).unwrap().is_empty());
         assert!(core.is_dir());
         drop(lease);
-        assert_eq!(evict(&directory, &pins).unwrap(), vec![core.clone()]);
+        assert_eq!(
+            evict(&directory, "core", &pins).unwrap(),
+            vec![core.clone()]
+        );
         assert!(!core.exists());
+    }
+
+    #[test]
+    fn agent_eviction_preserves_prepared_cache_and_resumable_transport() {
+        for directory in ["cores", "packages"] {
+            for kind in ["core", "package"] {
+                let temporary = tempfile::tempdir().unwrap();
+                let root = temporary.path().join(directory);
+                let model_cache = flare_helios::core::cache::Root::open(&root).unwrap();
+                let owned: Vec<_> = fs::read_dir(model_cache.path())
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path())
+                    .collect();
+                let transport = crate::hub::transport_root(&root, None);
+                fs::create_dir_all(transport.join("blobs")).unwrap();
+                let partial = transport.join("blobs/content.part");
+                let complete = transport.join("blobs/content");
+                let acquisition = transport.join("acquisition.lock");
+                fs::write(&partial, b"saved prefix").unwrap();
+                fs::write(&complete, b"retained content").unwrap();
+                fs::write(&acquisition, b"").unwrap();
+                let unit = root.join("export-4");
+                fs::create_dir(&unit).unwrap();
+                fs::write(unit.join("model.safetensors"), b"agent unit").unwrap();
+
+                assert_eq!(
+                    evict(&root, kind, &Pins::default()).unwrap(),
+                    vec![unit.clone()]
+                );
+                assert!(!unit.exists());
+                for path in owned {
+                    assert!(path.is_dir(), "cache directory removed: {}", path.display());
+                }
+                assert_eq!(fs::read(partial).unwrap(), b"saved prefix");
+                assert_eq!(fs::read(complete).unwrap(), b"retained content");
+                assert!(acquisition.is_file());
+            }
+        }
+    }
+
+    #[test]
+    fn binary_eviction_does_not_reserve_model_cache_names() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = temporary.path().join("bin");
+        fs::create_dir(&directory).unwrap();
+        for name in ["models", "transport"] {
+            fs::write(directory.join(name), b"unpinned executable").unwrap();
+        }
+        let removed = evict(&directory, "binary", &Pins::default()).unwrap();
+        assert_eq!(removed.len(), 2);
+        assert!(!directory.join("models").exists());
+        assert!(!directory.join("transport").exists());
     }
 
     #[test]
@@ -717,10 +787,10 @@ mod tests {
         let pins = Pins::default();
         let mut pinned = Pinned::new(&pins);
         pinned.pin(unit(cache, &path));
-        let removed = evict(&cache.join("cores"), &pins).unwrap();
+        let removed = evict(&cache.join("cores"), "core", &pins).unwrap();
         assert!(removed.is_empty() && path.exists());
         drop(pinned);
-        let removed = evict(&cache.join("cores"), &pins).unwrap();
+        let removed = evict(&cache.join("cores"), "core", &pins).unwrap();
         assert_eq!(removed, vec![cache.join("cores/e-8-rank1")]);
     }
 
@@ -942,7 +1012,7 @@ mod tests {
             fs::metadata(&second).unwrap().ino()
         );
         assert_eq!(fs::metadata(&first).unwrap().mode() & 0o222, 0);
-        evict(&cache.join("cores"), &Pins::default()).unwrap();
+        evict(&cache.join("cores"), "core", &Pins::default()).unwrap();
         assert!(!first.exists() && !second.exists());
         assert!(cache.join("blobs").join(&blob).exists());
         assert!(have(cache, "core", &first_name, size).unwrap().is_some());
