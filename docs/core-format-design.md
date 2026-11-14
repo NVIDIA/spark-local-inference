@@ -107,7 +107,9 @@ Device identity comes from the target hardware, not from an SM-version-to-name
 guess. Numeric SM architecture requirements are recorded in compatibility metadata;
 loaders validate that metadata independently of descriptive names.
 Payload exports record the captured device name in the signed core's
-`hardware_identity`. Cluster deployment IDs may be arbitrary identifiers.
+`hardware_identity`; export fails on a device whose PCI id names no platform.
+A capture request with `device_identity: "none"` records no device name
+instead, so the core is labeled `unknown-device` and claims no platform. Cluster deployment IDs may be arbitrary identifiers.
 Cores without a recorded device name are usable; when their authenticated
 metadata cannot identify the device, acquisition uses an
 `unknown-device-tp<N>-<UTC minute>` cache label. The downloader never substitutes

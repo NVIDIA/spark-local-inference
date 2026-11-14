@@ -13,6 +13,7 @@ use std::{
     sync::Mutex,
 };
 
+use crate::runtime_core::address_space;
 use crate::runtime_core::driver::{Access, AllocationProperties, Driver, Location};
 use crate::{Error, ExecutionError, Result};
 
@@ -30,8 +31,8 @@ const EXTENT: usize = 1 << 40;
 // Keep small Linux exports within the Windows WDDM address range as well.
 const HOST_BASE: u64 = 0xc0000000000;
 
-fn host_base(device_base: u64, world: u32) -> u64 {
-    if device_base + u64::from(world) * EXTENT as u64 <= HOST_BASE {
+fn host_base(device_base: u64, world: u32, extent: u64) -> u64 {
+    if device_base + u64::from(world) * extent <= HOST_BASE {
         HOST_BASE
     } else {
         0x200000000000
@@ -257,8 +258,50 @@ fn failure(error: impl ToString) {
         .get_or_insert_with(|| CString::new(error.to_string().replace('\0', " ")).unwrap());
 }
 
+/// The host base for `world` device windows of `extent` bytes from `base`,
+/// rejecting empty or overflowing windows and windows that overlap the host ranges.
+fn window_host_base(base: u64, extent: u64, world: u32) -> Result<u64> {
+    let span = u64::from(world)
+        .checked_mul(extent)
+        .filter(|span| base != 0 && extent != 0 && base.checked_add(*span).is_some())
+        .filter(|_| usize::try_from(extent).is_ok())
+        .ok_or_else(|| {
+            invalid(format!(
+                "invalid native core device window {base:#x}+{extent:#x}"
+            ))
+        })?;
+    let host_base = if cfg!(target_os = "windows") {
+        HOST_BASE
+    } else {
+        host_base(base, world, extent)
+    };
+    let host_end = host_base + u64::from(world) * EXTENT as u64;
+    if base < host_end && host_base < base + span {
+        return Err(invalid(
+            "core host reservations would overlap device reservations",
+        ));
+    }
+    Ok(host_base)
+}
+
 #[unsafe(no_mangle)]
 extern "C" fn flare_core_initialize(rank: u32, world: u32, device: i32) -> i32 {
+    flare_core_initialize_window(rank, world, device, BASE, EXTENT as u64)
+}
+
+/// Initializes the allocator with rank `r`'s device window at `base + r * extent`,
+/// `extent` bytes long. `flare_core_initialize` uses this platform's default window.
+/// `base` and `extent` must be multiples of the allocation granularity (`extent`
+/// of twice it: the lower half serves the pool, the upper half persistent
+/// storage), and the windows must not overlap the host ranges.
+#[unsafe(no_mangle)]
+extern "C" fn flare_core_initialize_window(
+    rank: u32,
+    world: u32,
+    device: i32,
+    base: u64,
+    extent: u64,
+) -> i32 {
     let initialize = || -> Result<()> {
         let mut arena = ARENA.lock().unwrap_or_else(|e| e.into_inner());
         if arena.is_some() {
@@ -267,16 +310,8 @@ extern "C" fn flare_core_initialize(rank: u32, world: u32, device: i32) -> i32 {
         if world == 0 || rank >= world || device < 0 {
             return Err(invalid("invalid core rank or device"));
         }
-        let host_base = if cfg!(target_os = "windows") {
-            HOST_BASE
-        } else {
-            host_base(BASE, world)
-        };
-        if u64::from(world) * EXTENT as u64 > BASE.abs_diff(host_base) {
-            return Err(invalid(
-                "core host reservations would overlap device reservations",
-            ));
-        }
+        let host_base = window_host_base(base, extent, world)?;
+        let extent_bytes = extent as usize;
         let driver = Driver::load()?;
         let (mut address, mut granularity, mut gpudirect) = (0, 0, 0);
         unsafe {
@@ -288,20 +323,32 @@ extern "C" fn flare_core_initialize(rank: u32, world: u32, device: i32) -> i32 {
                 "cuMemGetAllocationGranularity",
                 (driver.granularity)(&mut granularity, &properties(device, gpudirect != 0), 0),
             )?;
+            let granule = granularity as u64;
+            if base % granule != 0 || extent % (2 * granule) != 0 {
+                return Err(invalid(format!(
+                    "native core device window {base:#x}+{extent:#x} is not aligned to the {granule:#x}-byte allocation granularity"
+                )));
+            }
+            let bits = address_space::virtual_address_bits(device);
+            for peer in 0..world {
+                let start = base + u64::from(peer) * extent;
+                address_space::check_fits("native core device window", start, extent, bits)
+                    .map_err(invalid)?;
+            }
             let mut reserved = Vec::new();
             for peer in 0..world {
-                let base = BASE + u64::from(peer) * EXTENT as u64;
-                let status = (driver.reserve)(&mut address, EXTENT, 0, base, 0);
-                if status != 0 || address != base {
+                let start = base + u64::from(peer) * extent;
+                let status = (driver.reserve)(&mut address, extent_bytes, 0, start, 0);
+                if status != 0 || address != start {
                     if status == 0 {
-                        (driver.release_address)(address, EXTENT);
+                        (driver.release_address)(address, extent_bytes);
                     }
                     for address in reserved {
-                        (driver.release_address)(address, EXTENT);
+                        (driver.release_address)(address, extent_bytes);
                     }
                     driver.check("cuMemAddressReserve", status)?;
                     return Err(invalid(format!(
-                        "native core device address range {base:#x}+{EXTENT:#x} is unavailable; CUDA returned {address:#x}"
+                        "native core device address range {start:#x}+{extent:#x} is unavailable; CUDA returned {address:#x}"
                     )));
                 }
                 reserved.push(address);
@@ -313,7 +360,7 @@ extern "C" fn flare_core_initialize(rank: u32, world: u32, device: i32) -> i32 {
             granularity,
             gpudirect: gpudirect != 0,
             host_base: host_base + u64::from(rank) * EXTENT as u64,
-            free: vec![(BASE + u64::from(rank) * EXTENT as u64, EXTENT / 2)],
+            free: vec![(base + u64::from(rank) * extent, extent_bytes / 2)],
             mappings: BTreeMap::new(),
             retained: RetainedBacking::default(),
             retained_mappings: RetainedMappingPool::default(),
@@ -1244,7 +1291,7 @@ mod tests {
     fn small_linux_exports_keep_every_host_range_within_windows_addresses() {
         let device_base = 8 << 40;
         for world in 1..=4 {
-            let host = host_base(device_base, world);
+            let host = host_base(device_base, world, EXTENT as u64);
             assert_eq!(host, 12 << 40);
             assert!(device_base + u64::from(world) * EXTENT as u64 <= host);
             assert!(host + u64::from(world) * EXTENT as u64 <= 16 << 40);
@@ -1255,9 +1302,51 @@ mod tests {
     fn larger_linux_exports_keep_host_ranges_clear_of_all_device_ranks() {
         let device_base = 8 << 40;
         for world in 5..=24 {
-            let host = host_base(device_base, world);
+            let host = host_base(device_base, world, EXTENT as u64);
             assert_eq!(host, 32 << 40);
             assert!(device_base + u64::from(world) * EXTENT as u64 <= host);
+        }
+    }
+
+    #[test]
+    fn explicit_device_windows_are_validated() {
+        assert_eq!(
+            window_host_base(BASE, EXTENT as u64, 1).unwrap(),
+            if cfg!(target_os = "windows") {
+                HOST_BASE
+            } else {
+                host_base(BASE, 1, EXTENT as u64)
+            }
+        );
+        // A 64 GiB window at 256 GiB fits below the host ranges.
+        assert!(window_host_base(0x40_0000_0000, 64 << 30, 2).is_ok());
+        assert!(window_host_base(0, 1 << 30, 1).is_err());
+        assert!(window_host_base(1 << 40, 0, 1).is_err());
+        assert!(window_host_base(u64::MAX - (1 << 30), 1 << 30, 2).is_err());
+        // A window reaching the host range is rejected. Linux moves its host range to
+        // 32 TiB when device windows reach 12 TiB, so only one reaching 32 TiB overlaps it.
+        let host = if cfg!(target_os = "windows") {
+            HOST_BASE
+        } else {
+            0x200000000000
+        };
+        assert!(window_host_base(host - (1 << 30), 2 << 30, 1).is_err());
+    }
+
+    /// Prints device 0's WDDM GPU virtual address width; run with --ignored on a CUDA host.
+    #[test]
+    #[ignore = "needs a CUDA device"]
+    fn reports_the_device_address_width() {
+        let driver = Driver::load().unwrap();
+        // SAFETY: cuInit has no preconditions.
+        assert_eq!(unsafe { (driver.init)(0) }, 0);
+        let bits = address_space::virtual_address_bits(0);
+        println!("device 0 GPU virtual address bits: {bits:?}");
+        if cfg!(target_os = "windows") {
+            assert!(
+                bits.is_some_and(|bits| (32..64).contains(&bits)),
+                "{bits:?}"
+            );
         }
     }
 }

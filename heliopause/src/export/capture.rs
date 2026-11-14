@@ -17,9 +17,9 @@ use libloading::Library;
 use prost::Message;
 
 use super::{
-    Allocation, Argument, CaptureRequest, ExportResult, FilePart, FileSource, Kernel, RankOutput,
-    Relocation, WeightPayloadGroup, WeightPayloadSourceSpan, WeightPayloadSources, cubin, invalid,
-    weight_payload,
+    Allocation, Argument, CaptureRequest, DeviceIdentity, ExportResult, FilePart, FileSource,
+    Kernel, RankOutput, Relocation, WeightPayloadGroup, WeightPayloadSourceSpan,
+    WeightPayloadSources, cubin, invalid, weight_payload,
     reachability::{Reachability, merge_ranges, subtract_ranges},
     recorder::Recorder,
     wire,
@@ -3376,7 +3376,10 @@ pub(crate) fn capture_rank(
             },
         )?;
     }
-    output.hardware = current_platform(&cuda)?;
+    output.hardware = match request.device_identity {
+        DeviceIdentity::Required => current_platform(&cuda)?,
+        DeviceIdentity::None => None,
+    };
     drop(store);
     let granule = request.granularity.max(1 << 30);
     let reservations = if request.reservations.is_empty() {

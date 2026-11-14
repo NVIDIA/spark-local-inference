@@ -220,7 +220,12 @@ Ignition places rank-zero host storage at 12 TiB on Windows and on Linux when
 all device rank ranges fit below it (up to four Linux ranks). Larger Linux
 layouts use 32 TiB so their host and device ranges are disjoint, including
 sixteen-rank preparation. Heliopause selects the base and reports each rank's
-host range to Ignition before allocation.
+host range to Ignition before allocation. Each rank's device window is 1 TiB,
+starting at 4 TiB on Windows and 8 TiB on Linux. A caller that constructs
+`CoreStorage(device_window=(base, extent))` places rank `r`'s window at
+`base + r * extent` instead; the base must lie at or above `EXTERNAL_FLOOR`
+(256 GiB), and Heliopause rejects windows that are not aligned to the
+allocation granularity or that overlap the host ranges.
 Linux and Windows share the core format and the mailbox release/acquire
 protocol. A core loads on Windows only when its GPU architecture matches, its
 recorded virtual addresses are available, and its CUDA operations are supported.
@@ -230,6 +235,15 @@ for a host address at either base, including a 2 MiB reservation. The runtime
 does not relocate graph storage, so such a core must be re-exported before
 Windows use. Re-export a Linux TP1 core to a different filename; its host
 storage is placed at 12 TiB.
+
+Under WDDM, export and load compare every fixed reservation with the GPU
+virtual address width that WDDM reports for the device's adapter
+(`D3DKMTQueryAdapterInfo` with `KMTQAITYPE_QUERY_GPUMMU_CAPS`) before
+requesting it, and fail with an error naming the reservation and the width
+instead of calling `cuMemAddressReserve` with an address it cannot return
+from. The check covers Heliopause's device windows and the device and host
+reservations Helios makes for a core. Linux reservations and Ignition's own
+host-region reservations during export are not checked.
 
 Validate fixed device mappings and graph replay using the exported runtime
 fixtures on each target GPU. Cores with mapped host storage additionally
