@@ -13,6 +13,7 @@ use std::{
     sync::Mutex,
 };
 
+use crate::runtime_core::address_space;
 use crate::runtime_core::driver::{Access, AllocationProperties, Driver, Location};
 use crate::{Error, ExecutionError, Result};
 
@@ -288,6 +289,12 @@ extern "C" fn flare_core_initialize(rank: u32, world: u32, device: i32) -> i32 {
                 "cuMemGetAllocationGranularity",
                 (driver.granularity)(&mut granularity, &properties(device, gpudirect != 0), 0),
             )?;
+            let bits = address_space::virtual_address_bits(device);
+            for peer in 0..world {
+                let base = BASE + u64::from(peer) * EXTENT as u64;
+                address_space::check_fits("native core device window", base, EXTENT as u64, bits)
+                    .map_err(invalid)?;
+            }
             let mut reserved = Vec::new();
             for peer in 0..world {
                 let base = BASE + u64::from(peer) * EXTENT as u64;
@@ -1258,6 +1265,23 @@ mod tests {
             let host = host_base(device_base, world);
             assert_eq!(host, 32 << 40);
             assert!(device_base + u64::from(world) * EXTENT as u64 <= host);
+        }
+    }
+
+    /// Prints device 0's WDDM GPU virtual address width; run with --ignored on a CUDA host.
+    #[test]
+    #[ignore = "needs a CUDA device"]
+    fn reports_the_device_address_width() {
+        let driver = Driver::load().unwrap();
+        // SAFETY: cuInit has no preconditions.
+        assert_eq!(unsafe { (driver.init)(0) }, 0);
+        let bits = address_space::virtual_address_bits(0);
+        println!("device 0 GPU virtual address bits: {bits:?}");
+        if cfg!(target_os = "windows") {
+            assert!(
+                bits.is_some_and(|bits| (32..64).contains(&bits)),
+                "{bits:?}"
+            );
         }
     }
 }

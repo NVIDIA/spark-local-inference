@@ -231,6 +231,15 @@ does not relocate graph storage, so such a core must be re-exported before
 Windows use. Re-export a Linux TP1 core to a different filename; its host
 storage is placed at 12 TiB.
 
+Under WDDM, export and load compare every fixed reservation with the GPU
+virtual address width that WDDM reports for the device's adapter
+(`D3DKMTQueryAdapterInfo` with `KMTQAITYPE_QUERY_GPUMMU_CAPS`) before
+requesting it, and fail with an error naming the reservation and the width
+instead of calling `cuMemAddressReserve` with an address it cannot return
+from. The check covers Heliopause's device windows and the device and host
+reservations Helios makes for a core. Linux reservations and Ignition's own
+host-region reservations during export are not checked.
+
 Validate fixed device mappings and graph replay using the exported runtime
 fixtures on each target GPU. Cores with mapped host storage additionally
 require mapped access, stream-memory waits, and external event ordering tests.

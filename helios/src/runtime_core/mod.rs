@@ -12,6 +12,7 @@ mod cache_memory;
 mod cooperative_tests;
 mod describe;
 pub use describe::InspectionOptions;
+pub mod address_space;
 mod device_memory;
 pub mod driver;
 mod engram;
@@ -426,7 +427,15 @@ impl NativeResources {
         let driver = &self.driver;
         unsafe {
             driver.check("cuCtxSetCurrent", (driver.context_set)(self.context))?;
+            let bits = address_space::virtual_address_bits(self.device);
             for reservation in &core.reservations {
+                address_space::check_fits(
+                    "core reservation",
+                    reservation.address,
+                    reservation.nbytes as u64,
+                    bits,
+                )
+                .map_err(|error| invalid(format!("{error}; re-export the core for this GPU")))?;
                 let mut address = 0;
                 driver.check(
                     "cuMemAddressReserve",
