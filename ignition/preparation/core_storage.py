@@ -36,23 +36,37 @@ class CoreStorage:
     # The native allocator selects a higher base when the device ranks need this range.
     HOST_BASE = 0xc0000000000
     RESERVATION_BYTES = 1 << 40
+    # Each rank's host range; independent of an explicit device window.
+    HOST_RESERVATION_BYTES = 1 << 40
     # Keep library-owned device storage above the ranges occupied by Linux and WDDM contexts.
     EXTERNAL_FLOOR = 0x4000000000
     # Where sealing below the floor starts; a context's own storage lies above it.
     LOW_SCAN_START = 1 << 32
 
-    def __init__(self, *, rank=0, world=1, device=0, local_ranks=None):
+    def __init__(self, *, rank=0, world=1, device=0, local_ranks=None, device_window=None):
+        """``device_window=(base, extent)`` places rank ``r``'s fixed device window at
+        ``base + r * extent`` instead of the platform default ``(DEVICE_BASE, RESERVATION_BYTES)``.
+        A GPU whose virtual address space ends below the default window needs one.
+        ``base`` must lie at or above ``EXTERNAL_FLOOR``; the native allocator validates
+        alignment, the host ranges, and the GPU's address width."""
         import torch
 
         self.rank, self.world, self.device = rank, world, device
         self.local_ranks = world if local_ranks is None else local_ranks
         if type(self.local_ranks) is not int or not 1 <= self.local_ranks <= world:
             raise ValueError("local preparation ranks must be positive and fit the rank group")
+        if device_window is not None:
+            base, extent = (int(value) for value in device_window)
+            if base < self.EXTERNAL_FLOOR or extent <= 0:
+                raise ValueError(f"device window {base:#x}+{extent:#x} must start at or above "
+                                 f"{self.EXTERNAL_FLOOR:#x} and be nonempty")
+            self.DEVICE_BASE, self.RESERVATION_BYTES = base, extent
         properties = torch.cuda.get_device_properties(device)
         self.integrated = properties.is_integrated
         self._persistent_total_bytes = properties.total_memory
         self._retention_scope = False
         self._retention_pool = None
+        window = (self.DEVICE_BASE, self.RESERVATION_BYTES)
         self.DEVICE_BASE += rank * self.RESERVATION_BYTES
         self.cuda = _Cuda()
         from flare_heliopause import flare_heliopause as native
@@ -71,7 +85,9 @@ class CoreStorage:
         self.library = C.CDLL(native.__file__)
         self.library.flare_core_error.restype = C.c_char_p
         self.library.flare_core_snapshot.restype = C.c_void_p
-        if self.library.flare_core_initialize(rank, world, device):
+        self.library.flare_core_initialize_window.argtypes = [
+            C.c_uint32, C.c_uint32, C.c_int32, C.c_uint64, C.c_uint64]
+        if self.library.flare_core_initialize_window(rank, world, device, *window):
             raise self.error or RuntimeError("cannot initialize native core allocator")
         layout = self._snapshot()
         self.granularity = layout["granularity"]
@@ -330,11 +346,11 @@ class CoreStorage:
         # Host mappings are whole host pages; Grace kernels may use 64 KiB pages.
         extent = -(-size // mmap.PAGESIZE) * mmap.PAGESIZE
         region_type = WindowsHostRegion if os.name == "nt" else HostRegion
-        if self._host_cursor + extent > self.HOST_BASE + self.RESERVATION_BYTES:
+        if self._host_cursor + extent > self.HOST_BASE + self.HOST_RESERVATION_BYTES:
             raise MemoryError("native core host-address range exhausted")
         region = region_type(self.cuda, self._host_cursor, extent, shape, dtype, self.device,
                              lock=self.integrated)
-        if self._host_cursor + region.extent > self.HOST_BASE + self.RESERVATION_BYTES:
+        if self._host_cursor + region.extent > self.HOST_BASE + self.HOST_RESERVATION_BYTES:
             region.close()
             raise MemoryError("native core host-address range exhausted")
         self._host_cursor += region.extent

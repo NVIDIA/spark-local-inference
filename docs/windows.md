@@ -220,7 +220,12 @@ Ignition places rank-zero host storage at 12 TiB on Windows and on Linux when
 all device rank ranges fit below it (up to four Linux ranks). Larger Linux
 layouts use 32 TiB so their host and device ranges are disjoint, including
 sixteen-rank preparation. Heliopause selects the base and reports each rank's
-host range to Ignition before allocation.
+host range to Ignition before allocation. Each rank's device window is 1 TiB,
+starting at 4 TiB on Windows and 8 TiB on Linux. A caller that constructs
+`CoreStorage(device_window=(base, extent))` places rank `r`'s window at
+`base + r * extent` instead; the base must lie at or above `EXTERNAL_FLOOR`
+(256 GiB), and Heliopause rejects windows that are not aligned to the
+allocation granularity or that overlap the host ranges.
 Linux and Windows share the core format and the mailbox release/acquire
 protocol. A core loads on Windows only when its GPU architecture matches, its
 recorded virtual addresses are available, and its CUDA operations are supported.

@@ -21,6 +21,15 @@ def test_local_export_rank_count_must_fit_the_global_group(local_ranks):
         CoreStorage(world=3, local_ranks=local_ranks)
 
 
+@pytest.mark.parametrize("window", [
+    (CoreStorage.EXTERNAL_FLOOR - (1 << 30), 1 << 36),
+    (CoreStorage.EXTERNAL_FLOOR, 0),
+])
+def test_explicit_device_window_starts_at_the_floor_and_is_nonempty(window):
+    with pytest.raises(ValueError, match="device window"):
+        CoreStorage(device_window=window)
+
+
 def test_cuda_access_descriptor_array_matches_driver_abi():
     from ignition.preparation.core_storage import _Access, _Location
 
@@ -68,4 +77,4 @@ def test_linux_device_ranges_avoid_mimalloc_arena_hints():
 def test_windows_host_range_stays_below_stalling_wddm_addresses():
     # RTX Spark's driver stalls on host-address hints at 16 TiB and 32 TiB.
     assert CoreStorage.DEVICE_BASE + CoreStorage.RESERVATION_BYTES <= CoreStorage.HOST_BASE
-    assert CoreStorage.HOST_BASE + CoreStorage.RESERVATION_BYTES <= 16 << 40
+    assert CoreStorage.HOST_BASE + CoreStorage.HOST_RESERVATION_BYTES <= 16 << 40
