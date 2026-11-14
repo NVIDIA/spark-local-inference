@@ -95,11 +95,12 @@
     reconciliation (`flare orbit apply`). See orbit-proposals.md.
 
 [ ] Restore preparation/serving RoCE proxy parity once FlashInfer main includes
-    the sequence-limit guard and protocol verification additions. The pinned
-    FlashInfer proxy (flashinfer/experimental/b12x/comm/roce/_roce_proxy.c)
+    the sequence-limit guard and protocol verification additions. The FlashInfer
+    proxy at the commit recorded in `uv.lock`
+    (flashinfer/experimental/b12x/comm/roce/_roce_proxy.c)
     declares ABI 11; helios/native/roce_proxy.c implements ABI 10 and
     helios/src/execution/roce.rs loads only cores recording ABI 9 or 10.
-    Confirm with a multi-host core prepared from the pin whether serving
+    Confirm with a multi-host core prepared from that commit whether serving
     rejects it. See roce-ring.md#protocol-model-and-runtime-checks.
 
 [ ] Validate the unbuffered Windows core guard and parallel disk workers with

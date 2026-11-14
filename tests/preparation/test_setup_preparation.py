@@ -19,12 +19,19 @@ SPEC.loader.exec_module(setup)
 
 
 def test_setup_updates_preparation_dependencies(monkeypatch):
+    """Command-construction test; it does not run uv or prove resolution."""
     calls = []
     monkeypatch.setattr(setup.subprocess, "run", lambda *args, **kwargs: calls.append((args, kwargs)))
     assert setup.main() == 0
     assert len(calls) == 1
     command = calls[0][0][0]
-    assert command[:4] == ["uv", "sync", "--upgrade-package", "flashinfer-python"]
+    assert command == [
+        "uv", "sync", "--upgrade-package", "flashinfer-python",
+        "--extra", "prepare", "--extra", "test",
+        "--reinstall-package", "flashinfer-python", "--reinstall-package", "flare-heliopause",
+    ]
+    assert "--locked" not in command
+    assert "--frozen" not in command
     assert calls[0][1]["env"]["BUILD_NVEP"] == "0"
     assert calls[0][1]["cwd"] == ROOT
     assert calls[0][1]["check"] is True

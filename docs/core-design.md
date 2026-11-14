@@ -380,8 +380,8 @@ vision weights.
 
 [pyproject.toml](../pyproject.toml) and [uv.lock](../uv.lock) declare the
 preparation dependencies. Transformers supplies canonical architecture and
-processor semantics. `pyproject.toml` pins FlashInfer to a commit of
-`local-inference-lab/flashinfer`, and `uv.lock` records the same commit;
+processor semantics. `pyproject.toml` tracks `main` of
+`local-inference-lab/flashinfer`, and `uv.lock` records the resolved commit;
 its b12x operators and FlashInfer sampling supply the prepared GPU computation.
 
 ### Runtime contract

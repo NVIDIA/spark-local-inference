@@ -70,9 +70,15 @@ A core's cache layouts are fixed when it is prepared.
 Set up the preparation environment and build the native CLI:
 
 ```sh
-uv sync --locked --extra prepare --extra test
+uv sync --extra prepare --extra test
 cargo build --release --manifest-path flare-cli/Cargo.toml
 ```
+
+`uv sync` resolves the head commit of `local-inference-lab/flashinfer` main and
+rewrites the FlashInfer entry in `uv.lock`. Run it again, or run
+`scripts/setup_preparation.py`, before a preparation that must use main's head.
+The [FlashInfer dependency](#flashinfer-dependency) section defines which
+commands track main and which reproduce a recorded commit.
 
 `ignition.runtime_patches` installs process-local fixes for PyTorch 2.14.1+cu132
 and Triton 3.8.0. Preparation commands set dependency paths and GPU visibility
@@ -100,10 +106,9 @@ from ignition import runtime_patches
 runtime_patches.apply()
 ```
 
-`python scripts/setup_preparation.py` resolves the FlashInfer revision declared
-in `pyproject.toml`, syncs preparation/test dependencies, rebuilds FlashInfer and
-Heliopause. It updates `uv.lock`
-when the declared dependency resolves differently.
+`python scripts/setup_preparation.py` updates FlashInfer to the head commit of
+`local-inference-lab/flashinfer` main, syncs preparation/test dependencies, and
+rebuilds FlashInfer and Heliopause. It rewrites the FlashInfer entry in `uv.lock`.
 
 Build dependencies include a C/C++ compiler, CMake, Ninja, pkg-config, Protobuf's
 `protoc`, OpenSSL headers, Python headers, and liburing headers. On Ubuntu:
@@ -138,13 +143,46 @@ frontend/protocol tests and build Flare and Heliopause against the pinned
 revision. Compare rendered prompts and token
 IDs with upstream when changing encoder behavior.
 
-The preparation dependency pins a revision of `local-inference-lab/flashinfer`
-in `pyproject.toml`; `uv.lock` records the same commit. To update FlashInfer,
-change that revision and run `uv lock --upgrade-package flashinfer-python`,
-then sync the environment.
+### FlashInfer dependency
+
+The preparation dependency tracks `local-inference-lab/flashinfer` main in
+`pyproject.toml`, and `[tool.uv] upgrade-package` makes every plain `uv lock`,
+`uv sync`, and `uv run` resolve main's head commit and record it in `uv.lock`.
+A sync that selects the `prepare` extra installs it. These commands rewrite the
+FlashInfer entry; commit that entry only with a change that needs that
+FlashInfer commit. `.venv/bin/ignition`, an activated environment, `--frozen`,
+and `--no-sync` use the last synced commit instead of resolving main.
+`--offline` cannot resolve main; combine it with `--frozen` to reproduce a
+recorded lock. Run `uv sync` or `scripts/setup_preparation.py` before a
+preparation that must use main's head.
+
+For a reproducible environment on another host, copy the `uv.lock` that recorded
+the FlashInfer commit and run:
+
+```sh
+uv sync --frozen --extra prepare --extra test
+```
+
+For offline use, after the uv cache holds the recorded packages:
+
+```sh
+uv sync --frozen --offline --extra prepare --extra test
+```
+
+Every host confirms its installed FlashInfer commit from the distribution's
+`direct_url.json`:
+
+```sh
+grep -ho '"commit_id": *"[0-9a-f]\{40\}"' \
+  .venv/lib/python3.12/site-packages/flashinfer_python-*.dist-info/direct_url.json
+```
+
+Compare that value with the `?rev=main#<commit>` fragment in `uv.lock` and with
+`git ls-remote https://github.com/local-inference-lab/flashinfer.git refs/heads/main`.
+
 For local FlashInfer development, install the sibling
 checkout explicitly with `uv pip install --python .venv/bin/python --no-deps -e ../flashinfer`;
-`uv sync --locked --extra prepare --extra test` restores the Git dependency.
+`uv sync --extra prepare --extra test` restores the Git dependency.
 Inspect that checkout and its local changes before modifying it. After changing
 Rust code in `heliopause/`, or Helios code used by the extension, rebuild the
 installed extension explicitly:

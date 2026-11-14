@@ -51,12 +51,22 @@ Anthropic Messages, stateless Responses, authentication, and client configuratio
 ## 2. Commands
 
 The Python distribution and source package are named `ignition`. Install the
-preparation environment with `uv sync --locked --extra prepare --extra test`,
-then use `.venv/bin/ignition` or `.venv/bin/python -m ignition`.
+preparation environment with `uv sync --extra prepare --extra test`, then use
+`.venv/bin/ignition` or `.venv/bin/python -m ignition`.
 Preparation commands install version-checked runtime patches after setting the
-dependency environment; `uv run --locked --extra prepare ignition ...`
+dependency environment; `uv run --extra prepare ignition ...`
 uses the same startup path. See [environment setup](model-preparation.md#environment-setup)
 for patch application in standalone Python tools.
+
+Plain `uv sync`, `uv run`, and `scripts/setup_preparation.py` resolve the head
+commit of `local-inference-lab/flashinfer` main and rewrite the FlashInfer entry
+in `uv.lock`. `.venv/bin/ignition`, `.venv/bin/python -m ignition`, and an
+activated environment use the last synced commit. Run `uv sync` or the setup
+script before a preparation that must use main's head. `--frozen` and
+`--no-sync` keep the recorded commit; `--offline` cannot resolve main, so
+combine it with `--frozen` to reproduce a recorded lock. See the
+[FlashInfer dependency](model-preparation.md#flashinfer-dependency) section for
+reproducible and offline commands.
 
 ```
 ignition export  [MODEL] [flags]                prepare a model in the shared cache
